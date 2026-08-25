@@ -1,0 +1,750 @@
+import Foundation
+import Photos
+import SQLite3
+
+struct PhotoIndexProgress: Equatable, Sendable {
+    enum Phase: String, Sendable {
+        case scanningAssets
+        case scanningAlbums
+        case finalizing
+        case finished
+    }
+
+    let phase: Phase
+    let completed: Int
+    let total: Int
+
+    var fraction: Double {
+        guard total > 0 else { return phase == .finished ? 1 : 0 }
+        return min(max(Double(completed) / Double(total), 0), 1)
+    }
+}
+
+struct PhotoIndexStats: Equatable, Sendable {
+    let assetCount: Int
+    let albumCount: Int
+    let unsortedCount: Int
+}
+
+enum PhotoIndexError: LocalizedError {
+    case databaseUnavailable
+    case database(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .databaseUnavailable:
+            return "照片索引数据库暂时不可用。"
+        case .database(let message):
+            return "照片索引失败：\(message)"
+        }
+    }
+}
+
+/// A bounded metadata-only index for large Photos libraries.
+///
+/// This class owns its SQLite connection on a private serial queue. It never
+/// requests image data, video resources, or Live Photos while indexing.
+final class PhotoIndexStore: @unchecked Sendable {
+    private static let databaseName = "PhotoIndex.sqlite"
+    private static let schemaVersion = "2"
+    private static func makeMediaOptions() -> PHFetchOptions {
+        let options = PHFetchOptions()
+        options.predicate = NSPredicate(
+            format: "mediaType == %d OR mediaType == %d",
+            PHAssetMediaType.image.rawValue,
+            PHAssetMediaType.video.rawValue
+        )
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        return options
+    }
+
+    private let queue = DispatchQueue(
+        label: "com.misswell.PhotoVault.photo-index",
+        qos: .utility
+    )
+    private let databaseURL: URL
+    private var database: OpaquePointer?
+
+    init() {
+        let applicationSupport = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first ?? FileManager.default.temporaryDirectory
+        databaseURL = applicationSupport
+            .appendingPathComponent("PhotoVault", isDirectory: true)
+            .appendingPathComponent(Self.databaseName)
+    }
+
+    deinit {
+        queue.sync {
+            if let database {
+                sqlite3_close(database)
+                self.database = nil
+            }
+        }
+    }
+
+    func hasUsableIndex(
+        for librarySignature: String,
+        completion: @escaping (Bool) -> Void
+    ) {
+        queue.async { [weak self] in
+            let result = (try? self?.withDatabase {
+                try self?.readMeta("schema_version") == Self.schemaVersion
+                    && self?.readMeta("index_ready") == "1"
+                    && self?.readMeta("library_signature") == librarySignature
+            }) ?? false
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    func rebuild(
+        assets: PHFetchResult<PHAsset>,
+        userAlbums: [PHAssetCollection],
+        librarySignature: String,
+        progress: @escaping (PhotoIndexProgress) -> Void,
+        completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            do {
+                let stats = try self.rebuildSynchronously(
+                    assets: assets,
+                    userAlbums: userAlbums,
+                    librarySignature: librarySignature,
+                    progress: progress
+                )
+                DispatchQueue.main.async {
+                    completion(.success(stats))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func replaceAlbumMembership(
+        userAlbums: [PHAssetCollection],
+        librarySignature: String,
+        progress: @escaping (PhotoIndexProgress) -> Void,
+        completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            do {
+                let stats = try self.replaceAlbumMembershipSynchronously(
+                    userAlbums: userAlbums,
+                    librarySignature: librarySignature,
+                    progress: progress
+                )
+                DispatchQueue.main.async {
+                    completion(.success(stats))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func upsertAssets(
+        _ assets: [PHAsset],
+        deletedIDs: Set<String>,
+        librarySignature: String,
+        completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            do {
+                let stats = try self.upsertAssetsSynchronously(
+                    assets,
+                    deletedIDs: deletedIDs,
+                    librarySignature: librarySignature
+                )
+                DispatchQueue.main.async {
+                    completion(.success(stats))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func addMembership(
+        assetIDs: [String],
+        albumID: String,
+        albumTitle: String,
+        librarySignature: String,
+        completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            do {
+                let stats = try self.addMembershipSynchronously(
+                    assetIDs: assetIDs,
+                    albumID: albumID,
+                    albumTitle: albumTitle,
+                    librarySignature: librarySignature
+                )
+                DispatchQueue.main.async {
+                    completion(.success(stats))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func stats(completion: @escaping (Result<PhotoIndexStats, Error>) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            do {
+                let stats = try self.readStats()
+                DispatchQueue.main.async {
+                    completion(.success(stats))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func unsortedIdentifiers(
+        limit: Int,
+        offset: Int = 0,
+        completion: @escaping (Result<[String], Error>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            do {
+                let identifiers = try self.readUnsortedIdentifiers(limit: limit, offset: offset)
+                DispatchQueue.main.async {
+                    completion(.success(identifiers))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    private func rebuildSynchronously(
+        assets: PHFetchResult<PHAsset>,
+        userAlbums: [PHAssetCollection],
+        librarySignature: String,
+        progress: @escaping (PhotoIndexProgress) -> Void
+    ) throws -> PhotoIndexStats {
+        try withDatabase {
+            try execute("BEGIN IMMEDIATE TRANSACTION")
+            do {
+                try execute("UPDATE meta SET value = '0' WHERE key = 'index_ready'")
+                try setMeta("library_signature", value: librarySignature)
+                try execute("DELETE FROM album_asset")
+                try execute("DELETE FROM album_index")
+                try execute("DELETE FROM asset_index")
+
+                let assetStatement = try prepare("""
+                    INSERT INTO asset_index
+                        (asset_id, creation_date, modification_date, media_type, media_subtype, favorite, album_count)
+                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                    ON CONFLICT(asset_id) DO UPDATE SET
+                        creation_date = excluded.creation_date,
+                        modification_date = excluded.modification_date,
+                        media_type = excluded.media_type,
+                        media_subtype = excluded.media_subtype,
+                        favorite = excluded.favorite
+                    """)
+                defer { sqlite3_finalize(assetStatement) }
+
+                var indexError: Error?
+                let totalAssets = assets.count
+                progress(PhotoIndexProgress(
+                    phase: .scanningAssets,
+                    completed: 0,
+                    total: totalAssets
+                ))
+
+                assets.enumerateObjects { [weak self] asset, index, stop in
+                    guard let self else { return }
+                    do {
+                        try self.bindAsset(asset, to: assetStatement)
+                        try self.stepAndReset(assetStatement)
+                    } catch {
+                        indexError = error
+                        stop.pointee = true
+                    }
+
+                    if index == 0 || index == totalAssets - 1 || index % 500 == 0 {
+                        progress(PhotoIndexProgress(
+                            phase: .scanningAssets,
+                            completed: index + 1,
+                            total: totalAssets
+                        ))
+                    }
+                }
+                if let indexError { throw indexError }
+
+                try insertAlbumsAndMemberships(userAlbums, progress: progress)
+                progress(PhotoIndexProgress(
+                    phase: .finalizing,
+                    completed: totalAssets,
+                    total: totalAssets
+                ))
+                try execute("""
+                    UPDATE asset_index
+                    SET album_count = (
+                        SELECT COUNT(*)
+                        FROM album_asset
+                        WHERE album_asset.asset_id = asset_index.asset_id
+                    )
+                    """)
+                try execute("UPDATE meta SET value = '1' WHERE key = 'index_ready'")
+                try execute("COMMIT")
+            } catch {
+                try? execute("ROLLBACK")
+                throw error
+            }
+
+            return try readStats()
+        }
+    }
+
+    private func replaceAlbumMembershipSynchronously(
+        userAlbums: [PHAssetCollection],
+        librarySignature: String,
+        progress: @escaping (PhotoIndexProgress) -> Void
+    ) throws -> PhotoIndexStats {
+        try withDatabase {
+            try execute("BEGIN IMMEDIATE TRANSACTION")
+            do {
+                try execute("DELETE FROM album_asset")
+                try execute("DELETE FROM album_index")
+                try setMeta("library_signature", value: librarySignature)
+                try insertAlbumsAndMemberships(userAlbums, progress: progress)
+                try execute("""
+                    UPDATE asset_index
+                    SET album_count = (
+                        SELECT COUNT(*)
+                        FROM album_asset
+                        WHERE album_asset.asset_id = asset_index.asset_id
+                    )
+                    """)
+                try execute("UPDATE meta SET value = '1' WHERE key = 'index_ready'")
+                try execute("COMMIT")
+            } catch {
+                try? execute("ROLLBACK")
+                throw error
+            }
+
+            return try readStats()
+        }
+    }
+
+    private func insertAlbumsAndMemberships(
+        _ userAlbums: [PHAssetCollection],
+        progress: @escaping (PhotoIndexProgress) -> Void
+    ) throws {
+        let albumStatement = try prepare("""
+            INSERT INTO album_index (album_id, title, type)
+            VALUES (?, ?, 0)
+            ON CONFLICT(album_id) DO UPDATE SET title = excluded.title, type = excluded.type
+            """)
+        let membershipStatement = try prepare("""
+            INSERT OR IGNORE INTO album_asset (album_id, asset_id)
+            SELECT ?, ?
+            WHERE EXISTS (
+                SELECT 1 FROM asset_index WHERE asset_id = ?
+            )
+            """)
+        defer {
+            sqlite3_finalize(albumStatement)
+            sqlite3_finalize(membershipStatement)
+        }
+
+        let totalAlbums = userAlbums.count
+        for (albumIndex, collection) in userAlbums.enumerated() {
+            try bindText(collection.localIdentifier, at: 1, to: albumStatement)
+            try bindText(collection.localizedTitle ?? "未命名相册", at: 2, to: albumStatement)
+            try stepAndReset(albumStatement)
+
+            let albumAssets = PHAsset.fetchAssets(in: collection, options: Self.makeMediaOptions())
+            var membershipError: Error?
+            albumAssets.enumerateObjects { [weak self] asset, _, stop in
+                guard let self else { return }
+                do {
+                    try self.bindText(collection.localIdentifier, at: 1, to: membershipStatement)
+                    try self.bindText(asset.localIdentifier, at: 2, to: membershipStatement)
+                    // Album fetches can briefly contain an asset that is no
+                    // longer present in the library snapshot (for example
+                    // while iCloud is reconciling changes).  The EXISTS
+                    // guard keeps that stale relationship from violating the
+                    // foreign key and aborting a full 100k-item index build.
+                    try self.bindText(asset.localIdentifier, at: 3, to: membershipStatement)
+                    try self.stepAndReset(membershipStatement)
+                } catch {
+                    membershipError = error
+                    stop.pointee = true
+                }
+            }
+            if let membershipError { throw membershipError }
+
+            progress(PhotoIndexProgress(
+                phase: .scanningAlbums,
+                completed: albumIndex + 1,
+                total: totalAlbums
+            ))
+        }
+    }
+
+    private func upsertAssetsSynchronously(
+        _ assets: [PHAsset],
+        deletedIDs: Set<String>,
+        librarySignature: String
+    ) throws -> PhotoIndexStats {
+        try withDatabase {
+            try execute("BEGIN IMMEDIATE TRANSACTION")
+            do {
+                try setMeta("library_signature", value: librarySignature)
+                let statement = try prepare("""
+                    INSERT INTO asset_index
+                        (asset_id, creation_date, modification_date, media_type, media_subtype, favorite, album_count)
+                    VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT album_count FROM asset_index WHERE asset_id = ?), 0))
+                    ON CONFLICT(asset_id) DO UPDATE SET
+                        creation_date = excluded.creation_date,
+                        modification_date = excluded.modification_date,
+                        media_type = excluded.media_type,
+                        media_subtype = excluded.media_subtype,
+                        favorite = excluded.favorite
+                    """)
+                defer { sqlite3_finalize(statement) }
+
+                for asset in assets {
+                    try bindAsset(asset, to: statement, includeExistingID: true)
+                    try stepAndReset(statement)
+                }
+
+                if !deletedIDs.isEmpty {
+                    let deleteStatement = try prepare("DELETE FROM asset_index WHERE asset_id = ?")
+                    defer { sqlite3_finalize(deleteStatement) }
+                    for identifier in deletedIDs {
+                        try bindText(identifier, at: 1, to: deleteStatement)
+                        try stepAndReset(deleteStatement)
+                    }
+                }
+
+                try execute("UPDATE meta SET value = '1' WHERE key = 'index_ready'")
+                try execute("COMMIT")
+            } catch {
+                try? execute("ROLLBACK")
+                throw error
+            }
+
+            return try readStats()
+        }
+    }
+
+    private func addMembershipSynchronously(
+        assetIDs: [String],
+        albumID: String,
+        albumTitle: String,
+        librarySignature: String
+    ) throws -> PhotoIndexStats {
+        try withDatabase {
+            try execute("BEGIN IMMEDIATE TRANSACTION")
+            do {
+                try setMeta("library_signature", value: librarySignature)
+
+                let albumStatement = try prepare("""
+                    INSERT INTO album_index (album_id, title, type)
+                    VALUES (?, ?, 0)
+                    ON CONFLICT(album_id) DO UPDATE SET title = excluded.title
+                    """)
+                defer { sqlite3_finalize(albumStatement) }
+                try bindText(albumID, at: 1, to: albumStatement)
+                try bindText(albumTitle, at: 2, to: albumStatement)
+                try stepAndReset(albumStatement)
+
+                let membershipStatement = try prepare("""
+                    INSERT OR IGNORE INTO album_asset (album_id, asset_id)
+                    SELECT ?, ?
+                    WHERE EXISTS (
+                        SELECT 1 FROM asset_index WHERE asset_id = ?
+                    )
+                    """)
+                defer { sqlite3_finalize(membershipStatement) }
+                for assetID in assetIDs {
+                    try bindText(albumID, at: 1, to: membershipStatement)
+                    try bindText(assetID, at: 2, to: membershipStatement)
+                    try bindText(assetID, at: 3, to: membershipStatement)
+                    try stepAndReset(membershipStatement)
+                }
+
+                try execute("""
+                    UPDATE asset_index
+                    SET album_count = (
+                        SELECT COUNT(*)
+                        FROM album_asset
+                        WHERE album_asset.asset_id = asset_index.asset_id
+                    )
+                    """)
+                try execute("UPDATE meta SET value = '1' WHERE key = 'index_ready'")
+                try execute("COMMIT")
+            } catch {
+                try? execute("ROLLBACK")
+                throw error
+            }
+            return try readStats()
+        }
+    }
+
+    private func readStats() throws -> PhotoIndexStats {
+        PhotoIndexStats(
+            assetCount: try scalarInt("SELECT COUNT(*) FROM asset_index"),
+            albumCount: try scalarInt("SELECT COUNT(*) FROM album_index"),
+            unsortedCount: try scalarInt("SELECT COUNT(*) FROM asset_index WHERE album_count = 0")
+        )
+    }
+
+    private func readUnsortedIdentifiers(limit: Int, offset: Int) throws -> [String] {
+        let statement = try prepare("""
+            SELECT asset_id
+            FROM asset_index
+            WHERE album_count = 0
+            ORDER BY creation_date DESC, asset_id DESC
+            LIMIT ? OFFSET ?
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bindInt64(Int64(max(0, limit)), at: 1, to: statement)
+        try bindInt64(Int64(max(0, offset)), at: 2, to: statement)
+
+        var identifiers = [String]()
+        identifiers.reserveCapacity(min(max(0, limit), 4096))
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let value = sqlite3_column_text(statement, 0) {
+                identifiers.append(String(cString: value))
+            }
+        }
+        return identifiers
+    }
+
+    private func withDatabase<T>(_ body: () throws -> T) throws -> T {
+        try openIfNeeded()
+        return try body()
+    }
+
+    private func openIfNeeded() throws {
+        guard database == nil else { return }
+        let directory = databaseURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+
+        var handle: OpaquePointer?
+        let result = sqlite3_open_v2(
+            databaseURL.path,
+            &handle,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+            nil
+        )
+        guard result == SQLITE_OK, let handle else {
+            if let handle {
+                sqlite3_close(handle)
+            }
+            throw PhotoIndexError.databaseUnavailable
+        }
+        database = handle
+        try execute("PRAGMA journal_mode = WAL")
+        try execute("PRAGMA synchronous = NORMAL")
+        try execute("PRAGMA foreign_keys = ON")
+        try repairIfNeeded()
+        try execute("""
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            )
+            """)
+        try execute("""
+            INSERT OR IGNORE INTO meta (key, value) VALUES ('index_ready', '0')
+            """)
+        let existingSchemaVersion = try readMeta("schema_version")
+        if let existingSchemaVersion,
+           existingSchemaVersion != Self.schemaVersion {
+            try execute("DROP TABLE IF EXISTS album_asset")
+            try execute("DROP TABLE IF EXISTS album_index")
+            try execute("DROP TABLE IF EXISTS asset_index")
+            try execute("DELETE FROM meta")
+        }
+        try setMeta("schema_version", value: Self.schemaVersion)
+        try execute("""
+            INSERT OR IGNORE INTO meta (key, value) VALUES ('index_ready', '0')
+            """)
+        try execute("""
+            CREATE TABLE IF NOT EXISTS asset_index (
+                asset_id TEXT PRIMARY KEY NOT NULL,
+                creation_date REAL NOT NULL DEFAULT 0,
+                modification_date REAL NOT NULL DEFAULT 0,
+                media_type INTEGER NOT NULL DEFAULT 0,
+                media_subtype INTEGER NOT NULL DEFAULT 0,
+                favorite INTEGER NOT NULL DEFAULT 0,
+                album_count INTEGER NOT NULL DEFAULT 0
+            )
+            """)
+        try execute("""
+            CREATE TABLE IF NOT EXISTS album_index (
+                album_id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                type INTEGER NOT NULL DEFAULT 0
+            )
+            """)
+        try execute("""
+            CREATE TABLE IF NOT EXISTS album_asset (
+                album_id TEXT NOT NULL REFERENCES album_index(album_id) ON DELETE CASCADE,
+                asset_id TEXT NOT NULL REFERENCES asset_index(asset_id) ON DELETE CASCADE,
+                PRIMARY KEY (album_id, asset_id)
+            )
+            """)
+        try execute("CREATE INDEX IF NOT EXISTS asset_index_unassigned ON asset_index(album_count, creation_date DESC)")
+        try execute("CREATE INDEX IF NOT EXISTS album_asset_asset ON album_asset(asset_id)")
+    }
+
+    private func readMeta(_ key: String) throws -> String? {
+        let statement = try prepare("SELECT value FROM meta WHERE key = ?")
+        defer { sqlite3_finalize(statement) }
+        try bindText(key, at: 1, to: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        guard let value = sqlite3_column_text(statement, 0) else { return nil }
+        return String(cString: value)
+    }
+
+    private func setMeta(_ key: String, value: String) throws {
+        let statement = try prepare("""
+            INSERT INTO meta (key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bindText(key, at: 1, to: statement)
+        try bindText(value, at: 2, to: statement)
+        try stepAndReset(statement)
+    }
+
+    private func repairIfNeeded() throws {
+        let statement = try prepare("PRAGMA quick_check")
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW,
+              let result = sqlite3_column_text(statement, 0)
+        else { return }
+        guard String(cString: result) != "ok" else { return }
+
+        // This file only contains rebuildable metadata. Drop its tables so a
+        // corrupt index can recover without touching the user's Photos data.
+        try execute("DROP TABLE IF EXISTS album_asset")
+        try execute("DROP TABLE IF EXISTS album_index")
+        try execute("DROP TABLE IF EXISTS asset_index")
+        try execute("DELETE FROM meta")
+    }
+
+    private func scalarInt(_ sql: String) throws -> Int {
+        let statement = try prepare(sql)
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw databaseError()
+        }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private func execute(_ sql: String) throws {
+        var errorMessage: UnsafeMutablePointer<CChar>?
+        let result = sqlite3_exec(database, sql, nil, nil, &errorMessage)
+        guard result == SQLITE_OK else {
+            let message = errorMessage.map { String(cString: $0) } ?? "未知数据库错误"
+            sqlite3_free(errorMessage)
+            throw PhotoIndexError.database(message)
+        }
+    }
+
+    private func prepare(_ sql: String) throws -> OpaquePointer {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement
+        else {
+            throw databaseError()
+        }
+        return statement
+    }
+
+    private func bindAsset(
+        _ asset: PHAsset,
+        to statement: OpaquePointer,
+        includeExistingID: Bool = false
+    ) throws {
+        try bindText(asset.localIdentifier, at: 1, to: statement)
+        try bindDouble(asset.creationDate?.timeIntervalSince1970 ?? 0, at: 2, to: statement)
+        try bindDouble(asset.modificationDate?.timeIntervalSince1970 ?? 0, at: 3, to: statement)
+        try bindInt64(Int64(asset.mediaType.rawValue), at: 4, to: statement)
+        try bindInt64(Int64(asset.mediaSubtypes.rawValue), at: 5, to: statement)
+        try bindInt64(asset.isFavorite ? 1 : 0, at: 6, to: statement)
+        if includeExistingID {
+            try bindText(asset.localIdentifier, at: 7, to: statement)
+        }
+    }
+
+    private func bindText(_ value: String, at index: Int32, to statement: OpaquePointer) throws {
+        guard sqlite3_bind_text(statement, index, value, -1, sqliteTransient) == SQLITE_OK else {
+            throw databaseError()
+        }
+    }
+
+    private func bindDouble(_ value: Double, at index: Int32, to statement: OpaquePointer) throws {
+        guard sqlite3_bind_double(statement, index, value) == SQLITE_OK else {
+            throw databaseError()
+        }
+    }
+
+    private func bindInt64(_ value: Int64, at index: Int32, to statement: OpaquePointer) throws {
+        guard sqlite3_bind_int64(statement, index, value) == SQLITE_OK else {
+            throw databaseError()
+        }
+    }
+
+    private func stepAndReset(_ statement: OpaquePointer) throws {
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            let error = databaseError()
+            sqlite3_reset(statement)
+            sqlite3_clear_bindings(statement)
+            throw error
+        }
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+    }
+
+    private func databaseError() -> PhotoIndexError {
+        guard let database,
+              let message = sqlite3_errmsg(database)
+        else {
+            return .databaseUnavailable
+        }
+        return .database(String(cString: message))
+    }
+}
+
+private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
