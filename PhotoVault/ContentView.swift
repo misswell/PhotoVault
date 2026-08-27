@@ -10,10 +10,11 @@ struct ContentView: View {
     @State private var isShowingLimitedPicker = false
     @State private var isShowingSettings = false
     @AppStorage("PhotoVault.home.regularAlbumsExpanded") private var regularAlbumsExpanded = true
+    @AppStorage("PhotoVault.home.sharedAlbumsExpanded") private var sharedAlbumsExpanded = true
     @AppStorage("PhotoVault.home.folderPresentation") private var folderPresentationRawValue = FolderPresentation.list.rawValue
     @AppStorage("PhotoVault.home.folderGridMinimumWidth") private var folderGridMinimumWidthStorage = 132.0
+    @AppStorage(AlbumTileColumnCount.storageKey) private var albumTileColumnCountRawValue = AlbumTileColumnCount.automatic.rawValue
     @GestureState private var albumMagnification: CGFloat = 1
-    @State private var albumGridLayoutGeneration = 0
     @State private var expandedFolderIDs: Set<String> = []
 #if DEBUG
     @State private var isShowingPerformance = false
@@ -22,6 +23,7 @@ struct ContentView: View {
     private enum FolderListItem: Identifiable {
         case folder(PhotoAlbumFolder, depth: Int)
         case album(PhotoAlbum, depth: Int)
+        case albumGrid(PhotoAlbumFolder)
 
         var id: String {
             switch self {
@@ -29,6 +31,8 @@ struct ContentView: View {
                 return "folder:\(folder.id)"
             case .album(let album, _):
                 return "album:\(album.id)"
+            case .albumGrid(let folder):
+                return "album-grid:\(folder.id)"
             }
         }
     }
@@ -216,20 +220,40 @@ struct ContentView: View {
     }
 
     private var visibleFolderListItems: [FolderListItem] {
-        store.albumFolders.flatMap { folderListItems(for: $0) }
+        store.albumFolders.flatMap {
+            folderListItems(for: $0, albumPresentation: folderPresentation)
+        }
     }
 
     private func folderListItems(
         for folder: PhotoAlbumFolder,
-        depth: Int = 0
+        depth: Int = 0,
+        albumPresentation: FolderPresentation
     ) -> [FolderListItem] {
         var items: [FolderListItem] = [.folder(folder, depth: depth)]
         guard expandedFolderIDs.contains(folder.id) else { return items }
 
         for subfolder in folder.subfolders {
-            items.append(contentsOf: folderListItems(for: subfolder, depth: depth + 1))
+            items.append(contentsOf: folderListItems(
+                for: subfolder,
+                depth: depth + 1,
+                albumPresentation: albumPresentation
+            ))
         }
-        items.append(contentsOf: folder.albums.map { .album($0, depth: depth + 1) })
+
+        if albumPresentation == .grid {
+            if !folder.albums.isEmpty {
+                // Keep the grid as a peer List row instead of nesting it in
+                // the folder row. Nested lazy grids make List recalculate a
+                // large, changing row while scrolling, which can leave the
+                // row with the right height but no painted tiles.
+                items.append(.albumGrid(folder))
+            }
+        } else {
+            items.append(contentsOf: folder.albums.map {
+                .album($0, depth: depth + 1)
+            })
+        }
         return items
     }
 
@@ -238,7 +262,13 @@ struct ContentView: View {
     }
 
     private func toggleFolder(_ folder: PhotoAlbumFolder) {
-        withAnimation(.snappy(duration: 0.22)) {
+        // The folder header is its own List row. Animating the parent List's
+        // insert/delete transaction makes the list preserve its scroll anchor
+        // by moving the visible header up and down. Update the structure
+        // without that transaction; the chevron below still animates locally.
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
             if expandedFolderIDs.contains(folder.id) {
                 expandedFolderIDs.remove(folder.id)
             } else {
@@ -249,6 +279,11 @@ struct ContentView: View {
 
     private var folderPresentation: FolderPresentation {
         FolderPresentation(rawValue: folderPresentationRawValue) ?? .list
+    }
+
+    private var albumTileColumnCount: Int? {
+        let preset = AlbumTileColumnCount(rawValue: albumTileColumnCountRawValue) ?? .automatic
+        return preset == .automatic ? nil : preset.rawValue
     }
 
     private var folderGridMinimumWidth: CGFloat {
@@ -266,12 +301,13 @@ struct ContentView: View {
                 guard value.isFinite else { return }
                 let clampedValue = min(max(value, 0.75), 1.6)
                 let updatedWidth = CGFloat(folderGridMinimumWidthStorage) * clampedValue
-                withAnimation(.snappy(duration: 0.22)) {
-                    folderGridMinimumWidthStorage = Double(
-                        min(max(updatedWidth, 88), 220)
-                    )
-                    albumGridLayoutGeneration &+= 1
-                }
+                // The magnification gesture already provides the interactive
+                // transition. Animating the stored width again here makes
+                // List remeasure every tile a second time and can leave a
+                // nested grid with a blank but oversized row.
+                folderGridMinimumWidthStorage = Double(
+                    min(max(updatedWidth, 88), 220)
+                )
             }
     }
 
@@ -288,7 +324,7 @@ struct ContentView: View {
                     AlbumGrid(
                         albums: store.topLevelAlbums,
                         minimumWidth: folderGridMinimumWidth,
-                        layoutGeneration: albumGridLayoutGeneration,
+                        columnCount: albumTileColumnCount,
                         usesListRowInsets: true,
                         onSelectAlbum: { album in
                             selection = .album(album.id)
@@ -299,7 +335,10 @@ struct ContentView: View {
             }
         } header: {
             HStack(spacing: 8) {
-                Label("普通相册", systemImage: "rectangle.stack")
+                AlbumSectionHeaderLabel(
+                    title: "普通相册",
+                    systemImage: "rectangle.stack"
+                )
                 Spacer(minLength: 8)
                 Text(store.topLevelAlbums.count.formatted())
                     .font(.caption)
@@ -323,26 +362,11 @@ struct ContentView: View {
     @ViewBuilder
     private var foldersSection: some View {
         Section {
-            if folderPresentation == .list {
-                ForEach(visibleFolderListItems) { item in
-                    folderListItemView(item)
-                }
-            } else {
-                ForEach(store.albumFolders) { folder in
-                    AlbumFolderSidebarRow(
-                        folder: folder,
-                        albumPresentation: folderPresentation,
-                        minimumWidth: folderGridMinimumWidth,
-                        layoutGeneration: albumGridLayoutGeneration,
-                        magnificationGesture: albumGridMagnificationGesture,
-                        onSelectAlbum: { album in
-                            selection = .album(album.id)
-                        }
-                    )
-                }
+            ForEach(visibleFolderListItems) { item in
+                folderListItemView(item)
             }
         } header: {
-            Text("文件夹")
+            AlbumSectionHeaderLabel(title: "文件夹", systemImage: "folder")
         }
     }
 
@@ -360,37 +384,64 @@ struct ContentView: View {
             AlbumSidebarRow(album: album)
                 .padding(.leading, folderListIndent(for: depth))
                 .tag(PhotoSection.album(album.id))
+        case .albumGrid(let folder):
+            AlbumGrid(
+                albums: folder.albums,
+                minimumWidth: folderGridMinimumWidth,
+                columnCount: albumTileColumnCount,
+                usesListRowInsets: true,
+                onSelectAlbum: { album in
+                    selection = .album(album.id)
+                },
+                magnificationGesture: albumGridMagnificationGesture
+            )
+            .accessibilityElement(children: .contain)
         }
     }
 
     @ViewBuilder
     private var sharedAlbumsSection: some View {
         Section {
-            if folderPresentation == .list {
-                ForEach(store.topLevelSharedAlbums) { album in
-                    AlbumSidebarRow(album: album)
-                        .tag(PhotoSection.album(album.id))
+            if sharedAlbumsExpanded {
+                if folderPresentation == .list {
+                    ForEach(store.topLevelSharedAlbums) { album in
+                        AlbumSidebarRow(album: album)
+                            .tag(PhotoSection.album(album.id))
+                    }
+                } else {
+                    AlbumGrid(
+                        albums: store.topLevelSharedAlbums,
+                        minimumWidth: folderGridMinimumWidth,
+                        columnCount: albumTileColumnCount,
+                        usesListRowInsets: true,
+                        onSelectAlbum: { album in
+                            selection = .album(album.id)
+                        },
+                        magnificationGesture: albumGridMagnificationGesture
+                    )
                 }
-            } else {
-                AlbumGrid(
-                    albums: store.topLevelSharedAlbums,
-                    minimumWidth: folderGridMinimumWidth,
-                    layoutGeneration: albumGridLayoutGeneration,
-                    usesListRowInsets: true,
-                    onSelectAlbum: { album in
-                        selection = .album(album.id)
-                    },
-                    magnificationGesture: albumGridMagnificationGesture
-                )
             }
         } header: {
             HStack(spacing: 8) {
-                Label("共享相册", systemImage: "person.2.fill")
+                AlbumSectionHeaderLabel(
+                    title: "共享相册",
+                    systemImage: "person.2.fill"
+                )
                 Spacer(minLength: 8)
                 Text(store.topLevelSharedAlbums.count.formatted())
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+                Button {
+                    withAnimation(.snappy(duration: 0.22)) {
+                        sharedAlbumsExpanded.toggle()
+                    }
+                } label: {
+                    Image(systemName: sharedAlbumsExpanded ? "chevron.down" : "chevron.right")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(sharedAlbumsExpanded ? "折叠共享相册" : "展开共享相册")
             }
             .padding(.vertical, 5)
         }
@@ -405,8 +456,10 @@ struct ContentView: View {
                 assets: store.allPhotos,
                 store: store
             )
+            .id("library-detail")
         case .unsorted:
             UnsortedPhotosScreen(store: store)
+                .id("unsorted-detail")
         case .album(let id):
             if let album = store.album(withID: id) {
                 PhotoGridScreen(
@@ -415,6 +468,7 @@ struct ContentView: View {
                     store: store,
                     album: album
                 )
+                .id("album-detail-\(id)")
             } else {
                 ContentUnavailableView(
                     "相册已不可用",
@@ -454,13 +508,28 @@ private struct AlbumRefreshStatusRow: View {
     }
 }
 
+private struct AlbumSectionHeaderLabel: View {
+    let title: String
+    let systemImage: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .frame(width: 20, height: 20, alignment: .center)
+            Text(title)
+        }
+    }
+}
+
 private struct AlbumGrid<GestureType: Gesture>: View {
     let albums: [PhotoAlbum]
     let minimumWidth: CGFloat
-    let layoutGeneration: Int
+    let columnCount: Int?
     let usesListRowInsets: Bool
     let onSelectAlbum: (PhotoAlbum) -> Void
     let magnificationGesture: GestureType
+
+    @State private var availableWidth: CGFloat = 0
 
     var body: some View {
         Group {
@@ -471,10 +540,18 @@ private struct AlbumGrid<GestureType: Gesture>: View {
                 gridContent
             }
         }
+        .onPreferenceChange(AlbumGridWidthPreferenceKey.self) { width in
+            guard width > 0, abs(width - availableWidth) > 0.5 else { return }
+            availableWidth = width
+        }
     }
 
     private var gridContent: some View {
-        AlbumGridLayout(minimumItemWidth: minimumWidth, spacing: 12) {
+        LazyVGrid(
+            columns: gridColumns,
+            alignment: .leading,
+            spacing: 16
+        ) {
             ForEach(albums) { album in
                 AlbumGridCell(album: album) {
                     onSelectAlbum(album)
@@ -482,114 +559,61 @@ private struct AlbumGrid<GestureType: Gesture>: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .id(layoutGeneration)
-        .padding(.vertical, usesListRowInsets ? 0 : 12)
-        .padding(.horizontal, 0)
+        // Album grids live inside a List row. Asking the grid for its full
+        // intrinsic height prevents List from keeping the previous row
+        // measurement after a 2-column -> 1-column transition.
         .fixedSize(horizontal: false, vertical: true)
+        .padding(.vertical, usesListRowInsets ? 0 : 12)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: AlbumGridWidthPreferenceKey.self,
+                    value: proxy.size.width
+                )
+            }
+        }
+        // LazyVGrid's adaptive layout can keep its old column arrangement
+        // when it is embedded in List and the minimum width changes during a
+        // pinch. Rebuild only when the effective column count changes; the
+        // tiles themselves keep stable album IDs, so this is cheap for the
+        // small album list and deterministic at the transition boundary.
+        .id("album-grid-columns-\(resolvedColumnCount)")
         // Pinch-to-zoom must win over the buttons inside the grid. With a
         // simultaneous gesture, ending a pinch can also be interpreted as a
         // card tap and open an album unexpectedly.
         .highPriorityGesture(magnificationGesture, including: .all)
     }
+
+    private var resolvedColumnCount: Int {
+        if let columnCount, columnCount > 0 {
+            return columnCount
+        }
+
+        guard availableWidth > 0 else { return 1 }
+        let spacing: CGFloat = 12
+        return max(
+            1,
+            Int((availableWidth + spacing) / (minimumWidth + spacing))
+        )
+    }
+
+    private var gridColumns: [GridItem] {
+        Array(
+            repeating: GridItem(
+                .flexible(minimum: 0),
+                spacing: 12,
+                alignment: .top
+            ),
+            count: resolvedColumnCount
+        )
+    }
 }
 
-private struct AlbumGridLayout: Layout {
-    let minimumItemWidth: CGFloat
-    let spacing: CGFloat
+private struct AlbumGridWidthPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
 
-    func sizeThatFits(
-        proposal: ProposedViewSize,
-        subviews: Subviews,
-        cache: inout ()
-    ) -> CGSize {
-        let width = resolvedWidth(for: proposal, subviewCount: subviews.count)
-        let columns = columnCount(for: width)
-        let itemWidth = itemWidth(for: width, columns: columns)
-        let rowHeights = rowHeights(
-            for: subviews,
-            columns: columns,
-            itemWidth: itemWidth
-        )
-        let height = rowHeights.reduce(0, +)
-            + spacing * CGFloat(max(0, rowHeights.count - 1))
-        return CGSize(width: width, height: height)
-    }
-
-    func placeSubviews(
-        in bounds: CGRect,
-        proposal: ProposedViewSize,
-        subviews: Subviews,
-        cache: inout ()
-    ) {
-        guard !subviews.isEmpty else { return }
-
-        let width = max(bounds.width, 1)
-        let columns = columnCount(for: width)
-        let itemWidth = itemWidth(for: width, columns: columns)
-        let rowHeights = rowHeights(
-            for: subviews,
-            columns: columns,
-            itemWidth: itemWidth
-        )
-
-        var rowOriginY = bounds.minY
-        for row in 0..<rowHeights.count {
-            let rowHeight = rowHeights[row]
-            let startIndex = row * columns
-            let endIndex = min(startIndex + columns, subviews.count)
-
-            for index in startIndex..<endIndex {
-                let column = index - startIndex
-                let originX = bounds.minX + CGFloat(column) * (itemWidth + spacing)
-                subviews[index].place(
-                    at: CGPoint(x: originX, y: rowOriginY),
-                    anchor: .topLeading,
-                    proposal: ProposedViewSize(width: itemWidth, height: rowHeight)
-                )
-            }
-
-            rowOriginY += rowHeight + spacing
-        }
-    }
-
-    private func resolvedWidth(
-        for proposal: ProposedViewSize,
-        subviewCount: Int
-    ) -> CGFloat {
-        if let width = proposal.width, width.isFinite, width > 0 {
-            return width
-        }
-        return max(
-            minimumItemWidth,
-            CGFloat(max(1, min(subviewCount, 3))) * minimumItemWidth
-                + CGFloat(max(0, min(subviewCount, 3) - 1)) * spacing
-        )
-    }
-
-    private func columnCount(for width: CGFloat) -> Int {
-        max(1, Int((width + spacing) / (minimumItemWidth + spacing)))
-    }
-
-    private func itemWidth(for width: CGFloat, columns: Int) -> CGFloat {
-        (width - CGFloat(columns - 1) * spacing) / CGFloat(columns)
-    }
-
-    private func rowHeights(
-        for subviews: Subviews,
-        columns: Int,
-        itemWidth: CGFloat
-    ) -> [CGFloat] {
-        stride(from: 0, to: subviews.count, by: columns).map { startIndex in
-            let endIndex = min(startIndex + columns, subviews.count)
-            return (startIndex..<endIndex).reduce(CGFloat.zero) { height, index in
-                max(
-                    height,
-                    subviews[index].sizeThatFits(
-                        ProposedViewSize(width: itemWidth, height: nil)
-                    ).height
-                )
-            }
-        }
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
@@ -660,7 +684,7 @@ private struct AlbumGridThumbnail: View {
                 if let asset {
                     AssetImageView(
                         asset: asset,
-                        targetSize: CGSize(width: 360, height: 360)
+                        targetSize: CGSize(width: 256, height: 256)
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
@@ -840,17 +864,19 @@ private struct AlbumFolderSidebarRowLabel: View {
 
             Spacer(minLength: 8)
 
-            Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+            Image(systemName: "chevron.right")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
+                .rotationEffect(isExpanded ? .degrees(90) : .zero)
+                .animation(.easeInOut(duration: 0.16), value: isExpanded)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 6)
+        .frame(height: 44, alignment: .center)
         .contentShape(Rectangle())
     }
 
     private var folderSummary: String {
-        let albumCount = folder.allAlbums.count
+        let albumCount = folder.albumCount
         if albumCount == 0 {
             return "空文件夹"
         }
@@ -862,7 +888,7 @@ private struct AlbumFolderSidebarRow<GestureType: Gesture>: View {
     let folder: PhotoAlbumFolder
     let albumPresentation: FolderPresentation
     let minimumWidth: CGFloat
-    let layoutGeneration: Int
+    let columnCount: Int?
     let magnificationGesture: GestureType
     let onSelectAlbum: (PhotoAlbum) -> Void
 
@@ -886,7 +912,7 @@ private struct AlbumFolderSidebarRow<GestureType: Gesture>: View {
                             folder: childFolder,
                             albumPresentation: albumPresentation,
                             minimumWidth: minimumWidth,
-                            layoutGeneration: layoutGeneration,
+                            columnCount: columnCount,
                             magnificationGesture: magnificationGesture,
                             onSelectAlbum: onSelectAlbum
                         )
@@ -906,21 +932,24 @@ private struct AlbumFolderSidebarRow<GestureType: Gesture>: View {
                         AlbumGrid(
                             albums: folder.albums,
                             minimumWidth: minimumWidth,
-                            layoutGeneration: layoutGeneration,
+                            columnCount: columnCount,
                             usesListRowInsets: false,
                             onSelectAlbum: onSelectAlbum,
                             magnificationGesture: magnificationGesture
                         )
                     }
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                // Keep the expanded content in place while the row grows.
+                // Moving it from the top can make the first tile paint over
+                // the folder title during List's own row measurement pass.
+                .transition(.opacity)
             }
         }
         .animation(.snappy(duration: 0.22), value: isExpanded)
     }
 
     private var folderSummary: String {
-        let albumCount = folder.allAlbums.count
+        let albumCount = folder.albumCount
         if albumCount == 0 {
             return "空文件夹"
         }
@@ -1019,7 +1048,7 @@ private struct AlbumFolderGridCard: View {
     }
 
     private var folderSummary: String {
-        let albumCount = folder.allAlbums.count
+        let albumCount = folder.albumCount
         if albumCount == 0 {
             return "空文件夹"
         }
@@ -1087,7 +1116,13 @@ private struct AlbumSidebarRow: View {
             if let previewAsset = album.previewAsset {
                 AssetImageView(
                     asset: previewAsset,
-                    targetSize: CGSize(width: 88, height: 88)
+                    // The row is only 34 points wide. Request a small,
+                    // retina-friendly preview so scrolling the sidebar does
+                    // not decode a much larger image than it can display.
+                    targetSize: CGSize(width: 72, height: 72),
+                    cacheResult: true,
+                    cacheScope: .albumThumbnail,
+                    usesPhotoKitCaching: false
                 )
                 .frame(width: 34, height: 34)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -1106,7 +1141,7 @@ private struct AlbumSidebarRow: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 6)
+        .frame(height: 44, alignment: .center)
         .contentShape(Rectangle())
     }
 }
@@ -1227,10 +1262,16 @@ private struct DebugPerformanceView: View {
 
 struct PhotoVaultSettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(AlbumTileColumnCount.storageKey)
+    private var albumTileColumnCountRawValue = AlbumTileColumnCount.automatic.rawValue
     @AppStorage(PhotoSwipeStyle.storageKey)
     private var swipeStyleRawValue = PhotoSwipeStyle.system.rawValue
     @AppStorage(SlideshowTransitionStyle.storageKey)
     private var slideshowTransitionRawValue = SlideshowTransitionStyle.fade.rawValue
+
+    private var selectedAlbumTileColumnCount: AlbumTileColumnCount {
+        AlbumTileColumnCount(rawValue: albumTileColumnCountRawValue) ?? .automatic
+    }
 
     private var selectedSwipeStyle: PhotoSwipeStyle {
         PhotoSwipeStyle(rawValue: swipeStyleRawValue) ?? .system
@@ -1243,6 +1284,18 @@ struct PhotoVaultSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("相册平铺") {
+                    Picker("每行列数", selection: $albumTileColumnCountRawValue) {
+                        ForEach(AlbumTileColumnCount.allCases) { columnCount in
+                            Text(columnCount.title).tag(columnCount.rawValue)
+                        }
+                    }
+
+                    Text(selectedAlbumTileColumnCount.detail)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("图片左右滑动") {
                     Picker("切换样式", selection: $swipeStyleRawValue) {
                         ForEach(PhotoSwipeStyle.allCases) { style in

@@ -25,3 +25,5 @@ PhotoVault 是一个原生 SwiftUI + PhotoKit 的 iOS / iPadOS 相册首版。
 ## 运行
 
 用 Xcode 打开 `PhotoVault.xcodeproj`，选择 iPhone 或 iPad 模拟器/真机运行。部署目标为 iOS/iPadOS 26.0，首次运行需要允许照片访问。
+
+开发约束、性能注意事项、详情分页手势和真机验证中的踩坑记录见 [`AGENTS.md`](AGENTS.md)。

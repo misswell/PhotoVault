@@ -61,6 +61,10 @@ final class PhotoAlbumFolder: Identifiable {
     let title: String
     let albums: [PhotoAlbum]
     let subfolders: [PhotoAlbumFolder]
+    let albumCount: Int
+    let assetCount: Int
+    let previewAsset: PHAsset?
+    private let flattenedAlbums: [PhotoAlbum]
 
     init(
         collection: PHCollectionList,
@@ -72,24 +76,61 @@ final class PhotoAlbumFolder: Identifiable {
         self.title = title
         self.albums = albums
         self.subfolders = subfolders
+        albumCount = albums.count + subfolders.reduce(0) { $0 + $1.albumCount }
+        assetCount = albums.reduce(0) { $0 + $1.assetCount }
+            + subfolders.reduce(0) { $0 + $1.assetCount }
+        previewAsset = albums.first?.previewAsset ?? subfolders.first?.previewAsset
+        flattenedAlbums = albums + subfolders.flatMap(\.allAlbums)
     }
 
     var id: String {
         collection.localIdentifier
     }
 
-    var assetCount: Int {
-        albums.reduce(0) { $0 + $1.assetCount }
-            + subfolders.reduce(0) { $0 + $1.assetCount }
-    }
-
-    var previewAsset: PHAsset? {
-        albums.first?.previewAsset ?? subfolders.first?.previewAsset
-    }
-
     var allAlbums: [PhotoAlbum] {
-        albums + subfolders.flatMap(\.allAlbums)
+        flattenedAlbums
     }
+}
+
+enum AlbumTileColumnCount: Int, CaseIterable, Identifiable {
+    case automatic = 0
+    case two = 2
+    case three = 3
+    case four = 4
+    case five = 5
+
+    static let storageKey = "PhotoVault.home.albumTileColumns"
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic:
+            return "自动"
+        case .two:
+            return "2 列"
+        case .three:
+            return "3 列"
+        case .four:
+            return "4 列"
+        case .five:
+            return "5 列"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .automatic:
+            return "根据可用宽度和双指缩放自动排列。"
+        case .two, .three, .four, .five:
+            return "文件夹内和普通/共享相册平铺时固定显示为 \(rawValue) 列。"
+        }
+    }
+}
+
+enum PhotoGridPreferences {
+    static let preferredCellSideKey = "PhotoVault.photoGrid.preferredCellSide"
+    static let defaultPreferredCellSide = 50.0
 }
 
 enum PhotoSection: Hashable {

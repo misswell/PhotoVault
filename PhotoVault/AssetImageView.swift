@@ -7,6 +7,9 @@ struct AssetImageView: View {
     let targetSize: CGSize
     let contentMode: PHImageContentMode
     let requestPriority: PhotoRequestPriority
+    let cacheResult: Bool
+    let cacheScope: PhotoImageCacheScope
+    let usesPhotoKitCaching: Bool
     let onLoadStateChange: ((Bool) -> Void)?
 
     @State private var image: UIImage?
@@ -26,12 +29,18 @@ struct AssetImageView: View {
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFill,
         requestPriority: PhotoRequestPriority = .visibleGrid,
+        cacheResult: Bool? = nil,
+        cacheScope: PhotoImageCacheScope = .standard,
+        usesPhotoKitCaching: Bool = true,
         onLoadStateChange: ((Bool) -> Void)? = nil
     ) {
         self.asset = asset
         self.targetSize = targetSize
         self.contentMode = contentMode
         self.requestPriority = requestPriority
+        self.cacheResult = cacheResult ?? (requestPriority <= .slideshow)
+        self.cacheScope = cacheScope
+        self.usesPhotoKitCaching = usesPhotoKitCaching
         self.onLoadStateChange = onLoadStateChange
     }
 
@@ -124,18 +133,21 @@ struct AssetImageView: View {
         loadError = nil
         onLoadStateChange?(false)
 
-        PhotoImageManager.shared.startCaching(
-            asset: asset,
-            targetSize: targetSize,
-            contentMode: contentMode,
-            isNetworkAccessAllowed: requestPriority <= .slideshow
-        )
+        if usesPhotoKitCaching {
+            PhotoImageManager.shared.startCaching(
+                asset: asset,
+                targetSize: targetSize,
+                contentMode: contentMode,
+                isNetworkAccessAllowed: requestPriority <= .slideshow
+            )
+        }
         requestHandle = PhotoImageManager.shared.requestImage(
             for: asset,
             targetSize: targetSize,
             contentMode: contentMode,
             priority: requestPriority,
-            cacheResult: requestPriority <= .slideshow,
+            cacheResult: cacheResult,
+            cacheScope: cacheScope,
             progressHandler: { progress, error, _, _ in
                 Task { @MainActor in
                     guard self.activeRequestKey == requestKey else { return }
@@ -169,7 +181,11 @@ struct AssetImageView: View {
                 }
                 self.loadError = nil
                 self.loadProgress = 1
-                withAnimation(.easeOut(duration: 0.16)) {
+                if self.shouldAnimateAppearance {
+                    withAnimation(.easeOut(duration: 0.16)) {
+                        self.image = image
+                    }
+                } else {
                     self.image = image
                 }
                 // A degraded iCloud thumbnail is still a valid displayable
@@ -192,17 +208,24 @@ struct AssetImageView: View {
     }
 
     private var shouldAnimateAppearance: Bool {
-        requestPriority > .viewer
+        // The full-screen pager owns the configured page transition. A
+        // separate opacity animation here makes a cached neighbor slide in
+        // while an iCloud neighbor appears to fade, so consecutive swipes
+        // look inconsistent. Grid thumbnails are aspect-fill and already
+        // return false here.
+        false
     }
 
     private func cancelImageRequest() {
         PhotoImageManager.shared.cancel(requestHandle)
-        PhotoImageManager.shared.stopCaching(
-            asset: asset,
-            targetSize: targetSize,
-            contentMode: contentMode,
-            isNetworkAccessAllowed: requestPriority <= .slideshow
-        )
+        if usesPhotoKitCaching {
+            PhotoImageManager.shared.stopCaching(
+                asset: asset,
+                targetSize: targetSize,
+                contentMode: contentMode,
+                isNetworkAccessAllowed: requestPriority <= .slideshow
+            )
+        }
         requestHandle = nil
         activeRequestKey = nil
     }
@@ -244,6 +267,7 @@ struct ZoomableAssetView: View {
     @State private var offset: CGSize = .zero
     @State private var lastOffset: CGSize = .zero
     @State private var isPinching = false
+    @State private var isDragging = false
 
     var body: some View {
         GeometryReader { proxy in
@@ -265,7 +289,14 @@ struct ZoomableAssetView: View {
             // still be handled by the surrounding pager.
             image
                 .highPriorityGesture(magnificationGesture)
-                .simultaneousGesture(dragGesture)
+                // At the base scale the page controller must receive the
+                // one-finger drag. Keep the gesture modifier stable to avoid
+                // interrupting a pinch, but make its recognizer inactive
+                // until the image is actually zoomed.
+                .simultaneousGesture(
+                    dragGesture,
+                    including: scale > 1.01 ? .all : .subviews
+                )
             .contentShape(Rectangle())
             .onTapGesture(count: 2) {
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
@@ -286,6 +317,10 @@ struct ZoomableAssetView: View {
         .clipped()
         .onDisappear {
             isPinching = false
+            isDragging = false
+            PagerDiagnostics.log(
+                "image viewer disappear asset=\(asset.localIdentifier)"
+            )
             onZoomingChanged?(false)
         }
     }
@@ -295,6 +330,9 @@ struct ZoomableAssetView: View {
             .onChanged { value in
                 if !isPinching {
                     isPinching = true
+                    PagerDiagnostics.log(
+                        "pinch began asset=\(asset.localIdentifier) scale=\(scale)"
+                    )
                     onZoomingChanged?(true)
                 }
                 scale = min(max(lastScale * value, 1), 4)
@@ -306,13 +344,22 @@ struct ZoomableAssetView: View {
                     offset = .zero
                     lastOffset = .zero
                 }
+                PagerDiagnostics.log(
+                    "pinch ended asset=\(asset.localIdentifier) scale=\(scale)"
+                )
                 onZoomingChanged?(scale > 1.01)
             }
     }
 
     private var dragGesture: some Gesture {
-        DragGesture()
+        DragGesture(minimumDistance: scale > 1.01 ? 1 : 10_000)
             .onChanged { value in
+                if !isDragging {
+                    isDragging = true
+                    PagerDiagnostics.log(
+                        "image drag began asset=\(asset.localIdentifier) scale=\(scale) pinching=\(isPinching)"
+                    )
+                }
                 guard scale > 1.01, !isPinching else { return }
                 offset = CGSize(
                     width: lastOffset.width + value.translation.width,
@@ -320,6 +367,13 @@ struct ZoomableAssetView: View {
                 )
             }
             .onEnded { _ in
+                let didDrag = isDragging
+                isDragging = false
+                if didDrag {
+                    PagerDiagnostics.log(
+                        "image drag ended asset=\(asset.localIdentifier) scale=\(scale)"
+                    )
+                }
                 guard scale > 1.01 else { return }
                 lastOffset = offset
             }

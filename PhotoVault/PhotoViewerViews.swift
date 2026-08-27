@@ -3,6 +3,67 @@ import SwiftUI
 import UIKit
 import AVKit
 import PhotosUI
+import OSLog
+
+#if DEBUG
+@MainActor
+enum PagerDiagnostics {
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "com.misswell.PhotoVault",
+        category: "Pager"
+    )
+    private static let maxLogBytes = 512 * 1024
+    private static var hasStartedSession = false
+
+    private static var logURL: URL {
+        let cachesDirectory = FileManager.default.urls(
+            for: .cachesDirectory,
+            in: .userDomainMask
+        )[0]
+        return cachesDirectory
+            .appendingPathComponent("PhotoVault", isDirectory: true)
+            .appendingPathComponent("PagerDiagnostics.log")
+    }
+
+    static func beginSession() {
+        guard !hasStartedSession else { return }
+        hasStartedSession = true
+        let url = logURL
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try? Data().write(to: url, options: .atomic)
+        log("session started")
+    }
+
+    static func log(_ message: String) {
+        logger.log(level: .debug, "\(message, privacy: .public)")
+
+        let line = "\(Date()) \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        let url = logURL
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        let existing = (try? Data(contentsOf: url)) ?? Data()
+        var combined = existing
+        if existing.count + data.count > maxLogBytes {
+            combined = data
+        } else {
+            combined.append(data)
+        }
+        try? combined.write(to: url, options: .atomic)
+    }
+}
+#else
+enum PagerDiagnostics {
+    static func beginSession() {}
+    static func log(_ message: String) {}
+}
+#endif
 
 private func viewerPageTransition(
     style: PhotoSwipeStyle,
@@ -108,6 +169,376 @@ private struct ViewerMediaView: View {
     }
 }
 
+/// UIKit's page controller owns the interactive transition from beginning to
+/// end. SwiftUI's TabView is convenient for a static pager, but resetting its
+/// selection while its internal UIPageViewController is still animating can
+/// make the next swipe a no-op. This wrapper keeps one controller per nearby
+/// asset and lets the delegate report the completed page exactly once.
+private struct NativePhotoPager: UIViewControllerRepresentable {
+    let pageCount: Int
+    @Binding var currentIndex: Int
+    let assetProvider: (Int) -> PHAsset?
+    let targetSize: CGSize
+    let contentMode: PHImageContentMode
+    let neighborPriority: PhotoRequestPriority
+    let onMediaReady: ((Bool) -> Void)?
+    let onZoomingChanged: ((Bool) -> Void)?
+
+    func makeCoordinator() -> Coordinator {
+        PagerDiagnostics.beginSession()
+        return Coordinator(currentIndex: $currentIndex)
+    }
+
+    func makeUIViewController(context: Context) -> UIPageViewController {
+        let controller = UIPageViewController(
+            transitionStyle: .scroll,
+            navigationOrientation: .horizontal,
+            options: [
+                UIPageViewController.OptionsKey.interPageSpacing: 0
+            ]
+        )
+        controller.dataSource = context.coordinator
+        controller.delegate = context.coordinator
+        context.coordinator.attach(controller: controller)
+        context.coordinator.update(
+            pageCount: pageCount,
+            currentIndex: currentIndex,
+            assetProvider: assetProvider,
+            targetSize: targetSize,
+            contentMode: contentMode,
+            neighborPriority: neighborPriority,
+            onMediaReady: onMediaReady,
+            onZoomingChanged: onZoomingChanged
+        )
+        return controller
+    }
+
+    func updateUIViewController(
+        _ controller: UIPageViewController,
+        context: Context
+    ) {
+        context.coordinator.update(
+            pageCount: pageCount,
+            currentIndex: currentIndex,
+            assetProvider: assetProvider,
+            targetSize: targetSize,
+            contentMode: contentMode,
+            neighborPriority: neighborPriority,
+            onMediaReady: onMediaReady,
+            onZoomingChanged: onZoomingChanged
+        )
+    }
+
+    static func dismantleUIViewController(
+        _ uiViewController: UIPageViewController,
+        coordinator: Coordinator
+    ) {
+        coordinator.invalidate()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, UIPageViewControllerDataSource, UIPageViewControllerDelegate {
+        private weak var pageController: UIPageViewController?
+        private var pageCount = 0
+        private var displayedIndex: Int?
+        private var assetProvider: ((Int) -> PHAsset?) = { _ in nil }
+        private var targetSize = CGSize.zero
+        private var contentMode: PHImageContentMode = .aspectFit
+        private var neighborPriority: PhotoRequestPriority = .slideshow
+        private var onMediaReady: ((Bool) -> Void)?
+        private var onZoomingChanged: ((Bool) -> Void)?
+        private var isZooming = false
+        private var pages: [Int: PhotoPagerPageController] = [:]
+        private var currentIndexBinding: Binding<Int>
+        private var pendingProgrammaticIndex: Int?
+        private var lastUpdateSignature = ""
+
+        init(currentIndex: Binding<Int>) {
+            currentIndexBinding = currentIndex
+            PagerDiagnostics.log("coordinator init index=\(currentIndex.wrappedValue)")
+        }
+
+        func attach(controller: UIPageViewController) {
+            pageController = controller
+        }
+
+        func invalidate() {
+            guard pageController != nil || !pages.isEmpty else { return }
+            PagerDiagnostics.log(
+                "coordinator invalidate displayed=\(displayedIndex.map(String.init) ?? "none")"
+            )
+
+            // A cover can begin its dismissal while UIPageViewController is
+            // still finishing a horizontal transition. Detach the delegates
+            // before releasing the hosted pages so a late UIKit callback
+            // cannot write into the screen that is already going away.
+            pageController?.dataSource = nil
+            pageController?.delegate = nil
+            pageController?.view.isUserInteractionEnabled = false
+            pages.removeAll()
+            pendingProgrammaticIndex = nil
+            displayedIndex = nil
+            if isZooming {
+                isZooming = false
+                onZoomingChanged?(false)
+            }
+            onMediaReady = nil
+            onZoomingChanged = nil
+            assetProvider = { _ in nil }
+            pageController = nil
+        }
+
+        func update(
+            pageCount: Int,
+            currentIndex: Int,
+            assetProvider: @escaping (Int) -> PHAsset?,
+            targetSize: CGSize,
+            contentMode: PHImageContentMode,
+            neighborPriority: PhotoRequestPriority,
+            onMediaReady: ((Bool) -> Void)?,
+            onZoomingChanged: ((Bool) -> Void)?
+        ) {
+            self.pageCount = max(0, pageCount)
+            self.assetProvider = assetProvider
+            self.targetSize = targetSize
+            self.contentMode = contentMode
+            self.neighborPriority = neighborPriority
+            self.onMediaReady = onMediaReady
+            self.onZoomingChanged = onZoomingChanged
+
+            guard self.pageCount > 0,
+                  let pageController
+            else { return }
+
+            let clampedIndex = min(
+                max(0, currentIndex),
+                self.pageCount - 1
+            )
+
+            let displayed = self.displayedIndex.map(String.init) ?? "none"
+            let pending = self.pendingProgrammaticIndex.map(String.init) ?? "none"
+            let updateSignature = "count=\(self.pageCount) current=\(clampedIndex) displayed=\(displayed) pending=\(pending)"
+            if updateSignature != lastUpdateSignature {
+                lastUpdateSignature = updateSignature
+                PagerDiagnostics.log("update \(updateSignature)")
+            }
+
+            refreshPages(around: clampedIndex)
+
+            guard let displayedIndex else {
+                setInitialPage(to: clampedIndex)
+                return
+            }
+
+            // SwiftUI may call updateUIViewController more than once while
+            // the destination page is downloading. Do not restart the same
+            // UIKit transition on every asset/cache update.
+            if pendingProgrammaticIndex == clampedIndex {
+                return
+            }
+            guard pendingProgrammaticIndex == nil else { return }
+
+            // A filmstrip tap or another external control can change the
+            // binding without going through the page controller delegate.
+            // Move directly to that asset and leave the controller centered
+            // there; there is no selection value to reset afterward.
+            guard displayedIndex != clampedIndex,
+                  let visiblePage = pageController.viewControllers?.first as? PhotoPagerPageController
+            else { return }
+
+            let direction: UIPageViewController.NavigationDirection =
+                clampedIndex > visiblePage.index ? .forward : .reverse
+            guard let targetPage = page(at: clampedIndex) else { return }
+            pendingProgrammaticIndex = clampedIndex
+            let directionName = direction == .forward ? "forward" : "reverse"
+            PagerDiagnostics.log(
+                "external transition from=\(visiblePage.index) to=\(clampedIndex) direction=\(directionName)"
+            )
+            pageController.setViewControllers(
+                [targetPage],
+                direction: direction,
+                animated: true
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.pendingProgrammaticIndex = nil
+                self.displayedIndex = clampedIndex
+                if self.isZooming {
+                    self.isZooming = false
+                    self.onZoomingChanged?(false)
+                }
+                PagerDiagnostics.log("external transition completed=\(clampedIndex)")
+                self.refreshPages(around: clampedIndex)
+            }
+        }
+
+        func pageViewController(
+            _ pageViewController: UIPageViewController,
+            viewControllerBefore viewController: UIViewController
+        ) -> UIViewController? {
+            guard !isZooming,
+                  let photoPage = viewController as? PhotoPagerPageController
+            else { return nil }
+            PagerDiagnostics.log(
+                "data source before page=\(photoPage.index) target=\(photoPage.index - 1) zoom=\(isZooming)"
+            )
+            return page(at: photoPage.index - 1)
+        }
+
+        func pageViewController(
+            _ pageViewController: UIPageViewController,
+            viewControllerAfter viewController: UIViewController
+        ) -> UIViewController? {
+            guard !isZooming,
+                  let photoPage = viewController as? PhotoPagerPageController
+            else { return nil }
+            PagerDiagnostics.log(
+                "data source after page=\(photoPage.index) target=\(photoPage.index + 1) zoom=\(isZooming)"
+            )
+            return page(at: photoPage.index + 1)
+        }
+
+        func pageViewController(
+            _ pageViewController: UIPageViewController,
+            didFinishAnimating finished: Bool,
+            previousViewControllers: [UIViewController],
+            transitionCompleted completed: Bool
+        ) {
+            let visibleIndex = (pageViewController.viewControllers?.first as? PhotoPagerPageController)
+                .map { String($0.index) } ?? "none"
+            PagerDiagnostics.log(
+                "transition finished=\(finished) completed=\(completed) visible=\(visibleIndex)"
+            )
+            guard finished,
+                  completed,
+                  let visiblePage = pageViewController.viewControllers?.first as? PhotoPagerPageController
+            else { return }
+
+            let newIndex = visiblePage.index
+            pendingProgrammaticIndex = nil
+            displayedIndex = newIndex
+            if isZooming {
+                isZooming = false
+                onZoomingChanged?(false)
+            }
+            refreshPages(around: newIndex)
+
+            if currentIndexBinding.wrappedValue != newIndex {
+                currentIndexBinding.wrappedValue = newIndex
+            }
+        }
+
+        private func setInitialPage(to index: Int) {
+            guard let pageController else { return }
+            guard let initialPage = page(at: index) else { return }
+            PagerDiagnostics.log("set initial page=\(index)")
+            pageController.setViewControllers(
+                [initialPage],
+                direction: .forward,
+                animated: false
+            )
+            displayedIndex = index
+            if isZooming {
+                isZooming = false
+                onZoomingChanged?(false)
+            }
+        }
+
+        private func page(at index: Int) -> PhotoPagerPageController? {
+            guard index >= 0, index < pageCount else { return nil }
+
+            if let existing = pages[index] {
+                existing.rootView = makePageView(for: index)
+                return existing
+            }
+
+            PagerDiagnostics.log("create page=\(index)")
+            let page = PhotoPagerPageController(
+                index: index,
+                rootView: makePageView(for: index)
+            )
+            pages[index] = page
+            return page
+        }
+
+        private func makePageView(for index: Int) -> AnyView {
+            guard index >= 0, index < pageCount,
+                  let asset = assetProvider(index)
+            else {
+                return AnyView(
+                    ZStack {
+                        Color.black
+                        ProgressView("正在读取照片…")
+                            .tint(.white)
+                            .foregroundStyle(.white)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                )
+            }
+
+            return AnyView(
+                ViewerMediaView(
+                    asset: asset,
+                    targetSize: targetSize,
+                    contentMode: contentMode,
+                    requestPriority: displayedIndex == index
+                        ? .viewer
+                        : neighborPriority,
+                    onReady: { [weak self] ready in
+                        guard let self,
+                              self.displayedIndex == index
+                        else { return }
+                        PagerDiagnostics.log(
+                            "media ready index=\(index) ready=\(ready)"
+                        )
+                        self.onMediaReady?(ready)
+                    },
+                    onZoomingChanged: { [weak self] zooming in
+                        guard let self,
+                              self.displayedIndex == index
+                        else { return }
+                        self.isZooming = zooming
+                        self.onZoomingChanged?(zooming)
+                        PagerDiagnostics.log(
+                            "zoom index=\(index) active=\(zooming)"
+                        )
+                    }
+                )
+                .id("native-viewer-\(asset.localIdentifier)")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            )
+        }
+
+        private func refreshPages(around index: Int) {
+            let nearbyIndexes = Set(
+                [index - 1, index, index + 1]
+                    .filter { $0 >= 0 && $0 < pageCount }
+            )
+
+            for nearbyIndex in nearbyIndexes {
+                _ = page(at: nearbyIndex)
+            }
+
+            pages = pages.filter { nearbyIndexes.contains($0.key) }
+        }
+    }
+}
+
+@MainActor
+private final class PhotoPagerPageController: UIHostingController<AnyView> {
+    let index: Int
+
+    init(index: Int, rootView: AnyView) {
+        self.index = index
+        super.init(rootView: rootView)
+        view.backgroundColor = .black
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+}
+
 private struct LivePhotoAssetViewer: View {
     let asset: PHAsset
     let targetSize: CGSize
@@ -126,7 +557,6 @@ private struct LivePhotoAssetViewer: View {
 
             if let livePhoto {
                 LivePhotoUIKitView(livePhoto: livePhoto, contentMode: contentMode)
-                    .transition(.opacity)
             } else if let errorMessage {
                 VStack(spacing: 10) {
                     Image(systemName: "icloud.slash")
@@ -292,8 +722,8 @@ struct AssetPager: View {
     let contentMode: PHImageContentMode
     let neighborPriority: PhotoRequestPriority
     let onMediaReady: ((Bool) -> Void)?
+    let onZoomingChanged: ((Bool) -> Void)?
 
-    @State private var pageSelection: Int
     @State private var isZooming = false
     @State private var customDirection = 1
     @AppStorage(PhotoSwipeStyle.storageKey)
@@ -305,7 +735,8 @@ struct AssetPager: View {
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFit,
         neighborPriority: PhotoRequestPriority = .slideshow,
-        onMediaReady: ((Bool) -> Void)? = nil
+        onMediaReady: ((Bool) -> Void)? = nil,
+        onZoomingChanged: ((Bool) -> Void)? = nil
     ) {
         self.assets = assets
         _currentIndex = currentIndex
@@ -313,24 +744,7 @@ struct AssetPager: View {
         self.contentMode = contentMode
         self.neighborPriority = neighborPriority
         self.onMediaReady = onMediaReady
-        _pageSelection = State(initialValue: currentIndex.wrappedValue)
-    }
-
-    // Keep only the visible page and its two neighbors alive.  The tags use
-    // absolute asset indexes instead of -1/0/1 offsets, so rebuilding the
-    // window after a swipe does not replace the page the user is looking at.
-    private var pageIndexes: [Int] {
-        guard assets.count > 0 else { return [] }
-
-        var indexes = [Int]()
-        if currentIndex > 0 {
-            indexes.append(currentIndex - 1)
-        }
-        indexes.append(currentIndex)
-        if currentIndex < assets.count - 1 {
-            indexes.append(currentIndex + 1)
-        }
-        return indexes
+        self.onZoomingChanged = onZoomingChanged
     }
 
     private var swipeStyle: PhotoSwipeStyle {
@@ -355,49 +769,34 @@ struct AssetPager: View {
             }
         }
         .background(Color.black)
+        .onAppear {
+            PagerDiagnostics.beginSession()
+            PagerDiagnostics.log(
+                "AssetPager appear style=\(swipeStyle.rawValue) count=\(assets.count) index=\(currentIndex)"
+            )
+        }
         .onChange(of: currentIndex) { oldValue, newValue in
             customDirection = newValue >= oldValue ? 1 : -1
-            synchronizePageSelection()
+            PagerDiagnostics.log(
+                "AssetPager binding index \(oldValue)->\(newValue)"
+            )
         }
     }
 
     private var nativePager: some View {
-        TabView(selection: $pageSelection) {
-            ForEach(pageIndexes, id: \.self) { index in
-                ViewerMediaView(
-                    asset: assets.object(at: index),
-                    targetSize: targetSize,
-                    contentMode: contentMode,
-                    requestPriority: index == currentIndex
-                        ? .viewer
-                        : neighborPriority,
-                    onReady: { ready in
-                        guard index == currentIndex else { return }
-                        onMediaReady?(ready)
-                    },
-                    onZoomingChanged: { zooming in
-                        guard index == currentIndex else { return }
-                        if zooming {
-                            isZooming = true
-                        } else {
-                            DispatchQueue.main.async {
-                                isZooming = false
-                            }
-                        }
-                    }
-                )
-                .id("viewer-\(assets.object(at: index).localIdentifier)")
-                .tag(index)
-                .contentShape(Rectangle())
-                .simultaneousGesture(pageSwipeGesture)
-            }
-        }
-        .tabViewStyle(.page(indexDisplayMode: .never))
-        .onChange(of: pageSelection) { _, newValue in
-            guard newValue >= 0, newValue < assets.count else { return }
-            guard newValue != currentIndex else { return }
-            currentIndex = newValue
-        }
+        NativePhotoPager(
+            pageCount: assets.count,
+            currentIndex: $currentIndex,
+            assetProvider: { index in
+                guard index >= 0, index < assets.count else { return nil }
+                return assets.object(at: index)
+            },
+            targetSize: targetSize,
+            contentMode: contentMode,
+            neighborPriority: neighborPriority,
+            onMediaReady: onMediaReady,
+            onZoomingChanged: onZoomingChanged
+        )
     }
 
     private var customPager: some View {
@@ -412,6 +811,7 @@ struct AssetPager: View {
                 },
                 onZoomingChanged: { zooming in
                     isZooming = zooming
+                    onZoomingChanged?(zooming)
                 }
             )
             .id("custom-viewer-\(assets.object(at: currentIndex).localIdentifier)")
@@ -423,45 +823,6 @@ struct AssetPager: View {
         .contentShape(Rectangle())
         .simultaneousGesture(customSwipeGesture)
         .animation(.easeInOut(duration: 0.32), value: currentIndex)
-    }
-
-    private func synchronizePageSelection() {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            pageSelection = currentIndex
-        }
-    }
-
-    private var pageSwipeGesture: some Gesture {
-        DragGesture(minimumDistance: 24)
-            .onEnded { value in
-                guard !isZooming else { return }
-                let horizontalDistance = abs(value.translation.width)
-                let verticalDistance = abs(value.translation.height)
-                guard horizontalDistance > 72,
-                      horizontalDistance > verticalDistance * 1.15
-                else { return }
-                // If the native page controller already completed this
-                // swipe, its selection and the public index will briefly be
-                // out of sync. Let that native transition win instead of
-                // advancing a second time.
-                guard pageSelection == currentIndex else { return }
-
-                let nextIndex = value.translation.width < 0
-                    ? currentIndex + 1
-                    : currentIndex - 1
-                guard nextIndex >= 0, nextIndex < assets.count else { return }
-
-                // Update the public index first so the counter and filmstrip
-                // move even when TabView's internal page recognizer loses the
-                // drag to the zoomable image. Updating the tag as well keeps
-                // the page controller's native slide animation.
-                withAnimation(.easeInOut(duration: 0.28)) {
-                    currentIndex = nextIndex
-                    pageSelection = nextIndex
-                }
-            }
     }
 
     private var customSwipeGesture: some Gesture {
@@ -492,8 +853,8 @@ struct PhotoViewerView: View {
     let initialIndex: Int
     @ObservedObject var store: PhotoLibraryStore
     let album: PhotoAlbum?
+    let onDismissRequested: (() -> Void)?
 
-    @Environment(\.dismiss) private var dismiss
     @Environment(\.displayScale) private var displayScale
     @State private var currentIndex: Int
     @State private var controlsVisible = true
@@ -504,6 +865,9 @@ struct PhotoViewerView: View {
     @State private var isFavorite: Bool
     @State private var filmstripPosition: Int?
     @State private var dismissDragOffset: CGSize = .zero
+    @State private var isZooming = false
+    @State private var isDismissing = false
+    @State private var presentationProgress: CGFloat = 0
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
     @State private var alert: PhotoVaultAlert?
@@ -512,12 +876,14 @@ struct PhotoViewerView: View {
         assets: PHFetchResult<PHAsset>,
         initialIndex: Int,
         store: PhotoLibraryStore,
-        album: PhotoAlbum? = nil
+        album: PhotoAlbum? = nil,
+        onDismissRequested: (() -> Void)? = nil
     ) {
         self.assets = assets
         self.initialIndex = min(max(0, initialIndex), max(0, assets.count - 1))
         self.store = store
         self.album = album
+        self.onDismissRequested = onDismissRequested
         _currentIndex = State(initialValue: self.initialIndex)
         _isFavorite = State(
             initialValue: assets.count > 0 ? assets.object(at: self.initialIndex).isFavorite : false
@@ -525,69 +891,81 @@ struct PhotoViewerView: View {
     }
 
     var body: some View {
-        ZStack {
-            Color.black.opacity(Double(1 - dismissProgress * 0.72))
-                .ignoresSafeArea()
+        GeometryReader { presentationProxy in
+            ZStack {
+                Color.black.opacity(Double(1 - dismissProgress * 0.72))
+                    .ignoresSafeArea()
 
-            GeometryReader { proxy in
-                AssetPager(
-                    assets: assets,
-                    currentIndex: $currentIndex,
-                    targetSize: mediaTargetSize(for: proxy.size),
-                    contentMode: viewerContentMode
-                )
-                .frame(width: proxy.size.width, height: proxy.size.height)
-                .offset(dismissDragOffset)
-                .scaleEffect(1 - dismissProgress * 0.08)
-                .contentShape(Rectangle())
-                .simultaneousGesture(
-                    TapGesture().onEnded {
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            controlsVisible.toggle()
+                GeometryReader { proxy in
+                    AssetPager(
+                        assets: assets,
+                        currentIndex: $currentIndex,
+                        targetSize: mediaTargetSize(for: proxy.size),
+                        contentMode: viewerContentMode,
+                        onZoomingChanged: { zooming in
+                            isZooming = zooming
                         }
-                    }
-                )
-                // Keep the Photos-style pull-down-to-dismiss interaction
-                // simultaneous with the page controller. The gesture only
-                // changes state for a clearly vertical drag, so horizontal
-                // swipes remain owned by the photo pager.
-                .simultaneousGesture(dismissGesture)
-            }
-            // Only the media canvas is allowed to extend under the status bar
-            // and home indicator. Keep the control layer in the cover's safe
-            // area so its buttons remain tappable on iPhone and iPad.
-            .ignoresSafeArea(.container, edges: .all)
-
-            if controlsVisible {
-                VStack(spacing: 0) {
-                    topBar
-                    Spacer()
-                    if assets.count > 0 {
-                        ViewerFilmstrip(
-                            assets: assets,
-                            currentIndex: $currentIndex,
-                            position: $filmstripPosition
-                        )
-                        .frame(height: 64)
-                        .background(
-                            .ultraThinMaterial,
-                            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        .padding(.horizontal, 10)
-                    }
-                    bottomBar
+                    )
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .offset(dismissDragOffset)
+                    .scaleEffect(1 - dismissProgress * 0.08)
+                    .contentShape(Rectangle())
+                    .simultaneousGesture(
+                        TapGesture().onEnded {
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                controlsVisible.toggle()
+                            }
+                        }
+                    )
+                    // Keep the Photos-style pull-down-to-dismiss interaction
+                    // simultaneous with the page controller. The gesture only
+                    // changes state for a clearly vertical drag, so horizontal
+                    // swipes remain owned by the photo pager.
+                    .simultaneousGesture(dismissGesture)
+                    .allowsHitTesting(!isDismissing)
                 }
-                .opacity(Double(1 - dismissProgress))
-                .offset(y: dismissDragOffset.height * 0.28)
-                .transition(.opacity)
+                // Only the media canvas is allowed to extend under the status bar
+                // and home indicator. Keep the control layer in the cover's safe
+                // area so its buttons remain tappable on iPhone and iPad.
+                .ignoresSafeArea(.container, edges: .all)
+
+                if controlsVisible {
+                    VStack(spacing: 0) {
+                        topBar
+                        Spacer()
+                        if assets.count > 0 {
+                            ViewerFilmstrip(
+                                assets: assets,
+                                currentIndex: $currentIndex,
+                                position: $filmstripPosition
+                            )
+                            .frame(height: 64)
+                            .background(
+                                .ultraThinMaterial,
+                                in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .padding(.horizontal, 10)
+                        }
+                        bottomBar
+                    }
+                    .opacity(Double(1 - dismissProgress))
+                    .offset(y: dismissDragOffset.height * 0.28)
+                    .transition(.opacity)
+                    .allowsHitTesting(!isDismissing)
+                }
             }
+            .offset(y: (1 - presentationProgress) * max(1, presentationProxy.size.height))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
         .presentationBackground(.black)
         .statusBarHidden(!controlsVisible)
         .persistentSystemOverlays(.automatic)
+        // The viewer owns the Photos-style pull-down gesture below. Keeping
+        // the cover's default interactive dismissal disabled prevents UIKit
+        // from competing with it during the short dismissal transition.
+        .interactiveDismissDisabled(true)
         .sheet(isPresented: $isShowingInfo) {
             if assets.count > 0 {
                 PhotoInfoView(asset: assets.object(at: currentIndex))
@@ -625,6 +1003,24 @@ struct PhotoViewerView: View {
             guard assets.count > 0 else { return }
             isFavorite = assets.object(at: newIndex).isFavorite
         }
+        .onAppear {
+            isDismissing = false
+            PagerDiagnostics.log(
+                "viewer appear kind=fetch count=\(assets.count) index=\(currentIndex)"
+            )
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+                presentationProgress = 1
+            }
+        }
+        .onDisappear {
+            PagerDiagnostics.log(
+                "viewer disappear kind=fetch index=\(currentIndex) dismissing=\(isDismissing)"
+            )
+            // Do not reset the drag presentation state here. SwiftUI can call
+            // onDisappear at the beginning of the full-screen cover's exit
+            // transition; snapping the media back to the center at that
+            // point produces a visible flash before the cover is gone.
+        }
     }
 
     private var dismissProgress: CGFloat {
@@ -658,6 +1054,7 @@ struct PhotoViewerView: View {
     private var dismissGesture: some Gesture {
         DragGesture(minimumDistance: 12)
             .onChanged { value in
+                guard !isDismissing, !isZooming else { return }
                 let isVertical = value.translation.height > abs(value.translation.width) * 1.15
                 guard isVertical else { return }
 
@@ -667,6 +1064,7 @@ struct PhotoViewerView: View {
                 )
             }
             .onEnded { value in
+                guard !isDismissing, !isZooming else { return }
                 let isVertical = value.translation.height > abs(value.translation.width) * 1.15
                 guard isVertical else {
                     resetDismissOffset()
@@ -676,14 +1074,42 @@ struct PhotoViewerView: View {
                 let shouldDismiss = value.translation.height > 150
                     || value.predictedEndTranslation.height > 280
                 if shouldDismiss {
-                    dismiss()
+                    requestDismiss(reason: "pull-down")
                 } else {
                     resetDismissOffset()
                 }
             }
     }
 
+    private func requestDismiss(reason: String) {
+        guard !isDismissing else { return }
+        isDismissing = true
+        PagerDiagnostics.log(
+            "viewer dismiss requested kind=fetch reason=\(reason) index=\(currentIndex)"
+        )
+        finishDismissAnimation(reason: reason)
+    }
+
+    private func finishDismissAnimation(reason: String) {
+        withAnimation(.easeOut(duration: 0.18)) {
+            presentationProgress = 0
+            if reason == "pull-down" {
+                dismissDragOffset.height = max(dismissDragOffset.height, 260)
+            }
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard isDismissing else { return }
+            PagerDiagnostics.log(
+                "viewer dismiss animation completed kind=fetch index=\(currentIndex)"
+            )
+            onDismissRequested?()
+        }
+    }
+
     private func resetDismissOffset() {
+        guard !isDismissing, dismissDragOffset != .zero else { return }
         withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
             dismissDragOffset = .zero
         }
@@ -692,7 +1118,7 @@ struct PhotoViewerView: View {
     private var topBar: some View {
         HStack(spacing: 18) {
             Button {
-                dismiss()
+                requestDismiss(reason: "close-button")
             } label: {
                 Image(systemName: "xmark")
                     .font(.headline.weight(.semibold))
@@ -731,7 +1157,7 @@ struct PhotoViewerView: View {
     }
 
     private var bottomBar: some View {
-        HStack {
+        HStack(spacing: 12) {
             Button {
                 guard assets.count > 0 else { return }
                 store.toggleFavorite(assets.object(at: currentIndex))
@@ -786,8 +1212,8 @@ struct PhotoViewerView: View {
             .disabled(assets.count == 0)
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 24)
-        .padding(.bottom, 18)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 16)
     }
 
     private func cleanupShareItems() {
@@ -807,7 +1233,7 @@ struct PhotoViewerView: View {
         store.removeAssets([currentAsset], from: album) { result in
             switch result {
             case .success:
-                dismiss()
+                requestDismiss(reason: "remove-from-album")
             case .failure:
                 handle(result)
             }
@@ -1176,10 +1602,12 @@ private struct IndexedAssetPager: View {
     let contentMode: PHImageContentMode
     let neighborPriority: PhotoRequestPriority
     let onMediaReady: ((Bool) -> Void)?
+    let onZoomingChanged: ((Bool) -> Void)?
 
-    @State private var pageSelection: Int
     @State private var loadingOffsets = Set<Int>()
     @State private var loadedOffsets = Set<Int>()
+    @State private var loadGeneration: UInt64 = 0
+    @State private var isVisible = false
     @State private var loadError: String?
     @State private var isZooming = false
     @State private var customDirection = 1
@@ -1196,7 +1624,8 @@ private struct IndexedAssetPager: View {
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFit,
         neighborPriority: PhotoRequestPriority = .slideshow,
-        onMediaReady: ((Bool) -> Void)? = nil
+        onMediaReady: ((Bool) -> Void)? = nil,
+        onZoomingChanged: ((Bool) -> Void)? = nil
     ) {
         self.totalCount = max(0, totalCount)
         self.store = store
@@ -1206,17 +1635,7 @@ private struct IndexedAssetPager: View {
         self.contentMode = contentMode
         self.neighborPriority = neighborPriority
         self.onMediaReady = onMediaReady
-        _pageSelection = State(initialValue: min(max(0, currentIndex.wrappedValue), max(0, totalCount - 1)))
-    }
-
-    private var pageIndexes: [Int] {
-        guard totalCount > 0 else { return [] }
-        let index = min(max(0, currentIndex), totalCount - 1)
-        var indexes = [Int]()
-        if index > 0 { indexes.append(index - 1) }
-        indexes.append(index)
-        if index < totalCount - 1 { indexes.append(index + 1) }
-        return indexes
+        self.onZoomingChanged = onZoomingChanged
     }
 
     private var swipeStyle: PhotoSwipeStyle {
@@ -1241,9 +1660,28 @@ private struct IndexedAssetPager: View {
             }
         }
         .background(Color.black)
+        .onAppear {
+            isVisible = true
+            loadGeneration &+= 1
+            PagerDiagnostics.beginSession()
+            PagerDiagnostics.log(
+                "IndexedAssetPager appear style=\(swipeStyle.rawValue) count=\(totalCount) index=\(currentIndex)"
+            )
+            loadWindow(around: currentIndex)
+        }
+        .onDisappear {
+            isVisible = false
+            loadGeneration &+= 1
+            loadingOffsets.removeAll()
+            PagerDiagnostics.log(
+                "IndexedAssetPager disappear generation=\(loadGeneration)"
+            )
+        }
         .onChange(of: currentIndex) { oldValue, newValue in
             customDirection = newValue >= oldValue ? 1 : -1
-            synchronizePageSelection(to: newValue)
+            PagerDiagnostics.log(
+                "IndexedAssetPager binding index \(oldValue)->\(newValue)"
+            )
             trimAssetCache(around: newValue)
             loadWindow(around: newValue)
         }
@@ -1251,7 +1689,6 @@ private struct IndexedAssetPager: View {
             loadingOffsets.removeAll()
             loadedOffsets.removeAll()
             assetsByIndex.removeAll()
-            synchronizePageSelection(to: min(currentIndex, max(0, newValue - 1)))
             loadWindow(around: currentIndex)
         }
         .overlay {
@@ -1280,51 +1717,18 @@ private struct IndexedAssetPager: View {
     }
 
     private var nativePager: some View {
-        TabView(selection: $pageSelection) {
-            ForEach(pageIndexes, id: \.self) { index in
-                Group {
-                    if let asset = assetsByIndex[index] {
-                        ViewerMediaView(
-                            asset: asset,
-                            targetSize: targetSize,
-                            contentMode: contentMode,
-                            requestPriority: index == currentIndex
-                                ? .viewer
-                                : neighborPriority,
-                            onReady: { ready in
-                                guard index == currentIndex else { return }
-                                onMediaReady?(ready)
-                            },
-                            onZoomingChanged: { zooming in
-                                guard index == currentIndex else { return }
-                                if zooming {
-                                    isZooming = true
-                                } else {
-                                    DispatchQueue.main.async {
-                                        isZooming = false
-                                    }
-                                }
-                            }
-                        )
-                        .id("indexed-viewer-\(asset.localIdentifier)")
-                    } else {
-                        ProgressView("正在读取照片…")
-                            .tint(.white)
-                            .foregroundStyle(.white)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .tag(index)
-                .contentShape(Rectangle())
-                .simultaneousGesture(pageSwipeGesture)
-            }
-        }
-        .tabViewStyle(.page(indexDisplayMode: .never))
-        .onChange(of: pageSelection) { _, newValue in
-            guard newValue >= 0, newValue < totalCount else { return }
-            guard newValue != currentIndex else { return }
-            currentIndex = newValue
-        }
+        NativePhotoPager(
+            pageCount: totalCount,
+            currentIndex: $currentIndex,
+            assetProvider: { index in
+                assetsByIndex[index]
+            },
+            targetSize: targetSize,
+            contentMode: contentMode,
+            neighborPriority: neighborPriority,
+            onMediaReady: onMediaReady,
+            onZoomingChanged: onZoomingChanged
+        )
     }
 
     @ViewBuilder
@@ -1341,6 +1745,7 @@ private struct IndexedAssetPager: View {
                     },
                     onZoomingChanged: { zooming in
                         isZooming = zooming
+                        onZoomingChanged?(zooming)
                     }
                 )
                 .id("custom-indexed-viewer-\(asset.localIdentifier)")
@@ -1359,38 +1764,6 @@ private struct IndexedAssetPager: View {
                 .contentShape(Rectangle())
                 .simultaneousGesture(customSwipeGesture)
         }
-    }
-
-    private func synchronizePageSelection(to index: Int) {
-        let clampedIndex = min(max(0, index), max(0, totalCount - 1))
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) {
-            pageSelection = clampedIndex
-        }
-    }
-
-    private var pageSwipeGesture: some Gesture {
-        DragGesture(minimumDistance: 24)
-            .onEnded { value in
-                guard !isZooming else { return }
-                let horizontalDistance = abs(value.translation.width)
-                let verticalDistance = abs(value.translation.height)
-                guard horizontalDistance > 72,
-                      horizontalDistance > verticalDistance * 1.15
-                else { return }
-                guard pageSelection == currentIndex else { return }
-
-                let nextIndex = value.translation.width < 0
-                    ? currentIndex + 1
-                    : currentIndex - 1
-                guard nextIndex >= 0, nextIndex < totalCount else { return }
-
-                withAnimation(.easeInOut(duration: 0.28)) {
-                    currentIndex = nextIndex
-                    pageSelection = nextIndex
-                }
-            }
     }
 
     private var customSwipeGesture: some Gesture {
@@ -1416,7 +1789,7 @@ private struct IndexedAssetPager: View {
     }
 
     private func loadWindow(around index: Int) {
-        guard totalCount > 0 else { return }
+        guard isVisible, totalCount > 0 else { return }
         let clampedIndex = min(max(0, index), totalCount - 1)
         let offset = (clampedIndex / pageSize) * pageSize
         var offsets = [offset]
@@ -1439,7 +1812,14 @@ private struct IndexedAssetPager: View {
         else { return }
 
         let limit = min(pageSize, totalCount - offset)
+        let requestGeneration = loadGeneration
         store.fetchUnsortedAssets(offset: offset, limit: limit) { result in
+            guard isVisible, loadGeneration == requestGeneration else {
+                PagerDiagnostics.log(
+                    "IndexedAssetPager drop page offset=\(offset) generation=\(requestGeneration)/\(loadGeneration)"
+                )
+                return
+            }
             loadingOffsets.remove(offset)
             guard case .success(let pageAssets) = result else {
                 if case .failure(let error) = result {
@@ -1771,8 +2151,8 @@ struct IndexedPhotoViewerView: View {
     let totalCount: Int
     let initialIndex: Int
     @ObservedObject var store: PhotoLibraryStore
+    let onDismissRequested: (() -> Void)?
 
-    @Environment(\.dismiss) private var dismiss
     @Environment(\.displayScale) private var displayScale
     @State private var currentIndex: Int
     @State private var assetsByIndex: [Int: PHAsset] = [:]
@@ -1783,6 +2163,9 @@ struct IndexedPhotoViewerView: View {
     @State private var shareTemporaryURLs: [URL] = []
     @State private var isFavorite = false
     @State private var dismissDragOffset: CGSize = .zero
+    @State private var isZooming = false
+    @State private var isDismissing = false
+    @State private var presentationProgress: CGFloat = 0
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
     @State private var alert: PhotoVaultAlert?
@@ -1791,12 +2174,14 @@ struct IndexedPhotoViewerView: View {
         title: String,
         totalCount: Int,
         initialIndex: Int,
-        store: PhotoLibraryStore
+        store: PhotoLibraryStore,
+        onDismissRequested: (() -> Void)? = nil
     ) {
         self.title = title
         self.totalCount = max(0, totalCount)
         self.initialIndex = min(max(0, initialIndex), max(0, totalCount - 1))
         self.store = store
+        self.onDismissRequested = onDismissRequested
         _currentIndex = State(initialValue: self.initialIndex)
     }
 
@@ -1809,6 +2194,7 @@ struct IndexedPhotoViewerView: View {
     }
 
     var body: some View {
+        GeometryReader { presentationProxy in
         ZStack {
             Color.black.opacity(Double(1 - dismissProgress * 0.72))
                 .ignoresSafeArea()
@@ -1820,7 +2206,10 @@ struct IndexedPhotoViewerView: View {
                     currentIndex: $currentIndex,
                     assetsByIndex: $assetsByIndex,
                     targetSize: mediaTargetSize(for: proxy.size),
-                    contentMode: viewerContentMode
+                    contentMode: viewerContentMode,
+                    onZoomingChanged: { zooming in
+                        isZooming = zooming
+                    }
                 )
                 .frame(width: proxy.size.width, height: proxy.size.height)
                 .offset(dismissDragOffset)
@@ -1834,6 +2223,7 @@ struct IndexedPhotoViewerView: View {
                     }
                 )
                 .simultaneousGesture(dismissGesture)
+                .allowsHitTesting(!isDismissing)
             }
             .ignoresSafeArea(.container, edges: .all)
 
@@ -1860,13 +2250,17 @@ struct IndexedPhotoViewerView: View {
                 .opacity(Double(1 - dismissProgress))
                 .offset(y: dismissDragOffset.height * 0.28)
                 .transition(.opacity)
+                .allowsHitTesting(!isDismissing)
             }
+        }
+        .offset(y: (1 - presentationProgress) * max(1, presentationProxy.size.height))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
         .presentationBackground(.black)
         .statusBarHidden(!controlsVisible)
         .persistentSystemOverlays(.automatic)
+        .interactiveDismissDisabled(true)
         .sheet(isPresented: $isShowingInfo) {
             if let currentAsset {
                 PhotoInfoView(asset: currentAsset)
@@ -1903,6 +2297,23 @@ struct IndexedPhotoViewerView: View {
         .onChange(of: currentAssetID) { _, _ in
             isFavorite = currentAsset?.isFavorite ?? false
         }
+        .onAppear {
+            isDismissing = false
+            PagerDiagnostics.log(
+                "viewer appear kind=indexed count=\(totalCount) index=\(currentIndex)"
+            )
+            withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+                presentationProgress = 1
+            }
+        }
+        .onDisappear {
+            PagerDiagnostics.log(
+                "viewer disappear kind=indexed index=\(currentIndex) dismissing=\(isDismissing)"
+            )
+            // Keep the final drag frame intact until the cover has finished
+            // dismissing. Resetting it during onDisappear causes a one-frame
+            // snap/flash in the system full-screen transition.
+        }
     }
 
     private var dismissProgress: CGFloat {
@@ -1935,6 +2346,7 @@ struct IndexedPhotoViewerView: View {
     private var dismissGesture: some Gesture {
         DragGesture(minimumDistance: 12)
             .onChanged { value in
+                guard !isDismissing, !isZooming else { return }
                 let isVertical = value.translation.height > abs(value.translation.width) * 1.15
                 guard isVertical else { return }
                 dismissDragOffset = CGSize(
@@ -1943,20 +2355,49 @@ struct IndexedPhotoViewerView: View {
                 )
             }
             .onEnded { value in
+                guard !isDismissing, !isZooming else { return }
                 let isVertical = value.translation.height > abs(value.translation.width) * 1.15
                 guard isVertical else {
                     resetDismissOffset()
                     return
                 }
                 if value.translation.height > 150 || value.predictedEndTranslation.height > 280 {
-                    dismiss()
+                    requestDismiss(reason: "pull-down")
                 } else {
                     resetDismissOffset()
                 }
             }
     }
 
+    private func requestDismiss(reason: String) {
+        guard !isDismissing else { return }
+        isDismissing = true
+        PagerDiagnostics.log(
+            "viewer dismiss requested kind=indexed reason=\(reason) index=\(currentIndex)"
+        )
+        finishDismissAnimation(reason: reason)
+    }
+
+    private func finishDismissAnimation(reason: String) {
+        withAnimation(.easeOut(duration: 0.18)) {
+            presentationProgress = 0
+            if reason == "pull-down" {
+                dismissDragOffset.height = max(dismissDragOffset.height, 260)
+            }
+        }
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard isDismissing else { return }
+            PagerDiagnostics.log(
+                "viewer dismiss animation completed kind=indexed index=\(currentIndex)"
+            )
+            onDismissRequested?()
+        }
+    }
+
     private func resetDismissOffset() {
+        guard !isDismissing, dismissDragOffset != .zero else { return }
         withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
             dismissDragOffset = .zero
         }
@@ -1964,7 +2405,7 @@ struct IndexedPhotoViewerView: View {
 
     private var topBar: some View {
         HStack(spacing: 18) {
-            Button { dismiss() } label: {
+            Button { requestDismiss(reason: "close-button") } label: {
                 Image(systemName: "xmark")
                     .font(.headline.weight(.semibold))
                     .frame(width: 36, height: 36)
@@ -2001,7 +2442,7 @@ struct IndexedPhotoViewerView: View {
     }
 
     private var bottomBar: some View {
-        HStack {
+        HStack(spacing: 12) {
             Button {
                 guard let currentAsset else { return }
                 store.toggleFavorite(currentAsset)
@@ -2049,8 +2490,8 @@ struct IndexedPhotoViewerView: View {
             .disabled(currentAsset == nil)
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 24)
-        .padding(.bottom, 18)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 16)
     }
 
     private func cleanupShareItems() {

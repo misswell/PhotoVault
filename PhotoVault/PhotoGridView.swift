@@ -16,6 +16,22 @@ private enum PhotoGridMetrics {
         min(max(side, minimumPreferredCellSide), maximumPreferredCellSide)
     }
 
+    static func restoredPreferredCellSide() -> CGFloat {
+        let storedSide = (UserDefaults.standard.object(
+            forKey: PhotoGridPreferences.preferredCellSideKey
+        ) as? NSNumber)?.doubleValue
+        return clampedPreferredSide(
+            CGFloat(storedSide ?? PhotoGridPreferences.defaultPreferredCellSide)
+        )
+    }
+
+    static func persistPreferredCellSide(_ side: CGFloat) {
+        UserDefaults.standard.set(
+            Double(clampedPreferredSide(side)),
+            forKey: PhotoGridPreferences.preferredCellSideKey
+        )
+    }
+
     static func itemSide(
         for width: CGFloat,
         preferredSide: CGFloat = defaultCellSide
@@ -56,14 +72,17 @@ private final class PhotoGridPinchDriver: NSObject, UIGestureRecognizerDelegate 
     private weak var collectionView: UICollectionView?
     private let currentPreferredSide: () -> CGFloat
     private let onZoom: (CGFloat, CGPoint) -> Void
+    private let onZoomEnded: (CGFloat) -> Void
     private var initialPreferredSide = PhotoGridMetrics.defaultCellSide
 
     init(
         currentPreferredSide: @escaping () -> CGFloat,
-        onZoom: @escaping (CGFloat, CGPoint) -> Void
+        onZoom: @escaping (CGFloat, CGPoint) -> Void,
+        onZoomEnded: @escaping (CGFloat) -> Void
     ) {
         self.currentPreferredSide = currentPreferredSide
         self.onZoom = onZoom
+        self.onZoomEnded = onZoomEnded
     }
 
     func attach(to collectionView: UICollectionView) {
@@ -104,7 +123,7 @@ private final class PhotoGridPinchDriver: NSObject, UIGestureRecognizerDelegate 
                 initialPreferredSide,
                 gestureRecognizer.location(in: collectionView)
             )
-        case .changed, .ended, .cancelled:
+        case .changed:
             let preferredSide = PhotoGridMetrics.clampedPreferredSide(
                 initialPreferredSide * gestureRecognizer.scale
             )
@@ -112,6 +131,15 @@ private final class PhotoGridPinchDriver: NSObject, UIGestureRecognizerDelegate 
                 preferredSide,
                 gestureRecognizer.location(in: collectionView)
             )
+        case .ended, .cancelled:
+            let preferredSide = PhotoGridMetrics.clampedPreferredSide(
+                initialPreferredSide * gestureRecognizer.scale
+            )
+            onZoom(
+                preferredSide,
+                gestureRecognizer.location(in: collectionView)
+            )
+            onZoomEnded(preferredSide)
         default:
             break
         }
@@ -209,6 +237,7 @@ private final class PhotoSelectionPanDriver: NSObject, UIGestureRecognizerDelega
 /// callbacks, while UIKit provides recycling, prefetching and fast scrolling.
 struct PhotoGridView: UIViewRepresentable {
     let assets: PHFetchResult<PHAsset>
+    let isActive: Bool
     let selectionMode: Bool
     let selectedIDs: Set<String>
     let onOpen: (Int) -> Void
@@ -220,6 +249,7 @@ struct PhotoGridView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             assets: assets,
+            isActive: isActive,
             selectionMode: selectionMode,
             selectedIDs: selectedIDs,
             onOpen: onOpen,
@@ -234,10 +264,15 @@ struct PhotoGridView: UIViewRepresentable {
         context.coordinator.makeCollectionView()
     }
 
+    static func dismantleUIView(_ uiView: UICollectionView, coordinator: Coordinator) {
+        coordinator.dismantle(uiView)
+    }
+
     func updateUIView(_ collectionView: UICollectionView, context: Context) {
         context.coordinator.update(
             collectionView: collectionView,
             assets: assets,
+            isActive: isActive,
             selectionMode: selectionMode,
             selectedIDs: selectedIDs,
             onOpen: onOpen,
@@ -258,11 +293,13 @@ struct PhotoGridView: UIViewRepresentable {
 
         private var assets: PHFetchResult<PHAsset>
         private var signature: AssetSignature
+        private var isActive: Bool
         private var selectionMode: Bool
         private var selectedIDs: Set<String>
         private var thumbnailSize = CGSize(width: 160, height: 160)
-        private var preferredCellSide = PhotoGridMetrics.defaultCellSide
+        private var preferredCellSide = PhotoGridMetrics.restoredPreferredCellSide()
         private var isFastScrolling = false
+        private var needsReloadOnActivation = false
         private var selectionPanDriver: PhotoSelectionPanDriver?
         private var pinchDriver: PhotoGridPinchDriver?
         private weak var collectionView: UICollectionView?
@@ -275,6 +312,7 @@ struct PhotoGridView: UIViewRepresentable {
 
         init(
             assets: PHFetchResult<PHAsset>,
+            isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
             onOpen: @escaping (Int) -> Void,
@@ -285,6 +323,8 @@ struct PhotoGridView: UIViewRepresentable {
         ) {
             self.assets = assets
             signature = Self.signature(for: assets)
+            self.isActive = isActive
+            needsReloadOnActivation = !isActive
             self.selectionMode = selectionMode
             self.selectedIDs = selectedIDs
             self.onOpen = onOpen
@@ -292,6 +332,16 @@ struct PhotoGridView: UIViewRepresentable {
             self.onFavorite = onFavorite
             self.onShare = onShare
             self.onDelete = onDelete
+        }
+
+        func dismantle(_ collectionView: UICollectionView) {
+            cancelVisibleRequests(in: collectionView)
+            collectionView.isUserInteractionEnabled = false
+            collectionView.dataSource = nil
+            collectionView.delegate = nil
+            collectionView.prefetchDataSource = nil
+            self.collectionView = nil
+            NotificationCenter.default.removeObserver(self)
         }
 
         deinit {
@@ -346,6 +396,9 @@ struct PhotoGridView: UIViewRepresentable {
                         focusPoint: focusPoint,
                         in: collectionView
                     )
+                },
+                onZoomEnded: { preferredSide in
+                    PhotoGridMetrics.persistPreferredCellSide(preferredSide)
                 }
             )
             pinchDriver.attach(to: collectionView)
@@ -368,6 +421,7 @@ struct PhotoGridView: UIViewRepresentable {
         func update(
             collectionView: UICollectionView,
             assets: PHFetchResult<PHAsset>,
+            isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
             onOpen: @escaping (Int) -> Void,
@@ -377,6 +431,11 @@ struct PhotoGridView: UIViewRepresentable {
             onDelete: @escaping (PHAsset) -> Void
         ) {
             self.collectionView = collectionView
+            let wasActive = self.isActive
+            let didReactivate = !wasActive && isActive
+            var shouldResumeVisibleCells = false
+            self.isActive = isActive
+            collectionView.isUserInteractionEnabled = isActive
             self.selectionMode = selectionMode
             self.selectedIDs = selectedIDs
             self.onOpen = onOpen
@@ -392,11 +451,34 @@ struct PhotoGridView: UIViewRepresentable {
             signature = newSignature
 
             if dataSourceChanged {
+                cancelVisibleRequests(in: collectionView)
+                if isActive {
+                    collectionView.reloadData()
+                    needsReloadOnActivation = false
+                } else {
+                    needsReloadOnActivation = true
+                }
+            } else if didReactivate, needsReloadOnActivation {
+                // A data-source change while the viewer was presented still
+                // requires a reload. The unchanged case is intentionally
+                // handled below without reloadData so the cover can finish
+                // dismissing over the already-rendered album.
                 collectionView.reloadData()
+                needsReloadOnActivation = false
+            } else if didReactivate {
+                shouldResumeVisibleCells = true
+            }
+
+            if wasActive, !isActive {
+                cancelVisibleRequests(in: collectionView)
             }
 
             updateLayout(for: collectionView)
             updateVisibleSelection(in: collectionView)
+
+            if shouldResumeVisibleCells {
+                resumeVisibleCells(in: collectionView)
+            }
         }
 
         func collectionView(
@@ -414,6 +496,13 @@ struct PhotoGridView: UIViewRepresentable {
                 withReuseIdentifier: PhotoGridCell.reuseIdentifier,
                 for: indexPath
             ) as! PhotoGridCell
+            guard isActive else {
+                cell.showPlaceholder(
+                    selectionMode: selectionMode,
+                    isSelected: false
+                )
+                return cell
+            }
             let asset = assets.object(at: indexPath.item)
             cell.configure(
                 asset: asset,
@@ -428,7 +517,7 @@ struct PhotoGridView: UIViewRepresentable {
             _ collectionView: UICollectionView,
             didSelectItemAt indexPath: IndexPath
         ) {
-            guard indexPath.item < assets.count else { return }
+            guard isActive, indexPath.item < assets.count else { return }
             let asset = assets.object(at: indexPath.item)
             if selectionMode {
                 onToggleSelection(asset)
@@ -442,7 +531,7 @@ struct PhotoGridView: UIViewRepresentable {
             _ collectionView: UICollectionView,
             prefetchItemsAt indexPaths: [IndexPath]
         ) {
-            guard !isFastScrolling else { return }
+            guard isActive, !isFastScrolling else { return }
             let assetsToCache = indexPaths.compactMap { indexPath -> PHAsset? in
                 guard indexPath.item >= 0, indexPath.item < assets.count else { return nil }
                 return assets.object(at: indexPath.item)
@@ -465,6 +554,14 @@ struct PhotoGridView: UIViewRepresentable {
                 assets: assetsToStop,
                 targetSize: thumbnailSize
             )
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            didEndDisplaying cell: UICollectionViewCell,
+            forItemAt indexPath: IndexPath
+        ) {
+            (cell as? PhotoGridCell)?.cancelLoading()
         }
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
@@ -550,6 +647,29 @@ struct PhotoGridView: UIViewRepresentable {
                 else { continue }
                 let asset = assets.object(at: indexPath.item)
                 photoCell.setSelection(
+                    selectionMode: selectionMode,
+                    isSelected: selectedIDs.contains(asset.localIdentifier)
+                )
+            }
+        }
+
+        private func cancelVisibleRequests(in collectionView: UICollectionView) {
+            for cell in collectionView.visibleCells {
+                (cell as? PhotoGridCell)?.cancelLoading()
+            }
+        }
+
+        private func resumeVisibleCells(in collectionView: UICollectionView) {
+            for cell in collectionView.visibleCells {
+                guard let photoCell = cell as? PhotoGridCell,
+                      let indexPath = collectionView.indexPath(for: cell),
+                      indexPath.item < assets.count
+                else { continue }
+
+                let asset = assets.object(at: indexPath.item)
+                photoCell.resumeLoadingIfNeeded(
+                    asset: asset,
+                    targetSize: thumbnailSize,
                     selectionMode: selectionMode,
                     isSelected: selectedIDs.contains(asset.localIdentifier)
                 )
@@ -797,6 +917,11 @@ final class PhotoGridCell: UICollectionViewCell {
         setSelection(selectionMode: selectionMode, isSelected: isSelected)
         accessibilityLabel = asset.mediaType == .video ? "视频" : "照片"
 
+        photoVaultTrace(
+            "grid cell configure asset=\(photoVaultShortAssetID(asset.localIdentifier)) "
+                + "target=\(Int(targetSize.width))x\(Int(targetSize.height))"
+        )
+
         PhotoImageManager.shared.startCaching(asset: asset, targetSize: targetSize)
         requestHandle = PhotoImageManager.shared.requestImage(
             for: asset,
@@ -804,7 +929,7 @@ final class PhotoGridCell: UICollectionViewCell {
             contentMode: .aspectFill,
             deliveryMode: .opportunistic,
             resizeMode: .fast,
-            priority: .visibleGrid,
+            priority: .photoGrid,
             isNetworkAccessAllowed: true,
             progressHandler: { [weak self] progress, error, _, _ in
                 Task { @MainActor [weak self] in
@@ -818,6 +943,13 @@ final class PhotoGridCell: UICollectionViewCell {
             }
         ) { [weak self] image, info in
             let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
+            let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            let hasError = info?[PHImageErrorKey] != nil
+            photoVaultTrace(
+                "grid cell callback asset=\(photoVaultShortAssetID(asset.localIdentifier)) "
+                    + "degraded=\(degraded) cancelled=\(cancelled) "
+                    + "error=\(hasError) hasImage=\(image != nil)"
+            )
             guard !cancelled else { return }
             Task { @MainActor [weak self] in
                 guard let self,
@@ -827,6 +959,29 @@ final class PhotoGridCell: UICollectionViewCell {
                 self.imageView.image = image
             }
         }
+    }
+
+    func resumeLoadingIfNeeded(
+        asset: PHAsset,
+        targetSize: CGSize,
+        selectionMode: Bool,
+        isSelected: Bool
+    ) {
+        let sameAsset = representedIdentifier == asset.localIdentifier
+        let sameTargetSize = representedTargetSize == targetSize
+
+        if sameAsset, sameTargetSize, imageView.image != nil {
+            loadingIndicator.stopAnimating()
+            setSelection(selectionMode: selectionMode, isSelected: isSelected)
+            return
+        }
+
+        configure(
+            asset: asset,
+            targetSize: targetSize,
+            selectionMode: selectionMode,
+            isSelected: isSelected
+        )
     }
 
     func setSelection(selectionMode: Bool, isSelected: Bool) {
@@ -848,6 +1003,10 @@ final class PhotoGridCell: UICollectionViewCell {
         cancelRequest()
     }
 
+    func cancelLoading() {
+        cancelRequest()
+    }
+
     func showPlaceholder(selectionMode: Bool, isSelected: Bool) {
         cancelRequest()
         representedAsset = nil
@@ -861,7 +1020,14 @@ final class PhotoGridCell: UICollectionViewCell {
     }
 
     private func cancelRequest() {
-        PhotoImageManager.shared.cancel(requestHandle)
+        if let requestHandle,
+           let representedIdentifier {
+            photoVaultTrace(
+                "grid cell cancel asset=\(photoVaultShortAssetID(representedIdentifier))"
+                    + " target=\(Int(representedTargetSize.width))x\(Int(representedTargetSize.height))"
+            )
+            PhotoImageManager.shared.cancel(requestHandle)
+        }
         if let representedAsset {
             PhotoImageManager.shared.stopCaching(
                 asset: representedAsset,
@@ -883,6 +1049,7 @@ final class PhotoGridCell: UICollectionViewCell {
 struct IndexedPhotoGridView: UIViewRepresentable {
     let totalCount: Int
     let store: PhotoLibraryStore
+    let isActive: Bool
     let selectionMode: Bool
     let selectedIDs: Set<String>
     let onOpen: (PHAsset, Int) -> Void
@@ -895,6 +1062,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         Coordinator(
             totalCount: totalCount,
             store: store,
+            isActive: isActive,
             selectionMode: selectionMode,
             selectedIDs: selectedIDs,
             onOpen: onOpen,
@@ -909,10 +1077,15 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         context.coordinator.makeCollectionView()
     }
 
+    static func dismantleUIView(_ uiView: UICollectionView, coordinator: Coordinator) {
+        coordinator.dismantle(uiView)
+    }
+
     func updateUIView(_ collectionView: UICollectionView, context: Context) {
         context.coordinator.update(
             collectionView: collectionView,
             totalCount: totalCount,
+            isActive: isActive,
             selectionMode: selectionMode,
             selectedIDs: selectedIDs,
             onOpen: onOpen,
@@ -928,14 +1101,17 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         private let pageSize = 240
         private var totalCount: Int
         private let store: PhotoLibraryStore
+        private var isActive: Bool
         private var selectionMode: Bool
         private var selectedIDs: Set<String>
         private var assetsByIndex: [Int: PHAsset] = [:]
         private var loadingPages = Set<Int>()
+        private var loadGeneration: UInt64 = 0
         private var pageOrder: [Int] = []
         private let maxCachedPages = 8
         private var thumbnailSize = CGSize(width: 160, height: 160)
-        private var preferredCellSide = PhotoGridMetrics.defaultCellSide
+        private var preferredCellSide = PhotoGridMetrics.restoredPreferredCellSide()
+        private var needsReloadOnActivation = false
         private var selectionPanDriver: PhotoSelectionPanDriver?
         private var pinchDriver: PhotoGridPinchDriver?
         private weak var collectionView: UICollectionView?
@@ -949,6 +1125,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         init(
             totalCount: Int,
             store: PhotoLibraryStore,
+            isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
             onOpen: @escaping (PHAsset, Int) -> Void,
@@ -959,6 +1136,8 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         ) {
             self.totalCount = max(0, totalCount)
             self.store = store
+            self.isActive = isActive
+            needsReloadOnActivation = !isActive
             self.selectionMode = selectionMode
             self.selectedIDs = selectedIDs
             self.onOpen = onOpen
@@ -966,6 +1145,24 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             self.onFavorite = onFavorite
             self.onShare = onShare
             self.onDelete = onDelete
+            photoVaultTrace(
+                "unsorted grid init count=\(self.totalCount) active=\(isActive)"
+            )
+        }
+
+        func dismantle(_ collectionView: UICollectionView) {
+            photoVaultTrace(
+                "unsorted grid dismantle count=\(totalCount) "
+                    + "active=\(isActive) generation=\(loadGeneration)"
+            )
+            isActive = false
+            invalidatePageLoads()
+            cancelVisibleRequests(in: collectionView)
+            collectionView.isUserInteractionEnabled = false
+            collectionView.dataSource = nil
+            collectionView.delegate = nil
+            collectionView.prefetchDataSource = nil
+            self.collectionView = nil
         }
 
         func makeCollectionView() -> UICollectionView {
@@ -1010,6 +1207,9 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                         focusPoint: focusPoint,
                         in: collectionView
                     )
+                },
+                onZoomEnded: { preferredSide in
+                    PhotoGridMetrics.persistPreferredCellSide(preferredSide)
                 }
             )
             pinchDriver.attach(to: collectionView)
@@ -1025,6 +1225,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         func update(
             collectionView: UICollectionView,
             totalCount: Int,
+            isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
             onOpen: @escaping (PHAsset, Int) -> Void,
@@ -1034,6 +1235,10 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             onDelete: @escaping (PHAsset) -> Void
         ) {
             self.collectionView = collectionView
+            let wasActive = self.isActive
+            let oldCount = self.totalCount
+            self.isActive = isActive
+            collectionView.isUserInteractionEnabled = isActive
             self.selectionMode = selectionMode
             self.selectedIDs = selectedIDs
             self.onOpen = onOpen
@@ -1044,18 +1249,57 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             selectionPanDriver?.isEnabled = selectionMode
 
             let newCount = max(0, totalCount)
+            let didReactivate = !wasActive && isActive
+            if oldCount != newCount || wasActive != isActive {
+                photoVaultTrace(
+                    "unsorted grid update count=\(oldCount)->\(newCount) "
+                        + "active=\(wasActive)->\(isActive) "
+                        + "generation=\(loadGeneration)"
+                )
+            }
+            if wasActive, !isActive {
+                invalidatePageLoads()
+            }
             if newCount != self.totalCount {
+                invalidatePageLoads()
+                cancelVisibleRequests(in: collectionView)
                 self.totalCount = newCount
                 assetsByIndex.removeAll(keepingCapacity: true)
                 loadingPages.removeAll()
                 pageOrder.removeAll(keepingCapacity: true)
+                if isActive {
+                    collectionView.reloadData()
+                    needsReloadOnActivation = false
+                } else {
+                    needsReloadOnActivation = true
+                }
+            } else if didReactivate, needsReloadOnActivation {
+                // A count change while inactive must be reflected when the
+                // screen returns. For the common unchanged case, keep the
+                // existing cells so the cover can reveal the album without a
+                // blank/loading reload frame.
                 collectionView.reloadData()
+                needsReloadOnActivation = false
             } else {
                 self.totalCount = newCount
             }
 
+            if wasActive, !isActive { cancelVisibleRequests(in: collectionView) }
+
             updateLayout(for: collectionView)
             updateVisibleSelection(in: collectionView)
+
+            if didReactivate {
+                DispatchQueue.main.async { [weak self, weak collectionView] in
+                    guard let self,
+                          let collectionView,
+                          self.isActive,
+                          self.totalCount == newCount,
+                          self.collectionView === collectionView
+                    else { return }
+                    self.resumeVisibleCells(in: collectionView)
+                }
+            }
         }
 
         func collectionView(
@@ -1073,6 +1317,13 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                 withReuseIdentifier: PhotoGridCell.reuseIdentifier,
                 for: indexPath
             ) as! PhotoGridCell
+            guard isActive else {
+                cell.showPlaceholder(
+                    selectionMode: selectionMode,
+                    isSelected: false
+                )
+                return cell
+            }
             if let asset = assetsByIndex[indexPath.item] {
                 touchPage(containing: indexPath.item)
                 cell.configure(
@@ -1086,6 +1337,10 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                     selectionMode: selectionMode,
                     isSelected: false
                 )
+                photoVaultTrace(
+                    "unsorted grid cell missing index=\(indexPath.item) "
+                        + "total=\(totalCount) generation=\(loadGeneration)"
+                )
                 loadPage(containing: indexPath.item, in: collectionView)
             }
             return cell
@@ -1095,6 +1350,10 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             _ collectionView: UICollectionView,
             didSelectItemAt indexPath: IndexPath
         ) {
+            guard isActive else {
+                collectionView.deselectItem(at: indexPath, animated: false)
+                return
+            }
             guard let asset = assetsByIndex[indexPath.item] else {
                 loadPage(containing: indexPath.item, in: collectionView)
                 collectionView.deselectItem(at: indexPath, animated: false)
@@ -1113,10 +1372,19 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             _ collectionView: UICollectionView,
             prefetchItemsAt indexPaths: [IndexPath]
         ) {
+            guard isActive else { return }
             for indexPath in indexPaths {
                 touchPage(containing: indexPath.item)
                 loadPage(containing: indexPath.item, in: collectionView)
             }
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            didEndDisplaying cell: UICollectionViewCell,
+            forItemAt indexPath: IndexPath
+        ) {
+            (cell as? PhotoGridCell)?.cancelLoading()
         }
 
         func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
@@ -1177,14 +1445,68 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             return layout.itemSize
         }
 
+        private func resumeVisibleCells(in collectionView: UICollectionView) {
+            for cell in collectionView.visibleCells {
+                guard let photoCell = cell as? PhotoGridCell,
+                      let indexPath = collectionView.indexPath(for: cell)
+                else { continue }
+
+                guard let asset = assetsByIndex[indexPath.item] else {
+                    loadPage(containing: indexPath.item, in: collectionView)
+                    continue
+                }
+
+                touchPage(containing: indexPath.item)
+                photoCell.resumeLoadingIfNeeded(
+                    asset: asset,
+                    targetSize: thumbnailSize,
+                    selectionMode: selectionMode,
+                    isSelected: selectedIDs.contains(asset.localIdentifier)
+                )
+            }
+        }
+
         private func loadPage(containing index: Int, in collectionView: UICollectionView) {
             guard index >= 0, index < totalCount else { return }
             let page = index / pageSize
             guard loadingPages.insert(page).inserted else { return }
 
             let offset = page * pageSize
+            let requestGeneration = loadGeneration
+            photoVaultTrace(
+                "unsorted page start page=\(page) offset=\(offset) "
+                    + "limit=\(pageSize) generation=\(requestGeneration) "
+                    + "total=\(totalCount)"
+            )
             store.fetchUnsortedAssets(offset: offset, limit: pageSize) { [weak self, weak collectionView] result in
-                guard let self, let collectionView else { return }
+                guard let self else {
+                    photoVaultTrace(
+                        "unsorted page drop page=\(page) reason=coordinator-gone "
+                            + "generation=\(requestGeneration)"
+                    )
+                    return
+                }
+                guard let collectionView else {
+                    photoVaultTrace(
+                        "unsorted page drop page=\(page) reason=collection-gone "
+                            + "generation=\(requestGeneration)"
+                    )
+                    return
+                }
+                let sameGeneration = self.loadGeneration == requestGeneration
+                let sameCollection = self.collectionView === collectionView
+                photoVaultTrace(
+                    "unsorted page callback page=\(page) "
+                        + "generation=\(requestGeneration)/\(self.loadGeneration) "
+                        + "active=\(self.isActive) sameCollection=\(sameCollection) "
+                        + "result=\(Self.pageResultDescription(result))"
+                )
+                guard self.isActive,
+                      sameGeneration,
+                      sameCollection
+                else {
+                    return
+                }
                 self.loadingPages.remove(page)
                 guard case .success(let pageAssets) = result else { return }
 
@@ -1205,6 +1527,26 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                 if !visiblePaths.isEmpty {
                     collectionView.reloadItems(at: visiblePaths)
                 }
+            }
+        }
+
+        private func invalidatePageLoads() {
+            photoVaultTrace(
+                "unsorted page invalidate generation=\(loadGeneration)->\(loadGeneration &+ 1) "
+                    + "loading=\(loadingPages.sorted())"
+            )
+            loadGeneration &+= 1
+            loadingPages.removeAll()
+        }
+
+        private static func pageResultDescription(
+            _ result: Result<[PHAsset], Error>
+        ) -> String {
+            switch result {
+            case .success(let assets):
+                return "success(\(assets.count))"
+            case .failure(let error):
+                return "failure(\(error.localizedDescription))"
             }
         }
 
@@ -1258,6 +1600,12 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                     selectionMode: selectionMode,
                     isSelected: selectedIDs.contains(asset.localIdentifier)
                 )
+            }
+        }
+
+        private func cancelVisibleRequests(in collectionView: UICollectionView) {
+            for cell in collectionView.visibleCells {
+                (cell as? PhotoGridCell)?.cancelLoading()
             }
         }
 

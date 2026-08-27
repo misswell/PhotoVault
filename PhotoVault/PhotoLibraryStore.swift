@@ -163,12 +163,19 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         indexGeneration &+= 1
         let generation = indexGeneration
 
+        photoVaultTrace(
+            "store refresh generation=\(generation) cachedAlbums=\(albums.count)"
+        )
+
         isLoadingAlbums = true
         DispatchQueue.global(qos: .userInitiated).async {
             let fetchedPhotos = PHAsset.fetchAssets(with: Self.makeLibraryFetchOptions())
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.indexGeneration == generation else { return }
+                photoVaultTrace(
+                    "store photos fetched generation=\(generation) count=\(fetchedPhotos.count)"
+                )
                 self.allPhotos = fetchedPhotos
 
                 // Album enumeration also fetches collection membership and
@@ -180,6 +187,11 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
                     DispatchQueue.main.async { [weak self] in
                         guard let self, self.indexGeneration == generation else { return }
+                        photoVaultTrace(
+                            "store albums fetched generation=\(generation) "
+                                + "albums=\(fetchedAlbums.albums.count) "
+                                + "folders=\(fetchedAlbums.folders.count)"
+                        )
                         self.albums = fetchedAlbums.albums
                         self.albumFolders = fetchedAlbums.folders
                         self.saveAlbumCache(
@@ -201,7 +213,20 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     }
 
     func ensureUnsortedIndex() {
-        guard canReadPhotos, !isLoadingAlbums else { return }
+        guard canReadPhotos else {
+            photoVaultTrace("store ensure-unsorted skipped reason=no-permission")
+            return
+        }
+        if isLoadingAlbums {
+            photoVaultTrace(
+                "store ensure-unsorted deferred reason=albums-loading generation=\(indexGeneration)"
+            )
+            return
+        }
+        photoVaultTrace(
+            "store ensure-unsorted requested generation=\(indexGeneration) "
+                + "indexing=\(isIndexingUnsorted) count=\(unsortedCount)"
+        )
         unsortedScreenRequested = true
 
         if !isIndexingUnsorted {
@@ -236,20 +261,48 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         completion: @escaping @MainActor (Result<[PHAsset], Error>) -> Void
     ) {
         guard canReadPhotos else {
+            photoVaultTrace(
+                "store unsorted-fetch failed reason=no-permission offset=\(offset) limit=\(limit)"
+            )
             completion(.failure(PhotoIndexError.databaseUnavailable))
             return
         }
 
         let generation = indexGeneration
+        photoVaultTrace(
+            "store unsorted-fetch start offset=\(offset) limit=\(limit) "
+                + "generation=\(generation)"
+        )
         indexStore.unsortedIdentifiers(
             limit: max(0, limit),
             offset: max(0, offset)
         ) { [weak self] result in
-            guard let self, self.indexGeneration == generation else { return }
+            guard let self else {
+                photoVaultTrace(
+                    "store unsorted-fetch drop offset=\(offset) reason=store-gone "
+                        + "generation=\(generation)"
+                )
+                return
+            }
+            guard self.indexGeneration == generation else {
+                photoVaultTrace(
+                    "store unsorted-fetch drop offset=\(offset) reason=stale-generation "
+                        + "requested=\(generation) current=\(self.indexGeneration)"
+                )
+                return
+            }
             switch result {
             case .failure(let error):
+                photoVaultTrace(
+                    "store unsorted-fetch identifiers-failed offset=\(offset) "
+                        + "error=\(error.localizedDescription)"
+                )
                 completion(.failure(error))
             case .success(let identifiers):
+                photoVaultTrace(
+                    "store unsorted-fetch identifiers-ready offset=\(offset) "
+                        + "count=\(identifiers.count) generation=\(generation)"
+                )
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     let fetched = PHAsset.fetchAssets(
                         withLocalIdentifiers: identifiers,
@@ -265,7 +318,25 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                         assetsByIdentifier[$0]
                     }
                     DispatchQueue.main.async {
-                        guard let self, self.indexGeneration == generation else { return }
+                        guard let self else {
+                            photoVaultTrace(
+                                "store unsorted-fetch drop offset=\(offset) "
+                                    + "reason=store-gone-after-fetch generation=\(generation)"
+                            )
+                            return
+                        }
+                        guard self.indexGeneration == generation else {
+                            photoVaultTrace(
+                                "store unsorted-fetch drop offset=\(offset) "
+                                    + "reason=stale-generation-after-fetch "
+                                    + "requested=\(generation) current=\(self.indexGeneration)"
+                            )
+                            return
+                        }
+                        photoVaultTrace(
+                            "store unsorted-fetch assets-ready offset=\(offset) "
+                                + "count=\(orderedAssets.count) generation=\(generation)"
+                        )
                         completion(.success(orderedAssets))
                     }
                 }
@@ -812,6 +883,10 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         generation: Int
     ) {
         guard generation == indexGeneration else { return }
+        photoVaultTrace(
+            "store index start generation=\(generation) assets=\(allPhotos.count) "
+                + "userAlbums=\(userAlbums.count)"
+        )
         let librarySignature = makeLibrarySignature(for: allPhotos)
         isIndexingUnsorted = true
         indexErrorMessage = nil
@@ -1003,6 +1078,10 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         librarySignature: String
     ) {
         guard generation == indexGeneration else { return }
+        photoVaultTrace(
+            "store index finished generation=\(generation) "
+                + "assets=\(stats.assetCount) unsorted=\(stats.unsortedCount)"
+        )
         indexStats = stats
         unsortedCount = stats.unsortedCount
         isIndexingUnsorted = false
@@ -1017,6 +1096,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     }
 
     private func failIndexing(_ error: Error) {
+        photoVaultTrace("store index failed error=\(error.localizedDescription)")
         isIndexingUnsorted = false
         indexProgress = nil
         indexErrorMessage = error.localizedDescription
@@ -1028,6 +1108,11 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
               !isIndexingUnsorted,
               generation == indexGeneration
         else { return }
+
+        photoVaultTrace(
+            "store index ready for unsorted pages generation=\(generation) "
+                + "count=\(unsortedCount)"
+        )
 
         // Pages are requested by IndexedPhotoGridView as cells approach the
         // viewport. Keeping this hook empty is intentional: finishing the

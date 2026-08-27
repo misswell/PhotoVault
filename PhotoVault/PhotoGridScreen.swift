@@ -11,6 +11,7 @@ struct PhotoGridScreen: View {
     @State private var selectionMode = false
     @State private var selectedAssets: [String: PHAsset] = [:]
     @State private var viewerRequest: PhotoViewerRequest?
+    @State private var isViewerTransitioning = false
     @State private var isShowingSlideshow = false
     @State private var isShowingAlbumPicker = false
     @State private var isShowingShareSheet = false
@@ -44,10 +45,12 @@ struct PhotoGridScreen: View {
                 } else {
                     PhotoGridView(
                         assets: assets,
+                        isActive: !isViewerTransitioning
+                            && !isShowingSlideshow,
                         selectionMode: selectionMode,
                         selectedIDs: Set(selectedAssets.keys),
                         onOpen: { index in
-                            viewerRequest = PhotoViewerRequest(index: index)
+                            presentViewer(at: index)
                         },
                         onToggleSelection: toggleSelection(for:),
                         onFavorite: toggleFavorite(for:),
@@ -63,6 +66,12 @@ struct PhotoGridScreen: View {
         }
         .background(Color(uiColor: .systemGroupedBackground))
         .navigationTitle(title)
+        .onAppear {
+            photoVaultTrace("grid screen appear title=\(title)")
+        }
+        .onDisappear {
+            photoVaultTrace("grid screen disappear title=\(title)")
+        }
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 if selectionMode {
@@ -141,13 +150,18 @@ struct PhotoGridScreen: View {
                 }
             }
         }
-        .fullScreenCover(item: $viewerRequest) { request in
+        .fullScreenCover(item: $viewerRequest, onDismiss: {
+            photoVaultTrace("photo viewer dismissed title=\(title)")
+            viewerRequest = nil
+            isViewerTransitioning = false
+        }) { request in
             if let assets {
                 PhotoViewerView(
                     assets: assets,
                     initialIndex: request.index,
                     store: store,
-                    album: album
+                    album: album,
+                    onDismissRequested: dismissViewer
                 )
             }
         }
@@ -288,6 +302,25 @@ struct PhotoGridScreen: View {
             )
         }
     }
+
+    private func presentViewer(at index: Int) {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            isViewerTransitioning = true
+            viewerRequest = PhotoViewerRequest(index: index)
+        }
+    }
+
+    private func dismissViewer() {
+        photoVaultTrace("photo viewer dismiss committed title=\(title)")
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            viewerRequest = nil
+            isViewerTransitioning = false
+        }
+    }
 }
 
 struct UnsortedPhotosScreen: View {
@@ -296,6 +329,7 @@ struct UnsortedPhotosScreen: View {
     @State private var selectionMode = false
     @State private var selectedAssets: [String: PHAsset] = [:]
     @State private var viewerIndex: Int?
+    @State private var isViewerTransitioning = false
     @State private var isShowingSlideshow = false
     @State private var isShowingAlbumPicker = false
     @State private var isShowingShareSheet = false
@@ -309,6 +343,15 @@ struct UnsortedPhotosScreen: View {
         contentView
         .background(Color(uiColor: .systemGroupedBackground))
         .navigationTitle("未整理")
+        .onAppear {
+            photoVaultTrace(
+                "unsorted screen appear count=\(store.unsortedCount) "
+                    + "indexing=\(store.isIndexingUnsorted)"
+            )
+        }
+        .onDisappear {
+            photoVaultTrace("unsorted screen disappear")
+        }
         .toolbar {
             ToolbarItem(placement: .topBarLeading) {
                 if selectionMode {
@@ -362,7 +405,14 @@ struct UnsortedPhotosScreen: View {
                 }
             }
         }
-        .fullScreenCover(isPresented: viewerPresentationBinding) { viewerView }
+        .fullScreenCover(
+            isPresented: viewerPresentationBinding,
+            onDismiss: {
+                photoVaultTrace("indexed photo viewer dismissed")
+                viewerIndex = nil
+                isViewerTransitioning = false
+            }
+        ) { viewerView }
         .fullScreenCover(isPresented: $isShowingSlideshow) {
             IndexedSlideshowView(
                 title: "未整理",
@@ -467,6 +517,8 @@ struct UnsortedPhotosScreen: View {
             IndexedPhotoGridView(
                 totalCount: store.unsortedCount,
                 store: store,
+                isActive: !isViewerTransitioning
+                    && !isShowingSlideshow,
                 selectionMode: selectionMode,
                 selectedIDs: Set(selectedAssets.keys),
                 onOpen: openViewer(asset:index:),
@@ -486,7 +538,8 @@ struct UnsortedPhotosScreen: View {
                 title: "未整理",
                 totalCount: store.unsortedCount,
                 initialIndex: viewerIndex,
-                store: store
+                store: store,
+                onDismissRequested: dismissViewer
             )
         }
     }
@@ -499,7 +552,22 @@ struct UnsortedPhotosScreen: View {
     }
 
     private func openViewer(asset: PHAsset, index: Int) {
-        viewerIndex = index
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            isViewerTransitioning = true
+            viewerIndex = index
+        }
+    }
+
+    private func dismissViewer() {
+        photoVaultTrace("indexed photo viewer dismiss committed")
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            viewerIndex = nil
+            isViewerTransitioning = false
+        }
     }
 
     private func toggleSelection(for asset: PHAsset) {
