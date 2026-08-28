@@ -684,7 +684,10 @@ private struct AlbumGridThumbnail: View {
                 if let asset {
                     AssetImageView(
                         asset: asset,
-                        targetSize: CGSize(width: 256, height: 256)
+                        targetSize: CGSize(width: 256, height: 256),
+                        cacheResult: true,
+                        cacheScope: .albumThumbnail,
+                        usesPhotoKitCaching: false
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {

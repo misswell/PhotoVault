@@ -1759,7 +1759,8 @@ private final class ViewerFilmstripCell: UICollectionViewCell {
         representedAsset = asset
         representedTargetSize = targetSize
         imageView.image = nil
-        PhotoImageManager.shared.startCaching(asset: asset, targetSize: targetSize)
+        // The strip's prefetch data source owns the cache window; per-cell
+        // caching would only add PhotoKit churn.
         requestHandle = PhotoImageManager.shared.requestImage(
             for: asset,
             targetSize: targetSize,
@@ -1794,12 +1795,6 @@ private final class ViewerFilmstripCell: UICollectionViewCell {
 
     private func cancelRequest() {
         PhotoImageManager.shared.cancel(requestHandle)
-        if let representedAsset {
-            PhotoImageManager.shared.stopCaching(
-                asset: representedAsset,
-                targetSize: representedTargetSize
-            )
-        }
         requestHandle = nil
     }
 }

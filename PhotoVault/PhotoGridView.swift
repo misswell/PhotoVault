@@ -1034,7 +1034,10 @@ final class PhotoGridCell: UICollectionViewCell {
                 + "target=\(Int(targetSize.width))x\(Int(targetSize.height))"
         )
 
-        PhotoImageManager.shared.startCaching(asset: asset, targetSize: targetSize)
+        // The prefetch data source owns the PHCachingImageManager window
+        // (visible range plus the incoming edge). Caching here again per
+        // cell recycle only adds PhotoKit churn and evicts entries the
+        // prefetcher just established.
         requestHandle = PhotoImageManager.shared.requestImage(
             for: asset,
             targetSize: targetSize,
@@ -1139,12 +1142,6 @@ final class PhotoGridCell: UICollectionViewCell {
                     + " target=\(Int(representedTargetSize.width))x\(Int(representedTargetSize.height))"
             )
             PhotoImageManager.shared.cancel(requestHandle)
-        }
-        if let representedAsset {
-            PhotoImageManager.shared.stopCaching(
-                asset: representedAsset,
-                targetSize: representedTargetSize
-            )
         }
         requestHandle = nil
     }
