@@ -846,32 +846,31 @@ private struct AlbumFolderSidebarRowLabel: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: isExpanded ? "folder.fill" : "folder")
-                .font(.title3)
+                .font(.subheadline)
                 .foregroundStyle(.secondary)
-                .frame(width: 34, height: 34)
+                .frame(width: 28, height: 28)
                 .background(
                     Color.secondary.opacity(0.12),
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
                 )
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(folder.title)
-                    .lineLimit(1)
-                Text(folderSummary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Text(folder.title)
+                .lineLimit(1)
 
             Spacer(minLength: 8)
 
+            Text(folderSummary)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+                .lineLimit(1)
+
             Image(systemName: "chevron.right")
-                .font(.subheadline.weight(.semibold))
+                .font(.footnote.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .rotationEffect(isExpanded ? .degrees(90) : .zero)
                 .animation(.easeInOut(duration: 0.16), value: isExpanded)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 44, alignment: .center)
         .contentShape(Rectangle())
     }
 
@@ -1116,32 +1115,34 @@ private struct AlbumSidebarRow: View {
             if let previewAsset = album.previewAsset {
                 AssetImageView(
                     asset: previewAsset,
-                    // The row is only 34 points wide. Request a small,
+                    // The row is only 28 points wide. Request a small,
                     // retina-friendly preview so scrolling the sidebar does
                     // not decode a much larger image than it can display.
-                    targetSize: CGSize(width: 72, height: 72),
+                    targetSize: CGSize(width: 60, height: 60),
                     cacheResult: true,
                     cacheScope: .albumThumbnail,
                     usesPhotoKitCaching: false
                 )
-                .frame(width: 34, height: 34)
+                .frame(width: 28, height: 28)
                 .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             } else {
                 Image(systemName: album.symbolName)
-                    .frame(width: 34, height: 34)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28, height: 28)
                     .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
             }
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(album.title)
-                    .lineLimit(1)
-                Text("\(album.assetCount) 张")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Text(album.title)
+                .lineLimit(1)
+
+            Spacer(minLength: 8)
+
+            Text("\(album.assetCount) 张")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 44, alignment: .center)
         .contentShape(Rectangle())
     }
 }
@@ -1268,6 +1269,8 @@ struct PhotoVaultSettingsView: View {
     private var swipeStyleRawValue = PhotoSwipeStyle.system.rawValue
     @AppStorage(SlideshowTransitionStyle.storageKey)
     private var slideshowTransitionRawValue = SlideshowTransitionStyle.fade.rawValue
+    @AppStorage(AppIconPreference.storageKey)
+    private var appIconPreferenceRawValue = AppIconPreference.system.rawValue
 
     private var selectedAlbumTileColumnCount: AlbumTileColumnCount {
         AlbumTileColumnCount(rawValue: albumTileColumnCountRawValue) ?? .automatic
@@ -1279,6 +1282,10 @@ struct PhotoVaultSettingsView: View {
 
     private var selectedSlideshowTransition: SlideshowTransitionStyle {
         SlideshowTransitionStyle(rawValue: slideshowTransitionRawValue) ?? .fade
+    }
+
+    private var selectedAppIconPreference: AppIconPreference {
+        AppIconPreference(rawValue: appIconPreferenceRawValue) ?? .system
     }
 
     var body: some View {
@@ -1320,6 +1327,25 @@ struct PhotoVaultSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                Section("应用图标") {
+                    Picker("图标", selection: $appIconPreferenceRawValue) {
+                        ForEach(AppIconPreference.allCases) { preference in
+                            Text(preference.title).tag(preference.rawValue)
+                        }
+                    }
+                    .onChange(of: appIconPreferenceRawValue) { _, _ in
+                        applyAppIconPreference(selectedAppIconPreference)
+                    }
+
+                    Text(selectedAppIconPreference.detail)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text("切换时系统会弹出确认提示。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section {
                     Text("图片会预读相邻照片的高质量版本，尽量避免从 iCloud 切换时出现黑屏或闪烁。")
                         .font(.footnote)
@@ -1335,5 +1361,14 @@ struct PhotoVaultSettingsView: View {
             }
         }
         .presentationDetents([.medium, .large])
+    }
+
+    /// UIApplication persists the alternate icon itself; "跟随系统" maps to
+    /// nil, restoring the primary set whose light/dark variants follow the
+    /// system appearance.
+    private func applyAppIconPreference(_ preference: AppIconPreference) {
+        let application = UIApplication.shared
+        guard application.alternateIconName != preference.alternateIconName else { return }
+        application.setAlternateIconName(preference.alternateIconName)
     }
 }

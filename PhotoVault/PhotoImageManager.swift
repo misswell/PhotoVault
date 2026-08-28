@@ -17,12 +17,13 @@ private let photoVaultFileLogQueue = DispatchQueue(
 
 /// Debug-only diagnostics that are visible in the device console and retained
 /// in the app container so the request lifecycle can be inspected after a
-/// reproduction. The log intentionally contains no image data.
+/// reproduction. The log intentionally contains no image data. OSLog and the
+/// sandbox file are the retrieval paths; printing to stdout from the main
+/// thread during scroll measurably janks the lists, so it is skipped.
 func photoVaultTrace(_ message: @autoclosure () -> String) {
     let text = message()
     let line = "[PhotoVault] [\(Date().timeIntervalSince1970)] \(text)"
     photoVaultLogger.notice("\(text, privacy: .public)")
-    print(line)
 
     photoVaultFileLogQueue.async {
         let fileManager = FileManager.default

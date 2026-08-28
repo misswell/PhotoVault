@@ -65,6 +65,71 @@ enum PagerDiagnostics {
 }
 #endif
 
+@MainActor
+private final class MediaAudioSession: ObservableObject {
+    static let shared = MediaAudioSession()
+
+    @Published private(set) var isMuted = true
+
+    private init() {}
+
+    func toggleMuted() {
+        setMuted(!isMuted)
+    }
+
+    private func setMuted(_ muted: Bool) {
+        guard muted != isMuted else { return }
+
+        if muted {
+            isMuted = true
+            try? AVAudioSession.sharedInstance().setActive(
+                false,
+                options: .notifyOthersOnDeactivation
+            )
+            PagerDiagnostics.log("media audio muted=true")
+            return
+        }
+
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playback, mode: .moviePlayback)
+            try audioSession.setActive(true)
+            isMuted = false
+            PagerDiagnostics.log("media audio muted=false session=playback")
+        } catch {
+            isMuted = true
+            PagerDiagnostics.log(
+                "media audio activation failed error=\(error.localizedDescription)"
+            )
+        }
+    }
+}
+
+private extension PHAsset {
+    var hasPlayableAudio: Bool {
+        mediaType == .video
+            || (mediaType == .image && mediaSubtypes.contains(.photoLive))
+    }
+}
+
+private struct MediaAudioButton: View {
+    @ObservedObject private var audioSession = MediaAudioSession.shared
+
+    var body: some View {
+        Button {
+            audioSession.toggleMuted()
+        } label: {
+            Image(systemName: audioSession.isMuted
+                ? "speaker.slash.fill"
+                : "speaker.wave.2.fill")
+                .font(.headline)
+                .frame(width: 36, height: 36)
+                .glassEffect(.regular.interactive(), in: Circle())
+        }
+        .accessibilityLabel(audioSession.isMuted ? "打开声音" : "静音")
+    }
+}
+
 private func viewerPageTransition(
     style: PhotoSwipeStyle,
     direction: Int
@@ -177,6 +242,7 @@ private struct ViewerMediaView: View {
 private struct NativePhotoPager: UIViewControllerRepresentable {
     let pageCount: Int
     @Binding var currentIndex: Int
+    var isScrubbing: Bool = false
     let assetProvider: (Int) -> PHAsset?
     let targetSize: CGSize
     let contentMode: PHImageContentMode
@@ -203,6 +269,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         context.coordinator.update(
             pageCount: pageCount,
             currentIndex: currentIndex,
+            isScrubbing: isScrubbing,
             assetProvider: assetProvider,
             targetSize: targetSize,
             contentMode: contentMode,
@@ -220,6 +287,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         context.coordinator.update(
             pageCount: pageCount,
             currentIndex: currentIndex,
+            isScrubbing: isScrubbing,
             assetProvider: assetProvider,
             targetSize: targetSize,
             contentMode: contentMode,
@@ -251,6 +319,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         private var pages: [Int: PhotoPagerPageController] = [:]
         private var currentIndexBinding: Binding<Int>
         private var pendingProgrammaticIndex: Int?
+        private var isScrubbing = false
         private var lastUpdateSignature = ""
 
         init(currentIndex: Binding<Int>) {
@@ -291,6 +360,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         func update(
             pageCount: Int,
             currentIndex: Int,
+            isScrubbing: Bool,
             assetProvider: @escaping (Int) -> PHAsset?,
             targetSize: CGSize,
             contentMode: PHImageContentMode,
@@ -305,6 +375,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             self.neighborPriority = neighborPriority
             self.onMediaReady = onMediaReady
             self.onZoomingChanged = onZoomingChanged
+            self.isScrubbing = isScrubbing
 
             guard self.pageCount > 0,
                   let pageController
@@ -330,44 +401,71 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                 return
             }
 
-            // SwiftUI may call updateUIViewController more than once while
-            // the destination page is downloading. Do not restart the same
-            // UIKit transition on every asset/cache update.
-            if pendingProgrammaticIndex == clampedIndex {
-                return
-            }
-            guard pendingProgrammaticIndex == nil else { return }
-
-            // A filmstrip tap or another external control can change the
-            // binding without going through the page controller delegate.
-            // Move directly to that asset and leave the controller centered
-            // there; there is no selection value to reset afterward.
-            guard displayedIndex != clampedIndex,
-                  let visiblePage = pageController.viewControllers?.first as? PhotoPagerPageController
-            else { return }
-
-            let direction: UIPageViewController.NavigationDirection =
-                clampedIndex > visiblePage.index ? .forward : .reverse
-            guard let targetPage = page(at: clampedIndex) else { return }
-            pendingProgrammaticIndex = clampedIndex
-            let directionName = direction == .forward ? "forward" : "reverse"
-            PagerDiagnostics.log(
-                "external transition from=\(visiblePage.index) to=\(clampedIndex) direction=\(directionName)"
-            )
-            pageController.setViewControllers(
-                [targetPage],
-                direction: direction,
-                animated: true
-            ) { [weak self] _ in
-                guard let self else { return }
-                self.pendingProgrammaticIndex = nil
-                self.displayedIndex = clampedIndex
-                if self.isZooming {
-                    self.isZooming = false
-                    self.onZoomingChanged?(false)
+            if displayedIndex != clampedIndex {
+                // Filmstrip scrubbing produces a burst of index changes per
+                // gesture. Animated transitions would queue behind the
+                // pending guard and lag behind the finger, so scrub steps
+                // swap pages instantly instead.
+                if isScrubbing {
+                    if let targetPage = page(at: clampedIndex) {
+                        let direction: UIPageViewController.NavigationDirection =
+                            clampedIndex > displayedIndex ? .forward : .reverse
+                        PagerDiagnostics.log(
+                            "scrub transition from=\(displayedIndex) to=\(clampedIndex)"
+                        )
+                        pageController.setViewControllers(
+                            [targetPage],
+                            direction: direction,
+                            animated: false
+                        )
+                        self.displayedIndex = clampedIndex
+                        if isZooming {
+                            isZooming = false
+                            onZoomingChanged?(false)
+                        }
+                    }
+                    return
                 }
-                PagerDiagnostics.log("external transition completed=\(clampedIndex)")
-                self.refreshPages(around: clampedIndex)
+
+                // SwiftUI may call updateUIViewController more than once while
+                // the destination page is downloading. Do not restart the same
+                // UIKit transition on every asset/cache update.
+                if pendingProgrammaticIndex == clampedIndex {
+                    return
+                }
+                guard pendingProgrammaticIndex == nil else { return }
+
+                // A filmstrip tap or another external control can change the
+                // binding without going through the page controller delegate.
+                // Move directly to that asset and leave the controller centered
+                // there; there is no selection value to reset afterward.
+                guard let visiblePage = pageController.viewControllers?
+                    .first as? PhotoPagerPageController
+                else { return }
+
+                let direction: UIPageViewController.NavigationDirection =
+                    clampedIndex > visiblePage.index ? .forward : .reverse
+                guard let targetPage = page(at: clampedIndex) else { return }
+                pendingProgrammaticIndex = clampedIndex
+                let directionName = direction == .forward ? "forward" : "reverse"
+                PagerDiagnostics.log(
+                    "external transition from=\(visiblePage.index) to=\(clampedIndex) direction=\(directionName)"
+                )
+                pageController.setViewControllers(
+                    [targetPage],
+                    direction: direction,
+                    animated: true
+                ) { [weak self] _ in
+                    guard let self else { return }
+                    self.pendingProgrammaticIndex = nil
+                    self.displayedIndex = clampedIndex
+                    if self.isZooming {
+                        self.isZooming = false
+                        self.onZoomingChanged?(false)
+                    }
+                    PagerDiagnostics.log("external transition completed=\(clampedIndex)")
+                    self.refreshPages(around: clampedIndex)
+                }
             }
         }
 
@@ -546,6 +644,7 @@ private struct LivePhotoAssetViewer: View {
     let requestPriority: PhotoRequestPriority
     let onReady: (Bool) -> Void
 
+    @ObservedObject private var audioSession = MediaAudioSession.shared
     @State private var livePhoto: PHLivePhoto?
     @State private var requestHandle: PhotoRequestHandle?
     @State private var errorMessage: String?
@@ -556,7 +655,11 @@ private struct LivePhotoAssetViewer: View {
             Color.black
 
             if let livePhoto {
-                LivePhotoUIKitView(livePhoto: livePhoto, contentMode: contentMode)
+                LivePhotoUIKitView(
+                    livePhoto: livePhoto,
+                    contentMode: contentMode,
+                    isMuted: audioSession.isMuted
+                )
             } else if let errorMessage {
                 VStack(spacing: 10) {
                     Image(systemName: "icloud.slash")
@@ -620,11 +723,12 @@ private struct LivePhotoAssetViewer: View {
 private struct LivePhotoUIKitView: UIViewRepresentable {
     let livePhoto: PHLivePhoto
     let contentMode: PHImageContentMode
+    let isMuted: Bool
 
     func makeUIView(context: Context) -> PHLivePhotoView {
         let view = PHLivePhotoView()
         view.contentMode = contentMode == .aspectFill ? .scaleAspectFill : .scaleAspectFit
-        view.isMuted = false
+        view.isMuted = isMuted
         return view
     }
 
@@ -632,6 +736,7 @@ private struct LivePhotoUIKitView: UIViewRepresentable {
         if view.livePhoto !== livePhoto {
             view.livePhoto = livePhoto
         }
+        view.isMuted = isMuted
     }
 }
 
@@ -640,6 +745,7 @@ private struct VideoAssetViewer: View {
     let requestPriority: PhotoRequestPriority
     let onReady: (Bool) -> Void
 
+    @ObservedObject private var audioSession = MediaAudioSession.shared
     @State private var player: AVPlayer?
     @State private var requestHandle: PhotoRequestHandle?
     @State private var errorMessage: String?
@@ -652,6 +758,7 @@ private struct VideoAssetViewer: View {
             if let player {
                 VideoPlayer(player: player)
                     .onAppear {
+                        player.isMuted = audioSession.isMuted
                         player.play()
                     }
                     .onDisappear {
@@ -680,6 +787,9 @@ private struct VideoAssetViewer: View {
         .task(id: "\(asset.localIdentifier)-\(loadAttempt)") {
             requestPlayerItem()
         }
+        .onChange(of: audioSession.isMuted) { _, isMuted in
+            player?.isMuted = isMuted
+        }
         .onDisappear {
             PhotoImageManager.shared.cancel(requestHandle)
             requestHandle = nil
@@ -704,7 +814,9 @@ private struct VideoAssetViewer: View {
             Task { @MainActor in
                 guard !cancelled else { return }
                 if let item {
-                    self.player = AVPlayer(playerItem: item)
+                    let player = AVPlayer(playerItem: item)
+                    player.isMuted = self.audioSession.isMuted
+                    self.player = player
                     self.onReady(true)
                 } else {
                     self.errorMessage = error?.localizedDescription ?? "视频暂时无法播放"
@@ -723,6 +835,9 @@ struct AssetPager: View {
     let neighborPriority: PhotoRequestPriority
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
+    // True while the user is scrubbing the filmstrip: transitions become
+    // instant swaps so the main photo tracks the strip in real time.
+    let isScrubbing: Bool
 
     @State private var isZooming = false
     @State private var customDirection = 1
@@ -736,7 +851,8 @@ struct AssetPager: View {
         contentMode: PHImageContentMode = .aspectFit,
         neighborPriority: PhotoRequestPriority = .slideshow,
         onMediaReady: ((Bool) -> Void)? = nil,
-        onZoomingChanged: ((Bool) -> Void)? = nil
+        onZoomingChanged: ((Bool) -> Void)? = nil,
+        isScrubbing: Bool = false
     ) {
         self.assets = assets
         _currentIndex = currentIndex
@@ -745,6 +861,7 @@ struct AssetPager: View {
         self.neighborPriority = neighborPriority
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
+        self.isScrubbing = isScrubbing
     }
 
     private var swipeStyle: PhotoSwipeStyle {
@@ -787,6 +904,7 @@ struct AssetPager: View {
         NativePhotoPager(
             pageCount: assets.count,
             currentIndex: $currentIndex,
+            isScrubbing: isScrubbing,
             assetProvider: { index in
                 guard index >= 0, index < assets.count else { return nil }
                 return assets.object(at: index)
@@ -822,7 +940,7 @@ struct AssetPager: View {
         }
         .contentShape(Rectangle())
         .simultaneousGesture(customSwipeGesture)
-        .animation(.easeInOut(duration: 0.32), value: currentIndex)
+        .animation(isScrubbing ? nil : .easeInOut(duration: 0.32), value: currentIndex)
     }
 
     private var customSwipeGesture: some Gesture {
@@ -859,11 +977,10 @@ struct PhotoViewerView: View {
     @State private var currentIndex: Int
     @State private var controlsVisible = true
     @State private var isShowingInfo = false
-    @State private var isShowingShareSheet = false
-    @State private var shareItems: [Any] = []
-    @State private var shareTemporaryURLs: [URL] = []
+    @State private var isPreparingShare = false
     @State private var isFavorite: Bool
     @State private var filmstripPosition: Int?
+    @State private var isScrubbingFilmstrip = false
     @State private var dismissDragOffset: CGSize = .zero
     @State private var isZooming = false
     @State private var isDismissing = false
@@ -904,7 +1021,8 @@ struct PhotoViewerView: View {
                         contentMode: viewerContentMode,
                         onZoomingChanged: { zooming in
                             isZooming = zooming
-                        }
+                        },
+                        isScrubbing: isScrubbingFilmstrip
                     )
                     .frame(width: proxy.size.width, height: proxy.size.height)
                     .offset(dismissDragOffset)
@@ -937,7 +1055,10 @@ struct PhotoViewerView: View {
                             ViewerFilmstrip(
                                 assets: assets,
                                 currentIndex: $currentIndex,
-                                position: $filmstripPosition
+                                position: $filmstripPosition,
+                                onScrubbingChanged: { scrubbing in
+                                    isScrubbingFilmstrip = scrubbing
+                                }
                             )
                             .frame(height: 64)
                             .background(
@@ -955,11 +1076,12 @@ struct PhotoViewerView: View {
                     .allowsHitTesting(!isDismissing)
                 }
             }
+            .opacity(viewerOpacity)
             .offset(y: (1 - presentationProgress) * max(1, presentationProxy.size.height))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black)
-        .presentationBackground(.black)
+        .background(Color.clear)
+        .presentationBackground(.clear)
         .statusBarHidden(!controlsVisible)
         .persistentSystemOverlays(.automatic)
         // The viewer owns the Photos-style pull-down gesture below. Keeping
@@ -975,6 +1097,9 @@ struct PhotoViewerView: View {
             if let currentAsset {
                 AlbumPickerSheet(
                     albums: store.albums,
+                    folders: store.albumFolders,
+                    quickAlbumIDs: store.quickAlbumIDs,
+                    onToggleQuickAlbum: { store.toggleQuickAlbum($0) },
                     onCreate: { name in
                         store.createAlbum(named: name, containing: [currentAsset]) { result in
                             handle(result)
@@ -987,10 +1112,6 @@ struct PhotoViewerView: View {
                     }
                 )
             }
-        }
-        .sheet(isPresented: $isShowingShareSheet) {
-            ActivityView(activityItems: shareItems)
-                .onDisappear(perform: cleanupShareItems)
         }
         .alert(item: $alert) { alert in
             Alert(
@@ -1025,6 +1146,12 @@ struct PhotoViewerView: View {
 
     private var dismissProgress: CGFloat {
         min(max(dismissDragOffset.height / 420, 0), 1)
+    }
+
+    private var viewerOpacity: Double {
+        let interactiveFade = 1 - Double(dismissProgress) * 0.28
+        let completionFade = isDismissing ? Double(presentationProgress) : 1
+        return max(0, interactiveFade * completionFade)
     }
 
     private var currentAsset: PHAsset? {
@@ -1091,7 +1218,7 @@ struct PhotoViewerView: View {
     }
 
     private func finishDismissAnimation(reason: String) {
-        withAnimation(.easeOut(duration: 0.18)) {
+        withAnimation(.easeInOut(duration: 0.24)) {
             presentationProgress = 0
             if reason == "pull-down" {
                 dismissDragOffset.height = max(dismissDragOffset.height, 260)
@@ -1099,7 +1226,7 @@ struct PhotoViewerView: View {
         }
 
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(180))
+            try? await Task.sleep(for: .milliseconds(240))
             guard isDismissing else { return }
             PagerDiagnostics.log(
                 "viewer dismiss animation completed kind=fetch index=\(currentIndex)"
@@ -1123,7 +1250,7 @@ struct PhotoViewerView: View {
                 Image(systemName: "xmark")
                     .font(.headline.weight(.semibold))
                     .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .glassEffect(.regular.interactive(), in: Circle())
             }
 
             Spacer()
@@ -1132,13 +1259,17 @@ struct PhotoViewerView: View {
                 .font(.subheadline.weight(.medium))
                 .monospacedDigit()
 
+            if currentAsset?.hasPlayableAudio == true {
+                MediaAudioButton()
+            }
+
             Button {
                 isShowingInfo = true
             } label: {
                 Image(systemName: "info.circle")
                     .font(.title3)
                     .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .glassEffect(.regular.interactive(), in: Circle())
             }
 
             Button(action: toggleFullScreen) {
@@ -1147,7 +1278,7 @@ struct PhotoViewerView: View {
                     : "arrow.up.left.and.arrow.down.right")
                     .font(.title3)
                     .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .glassEffect(.regular.interactive(), in: Circle())
             }
             .accessibilityLabel(isFullScreen ? "退出全屏" : "全屏显示")
         }
@@ -1156,23 +1287,21 @@ struct PhotoViewerView: View {
         .padding(.top, 12)
     }
 
+    /// Photos-style floating action bar: icon-only buttons in a glass
+    /// capsule, evenly distributed with full 46pt hit targets so it reads
+    /// like the native viewer toolbar instead of a cramped row.
     private var bottomBar: some View {
-        HStack(spacing: 12) {
-            Button {
+        HStack(spacing: 0) {
+            viewerBarAction {
                 guard assets.count > 0 else { return }
                 store.toggleFavorite(assets.object(at: currentIndex))
                 isFavorite.toggle()
             } label: {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
                     .symbolRenderingMode(.hierarchical)
-                    .font(.title3)
             }
-
-            Spacer()
-
-            Text("双指缩放 · 双击放大")
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.76))
+            .disabled(assets.count == 0)
+            .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
 
             Spacer()
 
@@ -1192,36 +1321,60 @@ struct PhotoViewerView: View {
                 }
             } label: {
                 Image(systemName: "folder.badge.plus")
-                    .font(.title3)
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
             }
             .disabled(currentAsset == nil)
             .accessibilityLabel("管理相册")
+            .glassEffect(.regular.interactive(), in: Circle())
 
-            Button {
-                guard assets.count > 0 else { return }
+            Spacer()
+
+            viewerBarAction {
+                guard !isPreparingShare, assets.count > 0 else { return }
+                isPreparingShare = true
                 store.requestShareItems(for: [assets.object(at: currentIndex)]) { items, temporaryURLs in
+                    isPreparingShare = false
                     guard !items.isEmpty else { return }
-                    shareItems = items
-                    shareTemporaryURLs = temporaryURLs
-                    isShowingShareSheet = true
+                    ActivityPresenter.present(items: items) {
+                        removeTemporaryURLs(temporaryURLs)
+                    }
                 }
             } label: {
-                Image(systemName: "square.and.arrow.up")
-                    .font(.title3)
+                // Swap the glyph for a spinner inside the same 46pt frame so
+                // preparing iCloud data never shifts the bar's layout.
+                if isPreparingShare {
+                    ProgressView()
+                        .tint(.white)
+                } else {
+                    Image(systemName: "square.and.arrow.up")
+                }
             }
-            .disabled(assets.count == 0)
+            .disabled(isPreparingShare || assets.count == 0)
         }
+        .font(.title3.weight(.medium))
         .foregroundStyle(.white)
-        .padding(.horizontal, 20)
-        .padding(.bottom, 16)
+        .buttonStyle(.plain)
+        .padding(.horizontal, 26)
+        .padding(.bottom, 8)
     }
 
-    private func cleanupShareItems() {
-        for url in shareTemporaryURLs {
+    private func viewerBarAction<Label: View>(
+        action: @escaping () -> Void,
+        @ViewBuilder label: () -> Label
+    ) -> some View {
+        Button(action: action) {
+            label()
+                .frame(width: 46, height: 46)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func removeTemporaryURLs(_ urls: [URL]) {
+        for url in urls {
             try? FileManager.default.removeItem(at: url)
         }
-        shareTemporaryURLs.removeAll()
-        shareItems.removeAll()
     }
 
     private func removeCurrentFromAlbum() {
@@ -1251,12 +1404,14 @@ private struct ViewerFilmstrip: UIViewRepresentable {
     let assets: PHFetchResult<PHAsset>
     @Binding var currentIndex: Int
     @Binding var position: Int?
+    var onScrubbingChanged: (Bool) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             assets: assets,
             currentIndex: $currentIndex,
-            position: $position
+            position: $position,
+            onScrubbingChanged: onScrubbingChanged
         )
     }
 
@@ -1300,19 +1455,23 @@ private struct ViewerFilmstrip: UIViewRepresentable {
         private var selectedIndex: Int
         private var collectionView: UICollectionView?
         private var isProgrammaticScroll = false
+        private var isUserScrubbing = false
         private var needsInitialScroll = true
         private var currentIndexBinding: Binding<Int>
         private var positionBinding: Binding<Int?>
+        private var onScrubbingChanged: (Bool) -> Void
 
         init(
             assets: PHFetchResult<PHAsset>,
             currentIndex: Binding<Int>,
-            position: Binding<Int?>
+            position: Binding<Int?>,
+            onScrubbingChanged: @escaping (Bool) -> Void
         ) {
             self.assets = assets
             selectedIndex = min(max(0, currentIndex.wrappedValue), max(0, assets.count - 1))
             currentIndexBinding = currentIndex
             positionBinding = position
+            self.onScrubbingChanged = onScrubbingChanged
         }
 
         func attach(_ collectionView: UICollectionView) {
@@ -1378,6 +1537,9 @@ private struct ViewerFilmstrip: UIViewRepresentable {
             _ collectionView: UICollectionView,
             didSelectItemAt indexPath: IndexPath
         ) {
+            // A tap can follow a barely-moved drag that already began a
+            // scrub; treat the tap as authoritative and recenter normally.
+            endScrubbing()
             select(index: indexPath.item, animated: true, notify: true)
         }
 
@@ -1411,12 +1573,35 @@ private struct ViewerFilmstrip: UIViewRepresentable {
             )
         }
 
+        func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            // The user took over the strip; a programmatic settle animation
+            // may still be running, but their finger wins from here on.
+            isProgrammaticScroll = false
+            isUserScrubbing = true
+            onScrubbingChanged(true)
+        }
+
+        /// Photos-style live scrubbing: while the finger drags the strip (or
+        /// it decelerates), the asset under the center marker becomes the
+        /// current photo immediately instead of after the scroll settles.
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            guard !isProgrammaticScroll,
+                  scrollView.isTracking || scrollView.isDecelerating
+            else { return }
+            guard let index = centeredIndex(in: scrollView),
+                  index != selectedIndex
+            else { return }
+            select(index: index, animated: false, notify: true)
+        }
+
         func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+            endScrubbing()
             reportCenteredIndex(in: scrollView)
         }
 
         func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
             if !decelerate {
+                endScrubbing()
                 reportCenteredIndex(in: scrollView)
             }
         }
@@ -1425,15 +1610,45 @@ private struct ViewerFilmstrip: UIViewRepresentable {
             isProgrammaticScroll = false
         }
 
+        private func endScrubbing() {
+            guard isUserScrubbing else { return }
+            isUserScrubbing = false
+            onScrubbingChanged(false)
+        }
+
         private func select(index: Int, animated: Bool, notify: Bool) {
             guard index >= 0, index < assets.count else { return }
             selectedIndex = index
             updateVisibleSelection()
             if notify {
                 currentIndexBinding.wrappedValue = index
-                positionBinding.wrappedValue = index
+                // While the user scrubs, the finger owns the strip offset —
+                // do not fight it with scrollToItem or per-frame position
+                // writes; the settle happens when the scrub ends.
+                if !isUserScrubbing {
+                    positionBinding.wrappedValue = index
+                    scrollToSelected(animated: animated)
+                }
+            } else {
+                scrollToSelected(animated: animated)
             }
-            scrollToSelected(animated: animated)
+        }
+
+        /// The item currently under the strip's center marker, computed from
+        /// the layout geometry so per-frame scrubbing stays allocation-free.
+        private func centeredIndex(in scrollView: UIScrollView) -> Int? {
+            guard assets.count > 0,
+                  scrollView.bounds.width > 0,
+                  let layout = collectionView?.collectionViewLayout
+                      as? UICollectionViewFlowLayout
+            else { return nil }
+            let strideLength = layout.itemSize.width + layout.minimumLineSpacing
+            guard strideLength > 0 else { return nil }
+            let centerContentX = scrollView.contentOffset.x + scrollView.bounds.midX
+            let rawIndex = Int(
+                floor((centerContentX - layout.sectionInset.left) / strideLength)
+            )
+            return min(max(0, rawIndex), assets.count - 1)
         }
 
         private func updateVisibleSelection() {
@@ -1603,6 +1818,9 @@ private struct IndexedAssetPager: View {
     let neighborPriority: PhotoRequestPriority
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
+    // True while the user is scrubbing the filmstrip: transitions become
+    // instant swaps so the main photo tracks the strip in real time.
+    let isScrubbing: Bool
 
     @State private var loadingOffsets = Set<Int>()
     @State private var loadedOffsets = Set<Int>()
@@ -1625,7 +1843,8 @@ private struct IndexedAssetPager: View {
         contentMode: PHImageContentMode = .aspectFit,
         neighborPriority: PhotoRequestPriority = .slideshow,
         onMediaReady: ((Bool) -> Void)? = nil,
-        onZoomingChanged: ((Bool) -> Void)? = nil
+        onZoomingChanged: ((Bool) -> Void)? = nil,
+        isScrubbing: Bool = false
     ) {
         self.totalCount = max(0, totalCount)
         self.store = store
@@ -1636,6 +1855,7 @@ private struct IndexedAssetPager: View {
         self.neighborPriority = neighborPriority
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
+        self.isScrubbing = isScrubbing
     }
 
     private var swipeStyle: PhotoSwipeStyle {
@@ -1720,6 +1940,7 @@ private struct IndexedAssetPager: View {
         NativePhotoPager(
             pageCount: totalCount,
             currentIndex: $currentIndex,
+            isScrubbing: isScrubbing,
             assetProvider: { index in
                 assetsByIndex[index]
             },
@@ -1756,7 +1977,7 @@ private struct IndexedAssetPager: View {
             }
             .contentShape(Rectangle())
             .simultaneousGesture(customSwipeGesture)
-            .animation(.easeInOut(duration: 0.32), value: currentIndex)
+            .animation(isScrubbing ? nil : .easeInOut(duration: 0.32), value: currentIndex)
         } else {
             ProgressView("正在读取照片…")
                 .tint(.white)
@@ -1866,12 +2087,14 @@ private struct IndexedViewerFilmstrip: UIViewRepresentable {
     let totalCount: Int
     let store: PhotoLibraryStore
     @Binding var currentIndex: Int
+    var onScrubbingChanged: (Bool) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
             totalCount: totalCount,
             store: store,
-            currentIndex: $currentIndex
+            currentIndex: $currentIndex,
+            onScrubbingChanged: onScrubbingChanged
         )
     }
 
@@ -1919,18 +2142,22 @@ private struct IndexedViewerFilmstrip: UIViewRepresentable {
         private var loadingPages = Set<Int>()
         private weak var collectionView: UICollectionView?
         private var isProgrammaticScroll = false
+        private var isUserScrubbing = false
         private var needsInitialScroll = true
         private var currentIndexBinding: Binding<Int>
+        private let onScrubbingChanged: (Bool) -> Void
 
         init(
             totalCount: Int,
             store: PhotoLibraryStore,
-            currentIndex: Binding<Int>
+            currentIndex: Binding<Int>,
+            onScrubbingChanged: @escaping (Bool) -> Void
         ) {
             self.totalCount = max(0, totalCount)
             self.store = store
             selectedIndex = min(max(0, currentIndex.wrappedValue), max(0, totalCount - 1))
             currentIndexBinding = currentIndex
+            self.onScrubbingChanged = onScrubbingChanged
         }
 
         func attach(_ collectionView: UICollectionView) {
@@ -2004,6 +2231,9 @@ private struct IndexedViewerFilmstrip: UIViewRepresentable {
             didSelectItemAt indexPath: IndexPath
         ) {
             guard indexPath.item < totalCount else { return }
+            // A tap can follow a barely-moved drag that already began a
+            // scrub; treat the tap as authoritative and recenter normally.
+            endScrubbing()
             select(index: indexPath.item, animated: true, notify: true)
         }
 
@@ -2025,16 +2255,44 @@ private struct IndexedViewerFilmstrip: UIViewRepresentable {
             // drag does not repeatedly fetch the same metadata.
         }
 
+        func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            isProgrammaticScroll = false
+            isUserScrubbing = true
+            onScrubbingChanged(true)
+        }
+
+        /// Photos-style live scrubbing for the indexed strip: the centered
+        /// item becomes the current photo while the scroll is still moving.
+        func scrollViewDidScroll(_ scrollView: UIScrollView) {
+            guard !isProgrammaticScroll,
+                  scrollView.isTracking || scrollView.isDecelerating
+            else { return }
+            guard let index = centeredIndex(in: scrollView),
+                  index != selectedIndex
+            else { return }
+            select(index: index, animated: false, notify: true)
+        }
+
         func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+            endScrubbing()
             reportCenteredIndex(in: scrollView)
         }
 
         func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-            if !decelerate { reportCenteredIndex(in: scrollView) }
+            if !decelerate {
+                endScrubbing()
+                reportCenteredIndex(in: scrollView)
+            }
         }
 
         func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
             isProgrammaticScroll = false
+        }
+
+        private func endScrubbing() {
+            guard isUserScrubbing else { return }
+            isUserScrubbing = false
+            onScrubbingChanged(false)
         }
 
         private func select(index: Int, animated: Bool, notify: Bool) {
@@ -2043,7 +2301,28 @@ private struct IndexedViewerFilmstrip: UIViewRepresentable {
             updateVisibleSelection()
             if notify { currentIndexBinding.wrappedValue = index }
             loadPage(containing: index, in: collectionView)
-            scrollToSelected(animated: animated)
+            // While the user scrubs, the finger owns the strip offset; do
+            // not fight it with scrollToItem until the scrub ends.
+            if !isUserScrubbing {
+                scrollToSelected(animated: animated)
+            }
+        }
+
+        /// The item currently under the strip's center marker, computed from
+        /// the layout geometry so per-frame scrubbing stays allocation-free.
+        private func centeredIndex(in scrollView: UIScrollView) -> Int? {
+            guard totalCount > 0,
+                  scrollView.bounds.width > 0,
+                  let layout = collectionView?.collectionViewLayout
+                      as? UICollectionViewFlowLayout
+            else { return nil }
+            let strideLength = layout.itemSize.width + layout.minimumLineSpacing
+            guard strideLength > 0 else { return nil }
+            let centerContentX = scrollView.contentOffset.x + scrollView.bounds.midX
+            let rawIndex = Int(
+                floor((centerContentX - layout.sectionInset.left) / strideLength)
+            )
+            return min(max(0, rawIndex), totalCount - 1)
         }
 
         private func updateVisibleSelection() {
@@ -2158,10 +2437,9 @@ struct IndexedPhotoViewerView: View {
     @State private var assetsByIndex: [Int: PHAsset] = [:]
     @State private var controlsVisible = true
     @State private var isShowingInfo = false
-    @State private var isShowingShareSheet = false
-    @State private var shareItems: [Any] = []
-    @State private var shareTemporaryURLs: [URL] = []
+    @State private var isPreparingShare = false
     @State private var isFavorite = false
+    @State private var isScrubbingFilmstrip = false
     @State private var dismissDragOffset: CGSize = .zero
     @State private var isZooming = false
     @State private var isDismissing = false
@@ -2209,7 +2487,8 @@ struct IndexedPhotoViewerView: View {
                     contentMode: viewerContentMode,
                     onZoomingChanged: { zooming in
                         isZooming = zooming
-                    }
+                    },
+                    isScrubbing: isScrubbingFilmstrip
                 )
                 .frame(width: proxy.size.width, height: proxy.size.height)
                 .offset(dismissDragOffset)
@@ -2235,7 +2514,10 @@ struct IndexedPhotoViewerView: View {
                         IndexedViewerFilmstrip(
                             totalCount: totalCount,
                             store: store,
-                            currentIndex: $currentIndex
+                            currentIndex: $currentIndex,
+                            onScrubbingChanged: { scrubbing in
+                                isScrubbingFilmstrip = scrubbing
+                            }
                         )
                         .frame(height: 64)
                         .background(
@@ -2253,11 +2535,12 @@ struct IndexedPhotoViewerView: View {
                 .allowsHitTesting(!isDismissing)
             }
         }
+        .opacity(viewerOpacity)
         .offset(y: (1 - presentationProgress) * max(1, presentationProxy.size.height))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black)
-        .presentationBackground(.black)
+        .background(Color.clear)
+        .presentationBackground(.clear)
         .statusBarHidden(!controlsVisible)
         .persistentSystemOverlays(.automatic)
         .interactiveDismissDisabled(true)
@@ -2270,6 +2553,9 @@ struct IndexedPhotoViewerView: View {
             if let currentAsset {
                 AlbumPickerSheet(
                     albums: store.albums,
+                    folders: store.albumFolders,
+                    quickAlbumIDs: store.quickAlbumIDs,
+                    onToggleQuickAlbum: { store.toggleQuickAlbum($0) },
                     onCreate: { name in
                         store.createAlbum(named: name, containing: [currentAsset]) { result in
                             handle(result)
@@ -2282,10 +2568,6 @@ struct IndexedPhotoViewerView: View {
                     }
                 )
             }
-        }
-        .sheet(isPresented: $isShowingShareSheet) {
-            ActivityView(activityItems: shareItems)
-                .onDisappear(perform: cleanupShareItems)
         }
         .alert(item: $alert) { alert in
             Alert(
@@ -2318,6 +2600,12 @@ struct IndexedPhotoViewerView: View {
 
     private var dismissProgress: CGFloat {
         min(max(dismissDragOffset.height / 420, 0), 1)
+    }
+
+    private var viewerOpacity: Double {
+        let interactiveFade = 1 - Double(dismissProgress) * 0.28
+        let completionFade = isDismissing ? Double(presentationProgress) : 1
+        return max(0, interactiveFade * completionFade)
     }
 
     private var viewerContentMode: PHImageContentMode {
@@ -2379,7 +2667,7 @@ struct IndexedPhotoViewerView: View {
     }
 
     private func finishDismissAnimation(reason: String) {
-        withAnimation(.easeOut(duration: 0.18)) {
+        withAnimation(.easeInOut(duration: 0.24)) {
             presentationProgress = 0
             if reason == "pull-down" {
                 dismissDragOffset.height = max(dismissDragOffset.height, 260)
@@ -2387,7 +2675,7 @@ struct IndexedPhotoViewerView: View {
         }
 
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(180))
+            try? await Task.sleep(for: .milliseconds(240))
             guard isDismissing else { return }
             PagerDiagnostics.log(
                 "viewer dismiss animation completed kind=indexed index=\(currentIndex)"
@@ -2409,7 +2697,7 @@ struct IndexedPhotoViewerView: View {
                 Image(systemName: "xmark")
                     .font(.headline.weight(.semibold))
                     .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .glassEffect(.regular.interactive(), in: Circle())
             }
 
             Spacer()
@@ -2418,11 +2706,15 @@ struct IndexedPhotoViewerView: View {
                 .font(.subheadline.weight(.medium))
                 .monospacedDigit()
 
+            if currentAsset?.hasPlayableAudio == true {
+                MediaAudioButton()
+            }
+
             Button { isShowingInfo = true } label: {
                 Image(systemName: "info.circle")
                     .font(.title3)
                     .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .glassEffect(.regular.interactive(), in: Circle())
             }
             .disabled(currentAsset == nil)
 
@@ -2432,7 +2724,7 @@ struct IndexedPhotoViewerView: View {
                     : "arrow.up.left.and.arrow.down.right")
                     .font(.title3)
                     .frame(width: 36, height: 36)
-                    .background(.ultraThinMaterial, in: Circle())
+                    .glassEffect(.regular.interactive(), in: Circle())
             }
             .accessibilityLabel(isFullScreen ? "退出全屏" : "全屏显示")
         }
@@ -2441,24 +2733,21 @@ struct IndexedPhotoViewerView: View {
         .padding(.top, 12)
     }
 
+    /// Photos-style floating action bar: icon-only buttons in a glass
+    /// capsule, evenly distributed with full 46pt hit targets so it reads
+    /// like the native viewer toolbar instead of a cramped row.
     private var bottomBar: some View {
-        HStack(spacing: 12) {
-            Button {
+        HStack(spacing: 0) {
+            viewerBarAction {
                 guard let currentAsset else { return }
                 store.toggleFavorite(currentAsset)
                 isFavorite.toggle()
             } label: {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
                     .symbolRenderingMode(.hierarchical)
-                    .font(.title3)
             }
             .disabled(currentAsset == nil)
-
-            Spacer()
-
-            Text("左右滑动 · 双指缩放")
-                .font(.caption)
-                .foregroundStyle(.white.opacity(0.76))
+            .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
 
             Spacer()
 
@@ -2470,36 +2759,58 @@ struct IndexedPhotoViewerView: View {
                 }
             } label: {
                 Image(systemName: "folder.badge.plus")
-                    .font(.title3)
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
             }
             .disabled(currentAsset == nil)
             .accessibilityLabel("移入相册")
+            .glassEffect(.regular.interactive(), in: Circle())
 
-            Button {
-                guard let currentAsset else { return }
+            Spacer()
+
+            viewerBarAction {
+                guard !isPreparingShare, let currentAsset else { return }
+                isPreparingShare = true
                 store.requestShareItems(for: [currentAsset]) { items, temporaryURLs in
+                    isPreparingShare = false
                     guard !items.isEmpty else { return }
-                    shareItems = items
-                    shareTemporaryURLs = temporaryURLs
-                    isShowingShareSheet = true
+                    ActivityPresenter.present(items: items) {
+                        removeTemporaryURLs(temporaryURLs)
+                    }
                 }
             } label: {
-                Image(systemName: "square.and.arrow.up")
-                    .font(.title3)
+                if isPreparingShare {
+                    ProgressView()
+                        .tint(.white)
+                } else {
+                    Image(systemName: "square.and.arrow.up")
+                }
             }
-            .disabled(currentAsset == nil)
+            .disabled(isPreparingShare || currentAsset == nil)
         }
+        .font(.title3.weight(.medium))
         .foregroundStyle(.white)
-        .padding(.horizontal, 20)
-        .padding(.bottom, 16)
+        .buttonStyle(.plain)
+        .padding(.horizontal, 26)
+        .padding(.bottom, 8)
     }
 
-    private func cleanupShareItems() {
-        for url in shareTemporaryURLs {
+    private func viewerBarAction<Label: View>(
+        action: @escaping () -> Void,
+        @ViewBuilder label: () -> Label
+    ) -> some View {
+        Button(action: action) {
+            label()
+                .frame(width: 46, height: 46)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func removeTemporaryURLs(_ urls: [URL]) {
+        for url in urls {
             try? FileManager.default.removeItem(at: url)
         }
-        shareTemporaryURLs.removeAll()
-        shareItems.removeAll()
     }
 
     private func handle(_ result: Result<Void, Error>) {
@@ -2976,6 +3287,11 @@ struct SlideshowView: View {
         SlideshowTransitionStyle(rawValue: transitionStyleRawValue) ?? .fade
     }
 
+    private var currentAsset: PHAsset? {
+        guard currentIndex >= 0, currentIndex < assets.count else { return nil }
+        return assets.object(at: currentIndex)
+    }
+
     var body: some View {
         ZStack {
             Color.black
@@ -3012,7 +3328,7 @@ struct SlideshowView: View {
                             Image(systemName: "xmark")
                                 .font(.headline.weight(.semibold))
                                 .frame(width: 36, height: 36)
-                                .background(.ultraThinMaterial, in: Circle())
+                                .glassEffect(.regular.interactive(), in: Circle())
                         }
 
                         Text(title)
@@ -3020,13 +3336,17 @@ struct SlideshowView: View {
                             .lineLimit(1)
                             .frame(maxWidth: .infinity)
 
+                        if currentAsset?.hasPlayableAudio == true {
+                            MediaAudioButton()
+                        }
+
                         Button {
                             isPaused.toggle()
                         } label: {
                             Image(systemName: isPaused ? "play.fill" : "pause.fill")
                                 .font(.headline)
                                 .frame(width: 36, height: 36)
-                                .background(.ultraThinMaterial, in: Circle())
+                                .glassEffect(.regular.interactive(), in: Circle())
                         }
 
                         Button(action: toggleFullScreen) {
@@ -3035,7 +3355,7 @@ struct SlideshowView: View {
                                 : "arrow.up.left.and.arrow.down.right")
                                 .font(.headline)
                                 .frame(width: 36, height: 36)
-                                .background(.ultraThinMaterial, in: Circle())
+                                .glassEffect(.regular.interactive(), in: Circle())
                         }
                         .accessibilityLabel(isFullScreen ? "退出全屏" : "全屏显示")
                     }
@@ -3225,6 +3545,10 @@ struct IndexedSlideshowView: View {
         SlideshowTransitionStyle(rawValue: transitionStyleRawValue) ?? .fade
     }
 
+    private var currentAsset: PHAsset? {
+        assetsByIndex[currentIndex]
+    }
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
@@ -3258,7 +3582,7 @@ struct IndexedSlideshowView: View {
                             Image(systemName: "xmark")
                                 .font(.headline.weight(.semibold))
                                 .frame(width: 36, height: 36)
-                                .background(.ultraThinMaterial, in: Circle())
+                                .glassEffect(.regular.interactive(), in: Circle())
                         }
 
                         Text(title)
@@ -3266,11 +3590,15 @@ struct IndexedSlideshowView: View {
                             .lineLimit(1)
                             .frame(maxWidth: .infinity)
 
+                        if currentAsset?.hasPlayableAudio == true {
+                            MediaAudioButton()
+                        }
+
                         Button { isPaused.toggle() } label: {
                             Image(systemName: isPaused ? "play.fill" : "pause.fill")
                                 .font(.headline)
                                 .frame(width: 36, height: 36)
-                                .background(.ultraThinMaterial, in: Circle())
+                                .glassEffect(.regular.interactive(), in: Circle())
                         }
 
                         Button(action: toggleFullScreen) {
@@ -3279,7 +3607,7 @@ struct IndexedSlideshowView: View {
                                 : "arrow.up.left.and.arrow.down.right")
                                 .font(.headline)
                                 .frame(width: 36, height: 36)
-                                .background(.ultraThinMaterial, in: Circle())
+                                .glassEffect(.regular.interactive(), in: Circle())
                         }
                         .accessibilityLabel(isFullScreen ? "退出全屏" : "全屏显示")
                     }

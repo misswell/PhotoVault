@@ -232,6 +232,86 @@ private final class PhotoSelectionPanDriver: NSObject, UIGestureRecognizerDelega
     }
 }
 
+/// Builds the shared long-press menu for both grid variants. The quick-add
+/// submenu lists the albums the user pinned in the album picker, so a photo
+/// can be filed into frequently used albums without opening the picker. The
+/// remove entry only appears when the asset is in at least one user album;
+/// with a single membership it becomes a direct action, otherwise a submenu
+/// lists the albums one by one.
+@MainActor
+private func photoGridContextMenu(
+    asset: PHAsset,
+    containingAlbums: [PhotoAlbum],
+    quickAlbums: [PhotoAlbum],
+    onFavorite: @escaping (PHAsset) -> Void,
+    onAddToQuickAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+    onAddToAlbum: @escaping (PHAsset) -> Void,
+    onRemoveFromAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+    onShare: @escaping (PHAsset) -> Void,
+    onDelete: @escaping (PHAsset) -> Void
+) -> UIMenu {
+    let favoriteAction = UIAction(
+        title: asset.isFavorite ? "取消收藏" : "收藏",
+        image: UIImage(systemName: asset.isFavorite ? "heart.slash" : "heart")
+    ) { _ in onFavorite(asset) }
+
+    let addToAlbumAction = UIAction(
+        title: "添加到相册",
+        image: UIImage(systemName: "folder.badge.plus")
+    ) { _ in onAddToAlbum(asset) }
+
+    var removeElement: UIMenuElement?
+    if let singleAlbum = containingAlbums.first, containingAlbums.count == 1 {
+        removeElement = UIAction(
+            title: "从「\(singleAlbum.title)」移除",
+            image: UIImage(systemName: "folder.badge.minus")
+        ) { _ in onRemoveFromAlbum(asset, singleAlbum) }
+    } else if !containingAlbums.isEmpty {
+        removeElement = UIMenu(
+            title: "移除相册",
+            image: UIImage(systemName: "folder.badge.minus"),
+            children: containingAlbums.map { album in
+                UIAction(title: album.title) { _ in onRemoveFromAlbum(asset, album) }
+            }
+        )
+    }
+
+    let shareAction = UIAction(
+        title: "分享",
+        image: UIImage(systemName: "square.and.arrow.up")
+    ) { _ in onShare(asset) }
+
+    let deleteAction = UIAction(
+        title: "删除",
+        image: UIImage(systemName: "trash"),
+        attributes: .destructive
+    ) { _ in onDelete(asset) }
+
+    var children: [UIMenuElement] = [favoriteAction]
+    if !quickAlbums.isEmpty {
+        // One tap files the asset into a pinned album. Actions already in
+        // that album show a checkmark; re-adding is harmless either way.
+        let containingIDs = Set(containingAlbums.map(\.id))
+        let quickAlbumsMenu = UIMenu(
+            title: "快速收藏夹",
+            image: UIImage(systemName: "star"),
+            children: quickAlbums.map { album in
+                UIAction(
+                    title: album.title,
+                    state: containingIDs.contains(album.id) ? .on : .off
+                ) { _ in onAddToQuickAlbum(asset, album) }
+            }
+        )
+        children.append(quickAlbumsMenu)
+    }
+    children.append(addToAlbumAction)
+    if let removeElement {
+        children.append(removeElement)
+    }
+    children.append(contentsOf: [shareAction, deleteAction])
+    return UIMenu(title: "", children: children)
+}
+
 /// The large-library grid is backed by UICollectionView so PhotoKit assets
 /// and cells are both viewport-bound. SwiftUI still owns the screen and
 /// callbacks, while UIKit provides recycling, prefetching and fast scrolling.
@@ -245,6 +325,11 @@ struct PhotoGridView: UIViewRepresentable {
     let onFavorite: (PHAsset) -> Void
     let onShare: (PHAsset) -> Void
     let onDelete: (PHAsset) -> Void
+    let onAddToAlbum: (PHAsset) -> Void
+    let onRemoveFromAlbum: (PHAsset, PhotoAlbum) -> Void
+    let containingUserAlbums: (PHAsset) -> [PhotoAlbum]
+    let onAddToQuickAlbum: (PHAsset, PhotoAlbum) -> Void
+    let quickAlbums: () -> [PhotoAlbum]
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -256,7 +341,12 @@ struct PhotoGridView: UIViewRepresentable {
             onToggleSelection: onToggleSelection,
             onFavorite: onFavorite,
             onShare: onShare,
-            onDelete: onDelete
+            onDelete: onDelete,
+            onAddToAlbum: onAddToAlbum,
+            onRemoveFromAlbum: onRemoveFromAlbum,
+            containingUserAlbums: containingUserAlbums,
+            onAddToQuickAlbum: onAddToQuickAlbum,
+            quickAlbums: quickAlbums
         )
     }
 
@@ -279,7 +369,12 @@ struct PhotoGridView: UIViewRepresentable {
             onToggleSelection: onToggleSelection,
             onFavorite: onFavorite,
             onShare: onShare,
-            onDelete: onDelete
+            onDelete: onDelete,
+            onAddToAlbum: onAddToAlbum,
+            onRemoveFromAlbum: onRemoveFromAlbum,
+            containingUserAlbums: containingUserAlbums,
+            onAddToQuickAlbum: onAddToQuickAlbum,
+            quickAlbums: quickAlbums
         )
     }
 
@@ -309,6 +404,11 @@ struct PhotoGridView: UIViewRepresentable {
         private var onFavorite: (PHAsset) -> Void
         private var onShare: (PHAsset) -> Void
         private var onDelete: (PHAsset) -> Void
+        private var onAddToAlbum: (PHAsset) -> Void
+        private var onRemoveFromAlbum: (PHAsset, PhotoAlbum) -> Void
+        private var containingUserAlbums: (PHAsset) -> [PhotoAlbum]
+        private var onAddToQuickAlbum: (PHAsset, PhotoAlbum) -> Void
+        private var quickAlbums: () -> [PhotoAlbum]
 
         init(
             assets: PHFetchResult<PHAsset>,
@@ -319,7 +419,12 @@ struct PhotoGridView: UIViewRepresentable {
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
             onShare: @escaping (PHAsset) -> Void,
-            onDelete: @escaping (PHAsset) -> Void
+            onDelete: @escaping (PHAsset) -> Void,
+            onAddToAlbum: @escaping (PHAsset) -> Void,
+            onRemoveFromAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+            containingUserAlbums: @escaping (PHAsset) -> [PhotoAlbum],
+            onAddToQuickAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+            quickAlbums: @escaping () -> [PhotoAlbum]
         ) {
             self.assets = assets
             signature = Self.signature(for: assets)
@@ -332,6 +437,11 @@ struct PhotoGridView: UIViewRepresentable {
             self.onFavorite = onFavorite
             self.onShare = onShare
             self.onDelete = onDelete
+            self.onAddToAlbum = onAddToAlbum
+            self.onRemoveFromAlbum = onRemoveFromAlbum
+            self.containingUserAlbums = containingUserAlbums
+            self.onAddToQuickAlbum = onAddToQuickAlbum
+            self.quickAlbums = quickAlbums
         }
 
         func dismantle(_ collectionView: UICollectionView) {
@@ -428,7 +538,12 @@ struct PhotoGridView: UIViewRepresentable {
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
             onShare: @escaping (PHAsset) -> Void,
-            onDelete: @escaping (PHAsset) -> Void
+            onDelete: @escaping (PHAsset) -> Void,
+            onAddToAlbum: @escaping (PHAsset) -> Void,
+            onRemoveFromAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+            containingUserAlbums: @escaping (PHAsset) -> [PhotoAlbum],
+            onAddToQuickAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+            quickAlbums: @escaping () -> [PhotoAlbum]
         ) {
             self.collectionView = collectionView
             let wasActive = self.isActive
@@ -443,6 +558,11 @@ struct PhotoGridView: UIViewRepresentable {
             self.onFavorite = onFavorite
             self.onShare = onShare
             self.onDelete = onDelete
+            self.onAddToAlbum = onAddToAlbum
+            self.onRemoveFromAlbum = onRemoveFromAlbum
+            self.containingUserAlbums = containingUserAlbums
+            self.onAddToQuickAlbum = onAddToQuickAlbum
+            self.quickAlbums = quickAlbums
             selectionPanDriver?.isEnabled = selectionMode
 
             let newSignature = Self.signature(for: assets)
@@ -596,27 +716,19 @@ struct PhotoGridView: UIViewRepresentable {
                 previewProvider: nil
             ) { [weak self] _ in
                 guard let self else { return UIMenu() }
-
-                let favoriteAction = UIAction(
-                    title: asset.isFavorite ? "取消收藏" : "收藏",
-                    image: UIImage(systemName: asset.isFavorite ? "heart.slash" : "heart")
-                ) { [weak self] _ in
-                    self?.onFavorite(asset)
-                }
-                let shareAction = UIAction(
-                    title: "分享",
-                    image: UIImage(systemName: "square.and.arrow.up")
-                ) { [weak self] _ in
-                    self?.onShare(asset)
-                }
-                let deleteAction = UIAction(
-                    title: "删除",
-                    image: UIImage(systemName: "trash"),
-                    attributes: .destructive
-                ) { [weak self] _ in
-                    self?.onDelete(asset)
-                }
-                return UIMenu(title: "", children: [favoriteAction, shareAction, deleteAction])
+                // Resolve album membership only when the menu is about to
+                // appear; the query is a single PhotoKit containment fetch.
+                return photoGridContextMenu(
+                    asset: asset,
+                    containingAlbums: self.containingUserAlbums(asset),
+                    quickAlbums: self.quickAlbums(),
+                    onFavorite: self.onFavorite,
+                    onAddToQuickAlbum: self.onAddToQuickAlbum,
+                    onAddToAlbum: self.onAddToAlbum,
+                    onRemoveFromAlbum: self.onRemoveFromAlbum,
+                    onShare: self.onShare,
+                    onDelete: self.onDelete
+                )
             }
         }
 
@@ -1057,6 +1169,11 @@ struct IndexedPhotoGridView: UIViewRepresentable {
     let onFavorite: (PHAsset) -> Void
     let onShare: (PHAsset) -> Void
     let onDelete: (PHAsset) -> Void
+    let onAddToAlbum: (PHAsset) -> Void
+    let onRemoveFromAlbum: (PHAsset, PhotoAlbum) -> Void
+    let containingUserAlbums: (PHAsset) -> [PhotoAlbum]
+    let onAddToQuickAlbum: (PHAsset, PhotoAlbum) -> Void
+    let quickAlbums: () -> [PhotoAlbum]
 
     func makeCoordinator() -> Coordinator {
         Coordinator(
@@ -1069,7 +1186,12 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             onToggleSelection: onToggleSelection,
             onFavorite: onFavorite,
             onShare: onShare,
-            onDelete: onDelete
+            onDelete: onDelete,
+            onAddToAlbum: onAddToAlbum,
+            onRemoveFromAlbum: onRemoveFromAlbum,
+            containingUserAlbums: containingUserAlbums,
+            onAddToQuickAlbum: onAddToQuickAlbum,
+            quickAlbums: quickAlbums
         )
     }
 
@@ -1092,7 +1214,12 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             onToggleSelection: onToggleSelection,
             onFavorite: onFavorite,
             onShare: onShare,
-            onDelete: onDelete
+            onDelete: onDelete,
+            onAddToAlbum: onAddToAlbum,
+            onRemoveFromAlbum: onRemoveFromAlbum,
+            containingUserAlbums: containingUserAlbums,
+            onAddToQuickAlbum: onAddToQuickAlbum,
+            quickAlbums: quickAlbums
         )
     }
 
@@ -1121,6 +1248,11 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         private var onFavorite: (PHAsset) -> Void
         private var onShare: (PHAsset) -> Void
         private var onDelete: (PHAsset) -> Void
+        private var onAddToAlbum: (PHAsset) -> Void
+        private var onRemoveFromAlbum: (PHAsset, PhotoAlbum) -> Void
+        private var containingUserAlbums: (PHAsset) -> [PhotoAlbum]
+        private var onAddToQuickAlbum: (PHAsset, PhotoAlbum) -> Void
+        private var quickAlbums: () -> [PhotoAlbum]
 
         init(
             totalCount: Int,
@@ -1132,7 +1264,12 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
             onShare: @escaping (PHAsset) -> Void,
-            onDelete: @escaping (PHAsset) -> Void
+            onDelete: @escaping (PHAsset) -> Void,
+            onAddToAlbum: @escaping (PHAsset) -> Void,
+            onRemoveFromAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+            containingUserAlbums: @escaping (PHAsset) -> [PhotoAlbum],
+            onAddToQuickAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+            quickAlbums: @escaping () -> [PhotoAlbum]
         ) {
             self.totalCount = max(0, totalCount)
             self.store = store
@@ -1145,6 +1282,11 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             self.onFavorite = onFavorite
             self.onShare = onShare
             self.onDelete = onDelete
+            self.onAddToAlbum = onAddToAlbum
+            self.onRemoveFromAlbum = onRemoveFromAlbum
+            self.containingUserAlbums = containingUserAlbums
+            self.onAddToQuickAlbum = onAddToQuickAlbum
+            self.quickAlbums = quickAlbums
             photoVaultTrace(
                 "unsorted grid init count=\(self.totalCount) active=\(isActive)"
             )
@@ -1232,7 +1374,12 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
             onShare: @escaping (PHAsset) -> Void,
-            onDelete: @escaping (PHAsset) -> Void
+            onDelete: @escaping (PHAsset) -> Void,
+            onAddToAlbum: @escaping (PHAsset) -> Void,
+            onRemoveFromAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+            containingUserAlbums: @escaping (PHAsset) -> [PhotoAlbum],
+            onAddToQuickAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+            quickAlbums: @escaping () -> [PhotoAlbum]
         ) {
             self.collectionView = collectionView
             let wasActive = self.isActive
@@ -1246,6 +1393,11 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             self.onFavorite = onFavorite
             self.onShare = onShare
             self.onDelete = onDelete
+            self.onAddToAlbum = onAddToAlbum
+            self.onRemoveFromAlbum = onRemoveFromAlbum
+            self.containingUserAlbums = containingUserAlbums
+            self.onAddToQuickAlbum = onAddToQuickAlbum
+            self.quickAlbums = quickAlbums
             selectionPanDriver?.isEnabled = selectionMode
 
             let newCount = max(0, totalCount)
@@ -1417,20 +1569,17 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                 previewProvider: nil
             ) { [weak self] _ in
                 guard let self else { return UIMenu() }
-                let favorite = UIAction(
-                    title: asset.isFavorite ? "取消收藏" : "收藏",
-                    image: UIImage(systemName: asset.isFavorite ? "heart.slash" : "heart")
-                ) { [weak self] _ in self?.onFavorite(asset) }
-                let share = UIAction(
-                    title: "分享",
-                    image: UIImage(systemName: "square.and.arrow.up")
-                ) { [weak self] _ in self?.onShare(asset) }
-                let delete = UIAction(
-                    title: "删除",
-                    image: UIImage(systemName: "trash"),
-                    attributes: .destructive
-                ) { [weak self] _ in self?.onDelete(asset) }
-                return UIMenu(title: "", children: [favorite, share, delete])
+                return photoGridContextMenu(
+                    asset: asset,
+                    containingAlbums: self.containingUserAlbums(asset),
+                    quickAlbums: self.quickAlbums(),
+                    onFavorite: self.onFavorite,
+                    onAddToQuickAlbum: self.onAddToQuickAlbum,
+                    onAddToAlbum: self.onAddToAlbum,
+                    onRemoveFromAlbum: self.onRemoveFromAlbum,
+                    onShare: self.onShare,
+                    onDelete: self.onDelete
+                )
             }
         }
 

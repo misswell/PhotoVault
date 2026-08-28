@@ -67,6 +67,22 @@ private struct PhotoAlbumFetchResult {
     let folders: [PhotoAlbumFolder]
 }
 
+/// Albums the user pinned for one-tap access from the grid's context menu.
+/// The persisted list holds album local identifiers in pin order; a legacy
+/// single-album key from the first iteration is migrated on first read.
+enum PhotoQuickAlbums {
+    static let storageKey = "PhotoVault.quickAlbumIDs"
+    static let legacyStorageKey = "PhotoVault.quickCollectionAlbumID"
+}
+
+/// Declining the system delete prompt surfaces as this PhotoKit error code.
+/// It is a deliberate no-op, not a failure.
+private func isUserCancelledPhotoChange(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    return nsError.domain == PHPhotosErrorDomain
+        && nsError.code == PHPhotosError.userCancelled.rawValue
+}
+
 @MainActor
 final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     @Published private(set) var authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -81,11 +97,18 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     @Published private(set) var indexProgress: PhotoIndexProgress?
     @Published private(set) var indexStats: PhotoIndexStats?
     @Published private(set) var indexErrorMessage: String?
+    /// Album identifiers pinned by the user for the grid's quick-add menu.
+    @Published private(set) var quickAlbumIDs: [String] = []
 
     private var hasStarted = false
     private var indexGeneration = 0
     private var needsUnsortedIndex = true
     private var unsortedScreenRequested = false
+    private var lastProgressPublishAt = Date.distantPast
+    /// Live per-album fetch results. `assets(in:)` runs on every ContentView
+    /// body evaluation; recreating the fetch result each time is wasted
+    /// main-thread work, and PHFetchResult stays accurate on its own.
+    private var albumFetchResults: [String: PHFetchResult<PHAsset>] = [:]
     private let indexStore = PhotoIndexStore()
     private let changeTokenDefaultsKey = "PhotoVault.photoLibrary.changeToken.v1"
     private let changeTokenSignatureDefaultsKey = "PhotoVault.photoLibrary.changeTokenSignature.v1"
@@ -118,6 +141,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
     override init() {
         super.init()
+        loadQuickAlbumIDs()
     }
 
     deinit {
@@ -157,8 +181,10 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             albums = []
             albumFolders = []
         }
-        allPhotos = nil
-        unsortedPhotos = nil
+        // Keep the previous asset fetch results on screen while refreshing.
+        // The grids continue showing the cached content while the fresh
+        // PhotoKit scan runs in the background; a small toolbar spinner
+        // reports progress instead of a blocking full-screen loader.
         needsUnsortedIndex = true
         indexGeneration &+= 1
         let generation = indexGeneration
@@ -349,9 +375,74 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     }
 
     func assets(in album: PhotoAlbum) -> PHFetchResult<PHAsset> {
-        PHAsset.fetchAssets(in: album.collection, options: Self.makeLibraryFetchOptions())
+        if let cached = albumFetchResults[album.id] {
+            return cached
+        }
+        let result = PHAsset.fetchAssets(
+            in: album.collection,
+            options: Self.makeLibraryFetchOptions()
+        )
+        // Dozens of albums never approach this ceiling; it only guards
+        // against unbounded growth during long folder exploration.
+        if albumFetchResults.count >= 64 {
+            albumFetchResults.removeAll(keepingCapacity: true)
+        }
+        albumFetchResults[album.id] = result
+        return result
     }
 
+    /// User albums that currently contain the asset, in the order the flat
+    /// album list keeps them. Used by the grid context menu's remove option;
+    /// runs a single PhotoKit containment query per call.
+    func userAlbums(containing asset: PHAsset) -> [PhotoAlbum] {
+        let containingResult = PHAssetCollection.fetchAssetCollectionsContaining(
+            asset,
+            with: .album,
+            options: nil
+        )
+        var containingIDs = Set<String>()
+        containingResult.enumerateObjects { collection, _, _ in
+            containingIDs.insert(collection.localIdentifier)
+        }
+        return albums.filter { $0.kind == .user && containingIDs.contains($0.id) }
+    }
+
+    /// Pinned quick albums resolved against the current album list, in pin
+    /// order. Identifier-only entries whose album was deleted are skipped.
+    func quickAlbums() -> [PhotoAlbum] {
+        let userAlbumsByID = Dictionary(
+            uniqueKeysWithValues: albums.filter { $0.kind == .user }.map { ($0.id, $0) }
+        )
+        return quickAlbumIDs.compactMap { userAlbumsByID[$0] }
+    }
+
+    func isQuickAlbum(_ id: String) -> Bool {
+        quickAlbumIDs.contains(id)
+    }
+
+    func toggleQuickAlbum(_ id: String) {
+        if let index = quickAlbumIDs.firstIndex(of: id) {
+            quickAlbumIDs.remove(at: index)
+        } else {
+            quickAlbumIDs.append(id)
+        }
+        UserDefaults.standard.set(quickAlbumIDs, forKey: PhotoQuickAlbums.storageKey)
+    }
+
+    private func loadQuickAlbumIDs() {
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: PhotoQuickAlbums.storageKey) != nil {
+            quickAlbumIDs = defaults.stringArray(forKey: PhotoQuickAlbums.storageKey) ?? []
+            return
+        }
+        // First launch after the single quick album shipped: carry it over
+        // so an album pinned in the earlier build stays pinned.
+        if let legacyID = defaults.string(forKey: PhotoQuickAlbums.legacyStorageKey) {
+            quickAlbumIDs = [legacyID]
+            defaults.set(quickAlbumIDs, forKey: PhotoQuickAlbums.storageKey)
+            defaults.removeObject(forKey: PhotoQuickAlbums.legacyStorageKey)
+        }
+    }
     func addAssets(
         _ assets: [PHAsset],
         to album: PhotoAlbum,
@@ -423,8 +514,20 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
         performPhotoLibraryChange({
             PHAssetChangeRequest.deleteAssets(assets as NSArray)
-        }) { result in
-            completion(result)
+        }) { [weak self] result in
+            switch result {
+            case .success:
+                self?.optimisticallyRemoveAssets(assets)
+                completion(result)
+            case .failure(let error):
+                // Declining the system delete prompt is a deliberate no-op:
+                // no error is surfaced and the index stays exactly as it was.
+                if isUserCancelledPhotoChange(error) {
+                    completion(.success(()))
+                } else {
+                    completion(.failure(error))
+                }
+            }
         }
     }
 
@@ -728,20 +831,37 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 return existing
             }
 
-            let assets = PHAsset.fetchAssets(
-                in: collection,
-                options: makeLibraryFetchOptions()
-            )
-            if kind == .smart && assets.count == 0 {
+            // Counting a 100k collection forces PhotoKit to resolve its full
+            // membership on every library change. The estimated count is
+            // served from PhotoKit's own cache and the preview needs only a
+            // single-row fetch, so a whole-library album pass stays cheap.
+            let estimatedCount = collection.estimatedAssetCount
+            let assetCount: Int
+            if estimatedCount != NSNotFound {
+                assetCount = Int(estimatedCount)
+            } else {
+                assetCount = PHAsset.fetchAssets(
+                    in: collection,
+                    options: makeLibraryFetchOptions()
+                ).count
+            }
+            if kind == .smart && assetCount == 0 {
                 return nil
             }
+
+            let previewOptions = makeLibraryFetchOptions()
+            previewOptions.fetchLimit = 1
+            let previewAsset = PHAsset.fetchAssets(
+                in: collection,
+                options: previewOptions
+            ).firstObject
 
             let album = PhotoAlbum(
                 collection: collection,
                 kind: kind,
                 title: collection.localizedTitle ?? "未命名相册",
-                assetCount: assets.count,
-                previewAsset: assets.firstObject
+                assetCount: assetCount,
+                previewAsset: previewAsset
             )
             albumsByID[id] = album
             return album
@@ -891,17 +1011,18 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         isIndexingUnsorted = true
         indexErrorMessage = nil
         needsUnsortedIndex = false
+        lastProgressPublishAt = .distantPast
         indexProgress = PhotoIndexProgress(
             phase: .scanningAssets,
             completed: 0,
             total: allPhotos.count
         )
 
-        indexStore.hasUsableIndex(for: librarySignature) { [weak self] hasUsableIndex in
+        indexStore.hasUsableIndex { [weak self] hasUsableIndex in
             guard let self, self.indexGeneration == generation else { return }
 
             if hasUsableIndex,
-               let token = self.restorePersistentChangeToken(for: librarySignature) {
+               let token = self.restorePersistentChangeToken() {
                 self.applyPersistentChanges(
                     since: token,
                     allPhotos: allPhotos,
@@ -933,7 +1054,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             progress: { [weak self] progress in
                 Task { @MainActor [weak self] in
                     guard let self, self.indexGeneration == generation else { return }
-                    self.indexProgress = progress
+                    self.publishIndexProgress(progress)
                 }
             },
             completion: { [weak self] result in
@@ -951,6 +1072,22 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 }
             }
         )
+    }
+
+    /// A 100k-library scan ticks hundreds of times; publishing every tick
+    /// repaints the entire app and makes list scrolling janky. Coalesce the
+    /// ticks into at most ~4 publications per second; phase changes and the
+    /// finished tick always pass through so progress UI stays truthful at
+    /// its boundaries.
+    private func publishIndexProgress(_ progress: PhotoIndexProgress) {
+        let isPhaseChange = indexProgress?.phase != progress.phase
+        let isFinished = progress.completed >= progress.total
+        let now = Date()
+        guard isPhaseChange || isFinished
+                || now.timeIntervalSince(lastProgressPublishAt) >= 0.25
+        else { return }
+        lastProgressPublishAt = now
+        indexProgress = progress
     }
 
     private func applyPersistentChanges(
@@ -1031,7 +1168,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                                 progress: { [weak self] progress in
                                     Task { @MainActor [weak self] in
                                         guard let self, self.indexGeneration == generation else { return }
-                                        self.indexProgress = progress
+                                        self.publishIndexProgress(progress)
                                     }
                                 },
                                 completion: { [weak self] membershipResult in
@@ -1119,10 +1256,12 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         // index must never materialize the entire unsorted result.
     }
 
-    private func restorePersistentChangeToken(for librarySignature: String) -> PHPersistentChangeToken? {
-        guard UserDefaults.standard.string(forKey: changeTokenSignatureDefaultsKey)
-            == librarySignature
-        else { return nil }
+    /// The persisted PhotoKit change token. Its validity is enforced by
+    /// PhotoKit itself: fetchPersistentChanges throws for an expired token
+    /// and the caller falls back to a full rebuild. The old library-signature
+    /// veto here is what made every new screenshot trigger a full reindex —
+    /// an insert at position 0 always changed the signature.
+    private func restorePersistentChangeToken() -> PHPersistentChangeToken? {
         guard let data = UserDefaults.standard.data(forKey: changeTokenDefaultsKey) else {
             return nil
         }
@@ -1168,6 +1307,25 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             albumTitle: album.title,
             librarySignature: makeLibrarySignature(for: allPhotos)
         ) { [weak self] result in
+            guard let self,
+                  case .success(let stats) = result
+            else { return }
+            self.indexStats = stats
+            self.unsortedCount = stats.unsortedCount
+        }
+    }
+
+    /// Mirror of optimisticallyAddMembership for deletions. The PhotoKit
+    /// change is committed at this point, so drop the index rows right away
+    /// and republish the recomputed unsorted count instead of waiting for
+    /// the change-observer round trip to reconcile them.
+    private func optimisticallyRemoveAssets(_ assets: [PHAsset]) {
+        guard !assets.isEmpty,
+              indexStats != nil,
+              !isIndexingUnsorted
+        else { return }
+
+        indexStore.removeAssets(assetIDs: assets.map(\.localIdentifier)) { [weak self] result in
             guard let self,
                   case .success(let stats) = result
             else { return }

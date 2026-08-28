@@ -133,6 +133,54 @@ enum PhotoGridPreferences {
     static let defaultPreferredCellSide = 50.0
 }
 
+/// Manual app icon choice. "system" restores the primary icon set, which
+/// switches between its light and dark appearance variants automatically;
+/// "light"/"dark" pin one of the compiled alternate icons.
+enum AppIconPreference: String, CaseIterable, Identifiable {
+    case system
+    case light
+    case dark
+
+    static let storageKey = "PhotoVault.appIconPreference"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system:
+            return "跟随系统"
+        case .light:
+            return "亮色"
+        case .dark:
+            return "暗色"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .system:
+            return "外观切换时自动使用亮色或暗色图标。"
+        case .light:
+            return "始终使用亮色图标。"
+        case .dark:
+            return "始终使用暗色图标。"
+        }
+    }
+
+    /// Alternate icon name passed to setAlternateIconName; nil restores the
+    /// primary icon and its automatic appearance switching.
+    var alternateIconName: String? {
+        switch self {
+        case .system:
+            return nil
+        case .light:
+            return "AppIconLight"
+        case .dark:
+            return "AppIconDark"
+        }
+    }
+}
+
 enum PhotoSection: Hashable {
     case library
     case unsorted

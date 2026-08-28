@@ -14,11 +14,10 @@ struct PhotoGridScreen: View {
     @State private var isViewerTransitioning = false
     @State private var isShowingSlideshow = false
     @State private var isShowingAlbumPicker = false
-    @State private var isShowingShareSheet = false
-    @State private var shareItems: [Any] = []
-    @State private var shareTemporaryURLs: [URL] = []
-    @State private var isShowingDeleteConfirmation = false
-    @State private var singleAssetToDelete: PHAsset?
+    // Assets the album picker will operate on: the selection-mode batch or a
+    // single asset chosen through the grid's context menu.
+    @State private var pickerAssets: [PHAsset] = []
+    @State private var isPreparingShare = false
     @State private var alert: PhotoVaultAlert?
 
     init(
@@ -55,7 +54,14 @@ struct PhotoGridScreen: View {
                         onToggleSelection: toggleSelection(for:),
                         onFavorite: toggleFavorite(for:),
                         onShare: share(asset:),
-                        onDelete: requestDelete(asset:)
+                        onDelete: delete(asset:),
+                        onAddToAlbum: requestAddToAlbum(asset:),
+                        onRemoveFromAlbum: removeFromAlbum(asset:album:),
+                        containingUserAlbums: { asset in
+                            store.userAlbums(containing: asset)
+                        },
+                        onAddToQuickAlbum: addToQuickAlbum(asset:album:),
+                        quickAlbums: { store.quickAlbums() }
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -78,6 +84,17 @@ struct PhotoGridScreen: View {
                     Button("取消") {
                         exitSelectionMode()
                     }
+                }
+            }
+
+            ToolbarItem(placement: .topBarTrailing) {
+                // Home-style lightweight refresh indicator: shown only while
+                // a background library scan runs over already-visible
+                // content, so it never blocks interaction or layout.
+                if store.isLoadingAlbums, assets != nil {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("正在更新照片")
                 }
             }
 
@@ -116,6 +133,7 @@ struct PhotoGridScreen: View {
                     Spacer()
 
                     Button {
+                        pickerAssets = Array(selectedAssets.values)
                         isShowingAlbumPicker = true
                     } label: {
                         Label("添加到相册", systemImage: "folder.badge.plus")
@@ -139,10 +157,10 @@ struct PhotoGridScreen: View {
                     } label: {
                         Label("分享", systemImage: "square.and.arrow.up")
                     }
-                    .disabled(selectedAssets.isEmpty)
+                    .disabled(selectedAssets.isEmpty || isPreparingShare)
 
                     Button(role: .destructive) {
-                        isShowingDeleteConfirmation = true
+                        deleteSelected()
                     } label: {
                         Label("删除", systemImage: "trash")
                     }
@@ -173,40 +191,22 @@ struct PhotoGridScreen: View {
         .sheet(isPresented: $isShowingAlbumPicker) {
             AlbumPickerSheet(
                 albums: store.albums,
+                folders: store.albumFolders,
+                quickAlbumIDs: store.quickAlbumIDs,
+                onToggleQuickAlbum: { store.toggleQuickAlbum($0) },
                 onCreate: { name in
-                    store.createAlbum(named: name, containing: Array(selectedAssets.values)) { result in
+                    store.createAlbum(named: name, containing: pickerAssets) { result in
                         handle(result)
                     }
                     exitSelectionMode()
                 },
                 onSelect: { album in
-                    store.addAssets(Array(selectedAssets.values), to: album) { result in
+                    store.addAssets(pickerAssets, to: album) { result in
                         handle(result)
                     }
                     exitSelectionMode()
                 }
             )
-        }
-        .sheet(isPresented: $isShowingShareSheet) {
-            ActivityView(activityItems: shareItems)
-                .onDisappear(perform: cleanupShareItems)
-        }
-        .confirmationDialog(
-            singleAssetToDelete == nil ? "删除所选照片？" : "删除照片？",
-            isPresented: $isShowingDeleteConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("删除照片", role: .destructive) {
-                let assetsToDelete = singleAssetToDelete.map { [$0] } ?? Array(selectedAssets.values)
-                store.deleteAssets(assetsToDelete) { result in
-                    handle(result)
-                }
-                singleAssetToDelete = nil
-                exitSelectionMode()
-            }
-            Button("取消", role: .cancel) { }
-        } message: {
-            Text("照片会从系统照片库中删除，并可能从其他设备移除。")
         }
         .alert(item: $alert) { alert in
             Alert(
@@ -237,8 +237,28 @@ struct PhotoGridScreen: View {
         }
     }
 
+    private func requestAddToAlbum(asset: PHAsset) {
+        pickerAssets = [asset]
+        isShowingAlbumPicker = true
+    }
+
+    private func removeFromAlbum(asset: PHAsset, album: PhotoAlbum) {
+        store.removeAssets([asset], from: album) { result in
+            handle(result)
+        }
+    }
+
+    private func addToQuickAlbum(asset: PHAsset, album: PhotoAlbum) {
+        store.addAssets([asset], to: album) { result in
+            handle(result)
+        }
+    }
+
     private func share(asset: PHAsset) {
+        guard !isPreparingShare else { return }
+        isPreparingShare = true
         store.requestShareItems(for: [asset]) { items, temporaryURLs in
+            isPreparingShare = false
             guard !items.isEmpty else {
                 alert = PhotoVaultAlert(
                     title: "无法分享",
@@ -246,23 +266,36 @@ struct PhotoGridScreen: View {
                 )
                 return
             }
-            shareItems = items
-            shareTemporaryURLs = temporaryURLs
-            isShowingShareSheet = true
+            ActivityPresenter.present(items: items) {
+                removeTemporaryURLs(temporaryURLs)
+            }
         }
     }
 
-    private func requestDelete(asset: PHAsset) {
-        singleAssetToDelete = asset
-        isShowingDeleteConfirmation = true
+    private func delete(asset: PHAsset) {
+        // The system delete alert is the confirmation; no second dialog.
+        store.deleteAssets([asset]) { result in
+            handle(result)
+        }
+    }
+
+    private func deleteSelected() {
+        let assetsToDelete = Array(selectedAssets.values)
+        guard !assetsToDelete.isEmpty else { return }
+        store.deleteAssets(assetsToDelete) { result in
+            handle(result)
+        }
+        exitSelectionMode()
     }
 
     private func exitSelectionMode() {
         selectionMode = false
         selectedAssets.removeAll()
+        pickerAssets = []
     }
 
     private func beginShare() {
+        guard !isPreparingShare else { return }
         let assetsToShare = Array(selectedAssets.values)
         guard assetsToShare.count <= 12 else {
             alert = PhotoVaultAlert(
@@ -272,7 +305,9 @@ struct PhotoGridScreen: View {
             return
         }
 
+        isPreparingShare = true
         store.requestShareItems(for: assetsToShare) { items, temporaryURLs in
+            isPreparingShare = false
             guard !items.isEmpty else {
                 alert = PhotoVaultAlert(
                     title: "无法分享",
@@ -280,18 +315,16 @@ struct PhotoGridScreen: View {
                 )
                 return
             }
-            shareItems = items
-            shareTemporaryURLs = temporaryURLs
-            isShowingShareSheet = true
+            ActivityPresenter.present(items: items) {
+                removeTemporaryURLs(temporaryURLs)
+            }
         }
     }
 
-    private func cleanupShareItems() {
-        for url in shareTemporaryURLs {
+    private func removeTemporaryURLs(_ urls: [URL]) {
+        for url in urls {
             try? FileManager.default.removeItem(at: url)
         }
-        shareTemporaryURLs.removeAll()
-        shareItems.removeAll()
     }
 
     private func handle(_ result: Result<Void, Error>) {
@@ -332,11 +365,10 @@ struct UnsortedPhotosScreen: View {
     @State private var isViewerTransitioning = false
     @State private var isShowingSlideshow = false
     @State private var isShowingAlbumPicker = false
-    @State private var isShowingShareSheet = false
-    @State private var shareItems: [Any] = []
-    @State private var shareTemporaryURLs: [URL] = []
-    @State private var isShowingDeleteConfirmation = false
-    @State private var singleAssetToDelete: PHAsset?
+    // Assets the album picker will operate on: the selection-mode batch or a
+    // single asset chosen through the grid's context menu.
+    @State private var pickerAssets: [PHAsset] = []
+    @State private var isPreparingShare = false
     @State private var alert: PhotoVaultAlert?
 
     var body: some View {
@@ -356,6 +388,17 @@ struct UnsortedPhotosScreen: View {
             ToolbarItem(placement: .topBarLeading) {
                 if selectionMode {
                     Button("取消") { exitSelectionMode() }
+                }
+            }
+
+            ToolbarItem(placement: .topBarTrailing) {
+                // Home-style lightweight indicator: indexing never blocks
+                // layout or interaction, it just spins in the toolbar corner
+                // while the background scan runs.
+                if store.isIndexingUnsorted {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(indexProgressTitle)
                 }
             }
 
@@ -383,6 +426,7 @@ struct UnsortedPhotosScreen: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     Button {
+                        pickerAssets = Array(selectedAssets.values)
                         isShowingAlbumPicker = true
                     } label: {
                         Label("添加到相册", systemImage: "folder.badge.plus")
@@ -394,10 +438,10 @@ struct UnsortedPhotosScreen: View {
                     } label: {
                         Label("分享", systemImage: "square.and.arrow.up")
                     }
-                    .disabled(selectedAssets.isEmpty)
+                    .disabled(selectedAssets.isEmpty || isPreparingShare)
 
                     Button(role: .destructive) {
-                        isShowingDeleteConfirmation = true
+                        deleteSelected()
                     } label: {
                         Label("删除", systemImage: "trash")
                     }
@@ -423,40 +467,22 @@ struct UnsortedPhotosScreen: View {
         .sheet(isPresented: $isShowingAlbumPicker) {
             AlbumPickerSheet(
                 albums: store.albums,
+                folders: store.albumFolders,
+                quickAlbumIDs: store.quickAlbumIDs,
+                onToggleQuickAlbum: { store.toggleQuickAlbum($0) },
                 onCreate: { name in
-                    store.createAlbum(named: name, containing: Array(selectedAssets.values)) { result in
+                    store.createAlbum(named: name, containing: pickerAssets) { result in
                         handle(result)
                     }
                     exitSelectionMode()
                 },
                 onSelect: { album in
-                    store.addAssets(Array(selectedAssets.values), to: album) { result in
+                    store.addAssets(pickerAssets, to: album) { result in
                         handle(result)
                     }
                     exitSelectionMode()
                 }
             )
-        }
-        .sheet(isPresented: $isShowingShareSheet) {
-            ActivityView(activityItems: shareItems)
-                .onDisappear(perform: cleanupShareItems)
-        }
-        .confirmationDialog(
-            singleAssetToDelete == nil ? "删除所选照片？" : "删除照片？",
-            isPresented: $isShowingDeleteConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("删除照片", role: .destructive) {
-                let assetsToDelete = singleAssetToDelete.map { [$0] } ?? Array(selectedAssets.values)
-                store.deleteAssets(assetsToDelete) { result in
-                    handle(result)
-                }
-                singleAssetToDelete = nil
-                exitSelectionMode()
-            }
-            Button("取消", role: .cancel) { }
-        } message: {
-            Text("照片会从系统照片库中删除，并可能从其他设备移除。")
         }
         .alert(item: $alert) { alert in
             Alert(
@@ -464,30 +490,6 @@ struct UnsortedPhotosScreen: View {
                 message: Text(alert.message),
                 dismissButton: .default(Text("好"))
             )
-        }
-        .overlay(alignment: .top) {
-            if store.isIndexingUnsorted {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(spacing: 8) {
-                        ProgressView(value: store.indexProgress?.fraction)
-                            .progressViewStyle(.linear)
-                            .frame(width: 100)
-                        Text(indexProgressTitle)
-                            .font(.subheadline)
-                    }
-
-                    if let progress = store.indexProgress,
-                       progress.total > 0 {
-                        Text("已扫描 \(progress.completed.formatted()) / \(progress.total.formatted())")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 9)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .padding(.top, 8)
-            }
         }
         .task(id: store.isLoadingAlbums) {
             store.ensureUnsortedIndex()
@@ -525,7 +527,14 @@ struct UnsortedPhotosScreen: View {
                 onToggleSelection: toggleSelection(for:),
                 onFavorite: toggleFavorite(for:),
                 onShare: share(asset:),
-                onDelete: requestDelete(asset:)
+                onDelete: delete(asset:),
+                onAddToAlbum: requestAddToAlbum(asset:),
+                onRemoveFromAlbum: removeFromAlbum(asset:album:),
+                containingUserAlbums: { asset in
+                    store.userAlbums(containing: asset)
+                },
+                onAddToQuickAlbum: addToQuickAlbum(asset:album:),
+                quickAlbums: { store.quickAlbums() }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -580,51 +589,80 @@ struct UnsortedPhotosScreen: View {
         store.toggleFavorite(asset) { result in handle(result) }
     }
 
+    private func requestAddToAlbum(asset: PHAsset) {
+        pickerAssets = [asset]
+        isShowingAlbumPicker = true
+    }
+
+    private func removeFromAlbum(asset: PHAsset, album: PhotoAlbum) {
+        store.removeAssets([asset], from: album) { result in handle(result) }
+    }
+
+    private func addToQuickAlbum(asset: PHAsset, album: PhotoAlbum) {
+        store.addAssets([asset], to: album) { result in handle(result) }
+    }
+
     private func share(asset: PHAsset) {
+        guard !isPreparingShare else { return }
+        isPreparingShare = true
         store.requestShareItems(for: [asset]) { items, temporaryURLs in
+            isPreparingShare = false
             guard !items.isEmpty else {
                 alert = PhotoVaultAlert(title: "无法分享", message: "这张照片暂时无法读取，请稍后重试。")
                 return
             }
-            shareItems = items
-            shareTemporaryURLs = temporaryURLs
-            isShowingShareSheet = true
+            ActivityPresenter.present(items: items) {
+                removeTemporaryURLs(temporaryURLs)
+            }
         }
     }
 
-    private func requestDelete(asset: PHAsset) {
-        singleAssetToDelete = asset
-        isShowingDeleteConfirmation = true
+    private func delete(asset: PHAsset) {
+        // The system delete alert is the confirmation; no second dialog.
+        store.deleteAssets([asset]) { result in
+            handle(result)
+        }
+    }
+
+    private func deleteSelected() {
+        let assetsToDelete = Array(selectedAssets.values)
+        guard !assetsToDelete.isEmpty else { return }
+        store.deleteAssets(assetsToDelete) { result in
+            handle(result)
+        }
+        exitSelectionMode()
     }
 
     private func beginShare() {
+        guard !isPreparingShare else { return }
         let assetsToShare = Array(selectedAssets.values)
         guard assetsToShare.count <= 12 else {
             alert = PhotoVaultAlert(title: "选择太多", message: "为了保持流畅，一次最多分享 12 张照片。")
             return
         }
+        isPreparingShare = true
         store.requestShareItems(for: assetsToShare) { items, temporaryURLs in
+            isPreparingShare = false
             guard !items.isEmpty else {
                 alert = PhotoVaultAlert(title: "无法分享", message: "所选照片暂时无法读取，请稍后重试。")
                 return
             }
-            shareItems = items
-            shareTemporaryURLs = temporaryURLs
-            isShowingShareSheet = true
+            ActivityPresenter.present(items: items) {
+                removeTemporaryURLs(temporaryURLs)
+            }
         }
     }
 
-    private func cleanupShareItems() {
-        for url in shareTemporaryURLs {
+    private func removeTemporaryURLs(_ urls: [URL]) {
+        for url in urls {
             try? FileManager.default.removeItem(at: url)
         }
-        shareTemporaryURLs.removeAll()
-        shareItems.removeAll()
     }
 
     private func exitSelectionMode() {
         selectionMode = false
         selectedAssets.removeAll()
+        pickerAssets = []
     }
 
     private func handle(_ result: Result<Void, Error>) {
@@ -649,15 +687,34 @@ struct UnsortedPhotosScreen: View {
 
 struct AlbumPickerSheet: View {
     let albums: [PhotoAlbum]
+    var folders: [PhotoAlbumFolder] = []
+    // Identifiers of albums pinned for the grid's quick-add menu. Toggling a
+    // row's star persists through onToggleQuickAlbum without dismissing.
+    var quickAlbumIDs: [String] = []
+    var onToggleQuickAlbum: (String) -> Void = { _ in }
     let onCreate: (String) -> Void
     let onSelect: (PhotoAlbum) -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var isShowingCreateAlert = false
     @State private var newAlbumName = ""
+    @State private var expandedFolderIDs: Set<String> = []
+
+    /// One indent step per folder nesting level, shared by folder headers and
+    /// their albums so the hierarchy lines up.
+    fileprivate static let indentStep: CGFloat = 20
 
     private var userAlbums: [PhotoAlbum] {
         albums.filter { $0.kind == .user }
+    }
+
+    /// Albums that live inside any folder; the remaining ones are top-level.
+    private var folderAlbumIDs: Set<String> {
+        Set(folders.flatMap { $0.allAlbums.map(\.id) })
+    }
+
+    private var topLevelAlbums: [PhotoAlbum] {
+        userAlbums.filter { !folderAlbumIDs.contains($0.id) }
     }
 
     var body: some View {
@@ -670,14 +727,15 @@ struct AlbumPickerSheet: View {
                         description: Text("请先在系统照片中创建一个相册。")
                     )
                 } else {
-                    List(userAlbums) { album in
-                        Button {
-                            onSelect(album)
-                            dismiss()
-                        } label: {
-                            AlbumListRow(album: album)
+                    List {
+                        ForEach(pickerRows) { row in
+                            switch row {
+                            case .album(let album, let depth):
+                                albumRow(album, indent: CGFloat(depth) * Self.indentStep)
+                            case .folder(let folder, let depth):
+                                folderRow(folder, depth: depth)
+                            }
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }
@@ -716,46 +774,200 @@ struct AlbumPickerSheet: View {
             Text("新相册会保存到系统照片库。")
         }
     }
+
+    /// Every visible item is its own List row so all rows get identical
+    /// insets, separators and spacing. Children of a folder are only part of
+    /// the list while that folder is expanded.
+    private enum PickerRow: Identifiable {
+        case album(PhotoAlbum, depth: Int)
+        case folder(PhotoAlbumFolder, depth: Int)
+
+        var id: String {
+            switch self {
+            case .album(let album, _):
+                return "album:\(album.id)"
+            case .folder(let folder, _):
+                return "folder:\(folder.id)"
+            }
+        }
+    }
+
+    private var pickerRows: [PickerRow] {
+        var rows: [PickerRow] = topLevelAlbums.map { .album($0, depth: 0) }
+
+        func append(_ folder: PhotoAlbumFolder, depth: Int) {
+            rows.append(.folder(folder, depth: depth))
+            guard expandedFolderIDs.contains(folder.id) else { return }
+            for subfolder in folder.subfolders {
+                append(subfolder, depth: depth + 1)
+            }
+            for album in folder.albums {
+                rows.append(.album(album, depth: depth + 1))
+            }
+        }
+
+        for folder in folders {
+            append(folder, depth: 0)
+        }
+        return rows
+    }
+
+    private func albumRow(_ album: PhotoAlbum, indent: CGFloat) -> some View {
+        Button {
+            onSelect(album)
+            dismiss()
+        } label: {
+            AlbumListRow(
+                album: album,
+                isPinned: quickAlbumIDs.contains(album.id),
+                onTogglePin: { onToggleQuickAlbum(album.id) }
+            )
+            .padding(.leading, indent)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func folderRow(_ folder: PhotoAlbumFolder, depth: Int) -> some View {
+        let isExpanded = expandedFolderIDs.contains(folder.id)
+        return Button {
+            withAnimation(.snappy(duration: 0.22)) {
+                if isExpanded {
+                    expandedFolderIDs.remove(folder.id)
+                } else {
+                    expandedFolderIDs.insert(folder.id)
+                }
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: isExpanded ? "folder.fill" : "folder")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        Color.secondary.opacity(0.12),
+                        in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    )
+
+                Text(folder.title)
+                    .lineLimit(1)
+                    .foregroundStyle(.primary)
+
+                Spacer(minLength: 8)
+
+                Text(folderSummary(folder))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+                    .lineLimit(1)
+
+                Image(systemName: "chevron.right")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(isExpanded ? .degrees(90) : .zero)
+                    .animation(.easeInOut(duration: 0.16), value: isExpanded)
+            }
+            .padding(.leading, CGFloat(depth) * Self.indentStep)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func folderSummary(_ folder: PhotoAlbumFolder) -> String {
+        let albumCount = folder.albumCount
+        if albumCount == 0 {
+            return "空文件夹"
+        }
+        return "\(albumCount) 个相册 · \(folder.assetCount) 张"
+    }
 }
 
 private struct AlbumListRow: View {
     let album: PhotoAlbum
+    var isPinned = false
+    var onTogglePin: (() -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
             if let previewAsset = album.previewAsset {
                 AssetImageView(
                     asset: previewAsset,
-                    targetSize: CGSize(width: 160, height: 160)
+                    targetSize: CGSize(width: 60, height: 60),
+                    cacheResult: true,
+                    cacheScope: .albumThumbnail,
+                    usesPhotoKitCaching: false
                 )
-                .frame(width: 52, height: 52)
-                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .frame(width: 28, height: 28)
+                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
             } else {
                 Image(systemName: album.symbolName)
-                    .font(.title3)
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    .frame(width: 52, height: 52)
-                    .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+                    .frame(width: 28, height: 28)
+                    .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
             }
 
-            VStack(alignment: .leading, spacing: 3) {
-                Text(album.title)
-                    .foregroundStyle(.primary)
-                Text("\(album.assetCount) 张")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            Text(album.title)
+                .lineLimit(1)
+                .foregroundStyle(.primary)
+
+            Spacer(minLength: 8)
+
+            Text("\(album.assetCount) 张")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+
+            if let onTogglePin {
+                Button {
+                    onTogglePin()
+                } label: {
+                    Image(systemName: isPinned ? "star.fill" : "star")
+                        .font(.body)
+                        .foregroundStyle(isPinned ? Color.yellow : Color.secondary)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isPinned ? "取消快速收藏" : "标记为快速收藏")
             }
         }
-        .padding(.vertical, 4)
     }
 }
 
-struct ActivityView: UIViewControllerRepresentable {
-    let activityItems: [Any]
+/// Presents the system share sheet straight through UIKit. Hosting
+/// UIActivityViewController inside a SwiftUI sheet lays its content out for
+/// the wrong size first and then jumps into place; presenting from the top
+/// view controller keeps the sheet anchored from the first frame and gives
+/// iPad the popover anchor it requires.
+@MainActor
+enum ActivityPresenter {
+    static func present(items: [Any], onDismiss cleanup: @escaping () -> Void = {}) {
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }),
+            let root = scene.keyWindow?.rootViewController
+        else {
+            cleanup()
+            return
+        }
+        var top: UIViewController = root
+        while let presented = top.presentedViewController {
+            top = presented
+        }
 
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+        let activity = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        activity.completionWithItemsHandler = { _, _, _, _ in
+            cleanup()
+        }
+        if let popover = activity.popoverPresentationController {
+            popover.sourceView = top.view
+            popover.sourceRect = CGRect(
+                x: top.view.bounds.midX,
+                y: top.view.bounds.maxY - 60,
+                width: 1,
+                height: 1
+            )
+            popover.permittedArrowDirections = []
+        }
+        top.present(activity, animated: true)
     }
-
-    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) { }
 }

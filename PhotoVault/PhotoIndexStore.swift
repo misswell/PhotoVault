@@ -62,8 +62,13 @@ final class PhotoIndexStore: @unchecked Sendable {
         label: "com.misswell.PhotoVault.photo-index",
         qos: .utility
     )
+    private let readQueue = DispatchQueue(
+        label: "com.misswell.PhotoVault.photo-index-read",
+        qos: .userInitiated
+    )
     private let databaseURL: URL
     private var database: OpaquePointer?
+    private var readDatabase: OpaquePointer?
 
     init() {
         let applicationSupport = FileManager.default.urls(
@@ -82,17 +87,24 @@ final class PhotoIndexStore: @unchecked Sendable {
                 self.database = nil
             }
         }
+        readQueue.sync {
+            if let readDatabase {
+                sqlite3_close(readDatabase)
+                self.readDatabase = nil
+            }
+        }
     }
 
-    func hasUsableIndex(
-        for librarySignature: String,
-        completion: @escaping (Bool) -> Void
-    ) {
-        queue.async { [weak self] in
-            let result = (try? self?.withDatabase {
-                try self?.readMeta("schema_version") == Self.schemaVersion
-                    && self?.readMeta("index_ready") == "1"
-                    && self?.readMeta("library_signature") == librarySignature
+    /// Index usability no longer compares the library signature: a signature
+    /// change is exactly what a single new screenshot looks like, and the
+    /// persistent change token (whose validity PhotoKit itself enforces)
+    /// applies that delta incrementally. The fallback for a stale or expired
+    /// token remains the full rebuild in the caller.
+    func hasUsableIndex(completion: @escaping (Bool) -> Void) {
+        readQueue.async { [weak self] in
+            let result = (try? self?.withReadDatabase {
+                try self?.readMetaOnReadConnection("schema_version") == Self.schemaVersion
+                    && self?.readMetaOnReadConnection("index_ready") == "1"
             }) ?? false
             DispatchQueue.main.async {
                 completion(result)
@@ -180,6 +192,52 @@ final class PhotoIndexStore: @unchecked Sendable {
         }
     }
 
+    /// Drops assets from the index immediately after a committed PhotoKit
+    /// delete, so the Unsorted list reflects the deletion without waiting
+    /// for the change-observer round trip. Album membership rows cascade
+    /// via the foreign keys, and a later persistent-change sync deleting
+    /// the same identifiers is an idempotent no-op.
+    func removeAssets(
+        assetIDs: [String],
+        completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            do {
+                let stats = try self.removeAssetsSynchronously(assetIDs: assetIDs)
+                DispatchQueue.main.async {
+                    completion(.success(stats))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    private func removeAssetsSynchronously(assetIDs: [String]) throws -> PhotoIndexStats {
+        try withDatabase {
+            try execute("BEGIN IMMEDIATE TRANSACTION")
+            do {
+                let statement = try prepare("DELETE FROM asset_index WHERE asset_id = ?")
+                defer { sqlite3_finalize(statement) }
+                for assetID in assetIDs {
+                    try bindText(assetID, at: 1, to: statement)
+                    try stepAndReset(statement)
+                }
+                try execute("UPDATE meta SET value = '1' WHERE key = 'index_ready'")
+                try execute("COMMIT")
+            } catch {
+                try? execute("ROLLBACK")
+                throw error
+            }
+
+            return try readStats()
+        }
+    }
+
     func addMembership(
         assetIDs: [String],
         albumID: String,
@@ -209,11 +267,13 @@ final class PhotoIndexStore: @unchecked Sendable {
     }
 
     func stats(completion: @escaping (Result<PhotoIndexStats, Error>) -> Void) {
-        queue.async { [weak self] in
+        readQueue.async { [weak self] in
             guard let self else { return }
 
             do {
-                let stats = try self.readStats()
+                let stats = try self.withReadDatabase {
+                    try self.readStatsOnReadConnection()
+                }
                 DispatchQueue.main.async {
                     completion(.success(stats))
                 }
@@ -230,11 +290,16 @@ final class PhotoIndexStore: @unchecked Sendable {
         offset: Int = 0,
         completion: @escaping (Result<[String], Error>) -> Void
     ) {
-        queue.async { [weak self] in
+        readQueue.async { [weak self] in
             guard let self else { return }
 
             do {
-                let identifiers = try self.readUnsortedIdentifiers(limit: limit, offset: offset)
+                let identifiers = try self.withReadDatabase {
+                    try self.readUnsortedIdentifiersOnReadConnection(
+                        limit: limit,
+                        offset: offset
+                    )
+                }
                 DispatchQueue.main.async {
                     completion(.success(identifiers))
                 }
@@ -525,6 +590,94 @@ final class PhotoIndexStore: @unchecked Sendable {
 
     private func readUnsortedIdentifiers(limit: Int, offset: Int) throws -> [String] {
         let statement = try prepare("""
+            SELECT asset_id
+            FROM asset_index
+            WHERE album_count = 0
+            ORDER BY creation_date DESC, asset_id DESC
+            LIMIT ? OFFSET ?
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bindInt64(Int64(max(0, limit)), at: 1, to: statement)
+        try bindInt64(Int64(max(0, offset)), at: 2, to: statement)
+
+        var identifiers = [String]()
+        identifiers.reserveCapacity(min(max(0, limit), 4096))
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let value = sqlite3_column_text(statement, 0) {
+                identifiers.append(String(cString: value))
+            }
+        }
+        return identifiers
+    }
+
+    /// Readers use a dedicated read-only connection. WAL lets it serve the
+    /// last committed snapshot while the writer runs a long rebuild
+    /// transaction, so Unsorted paging and viewer loading never stall behind
+    /// indexing work. READONLY without CREATE also means a fresh install
+    /// simply reports "no index" and the writer side builds it.
+    private func withReadDatabase<T>(_ body: () throws -> T) throws -> T {
+        try openReadIfNeeded()
+        return try body()
+    }
+
+    private func openReadIfNeeded() throws {
+        guard readDatabase == nil else { return }
+        var handle: OpaquePointer?
+        let result = sqlite3_open_v2(
+            databaseURL.path,
+            &handle,
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+            nil
+        )
+        guard result == SQLITE_OK, let handle else {
+            if let handle {
+                sqlite3_close(handle)
+            }
+            throw PhotoIndexError.databaseUnavailable
+        }
+        readDatabase = handle
+    }
+
+    private func prepareRead(_ sql: String) throws -> OpaquePointer {
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(readDatabase, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement
+        else {
+            throw databaseError()
+        }
+        return statement
+    }
+
+    private func readMetaOnReadConnection(_ key: String) throws -> String? {
+        let statement = try prepareRead("SELECT value FROM meta WHERE key = ?")
+        defer { sqlite3_finalize(statement) }
+        try bindText(key, at: 1, to: statement)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        guard let value = sqlite3_column_text(statement, 0) else { return nil }
+        return String(cString: value)
+    }
+
+    private func scalarIntOnReadConnection(_ sql: String) throws -> Int {
+        let statement = try prepareRead(sql)
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw databaseError()
+        }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private func readStatsOnReadConnection() throws -> PhotoIndexStats {
+        PhotoIndexStats(
+            assetCount: try scalarIntOnReadConnection("SELECT COUNT(*) FROM asset_index"),
+            albumCount: try scalarIntOnReadConnection("SELECT COUNT(*) FROM album_index"),
+            unsortedCount: try scalarIntOnReadConnection(
+                "SELECT COUNT(*) FROM asset_index WHERE album_count = 0"
+            )
+        )
+    }
+
+    private func readUnsortedIdentifiersOnReadConnection(limit: Int, offset: Int) throws -> [String] {
+        let statement = try prepareRead("""
             SELECT asset_id
             FROM asset_index
             WHERE album_count = 0
