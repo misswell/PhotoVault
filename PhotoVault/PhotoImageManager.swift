@@ -395,7 +395,11 @@ final class PhotoImageManager {
                 contentMode: contentMode,
                 options: options
             ) { image, info in
-                completion(image, info)
+                // PhotoKit can hand back a lazily-decoded UIImage; decoding
+                // at first render hitches the main thread during fast
+                // scrolls. Prepare once here, on PhotoKit's callback queue.
+                let preparedImage = image?.preparingForDisplay() ?? image
+                completion(preparedImage, info)
 
                 let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
                 let hasError = info?[PHImageErrorKey] != nil
@@ -412,13 +416,13 @@ final class PhotoImageManager {
                 let shouldCacheImage = cacheResult
                     && (cacheScope == .albumThumbnail || !degraded)
                 if shouldCacheImage,
-                   let image,
+                   let preparedImage,
                    !cancelled,
                    !hasError {
                     cache.setObject(
-                        image,
+                        preparedImage,
                         forKey: cacheKey,
-                        cost: self.imageCacheCost(image)
+                        cost: self.imageCacheCost(preparedImage)
                     )
                 }
                 if cancelled || hasError || !degraded {
@@ -558,6 +562,17 @@ final class PhotoImageManager {
         manager.stopCachingImagesForAllAssets()
         imageCache.removeAllObjects()
         albumThumbnailCache.removeAllObjects()
+        scheduler.cancelRequests(atOrBelow: .nearGrid)
+    }
+
+    /// Frees viewer/grid decode caches when the app leaves the foreground.
+    /// The small album-thumbnail cache is kept on purpose so returning to
+    /// the app does not refetch every sidebar row and album tile; callers
+    /// reach this only on a real .background transition, not on .inactive
+    /// (Control Center, banners, app-switcher pass-throughs).
+    func dropTransientCaches() {
+        manager.stopCachingImagesForAllAssets()
+        imageCache.removeAllObjects()
         scheduler.cancelRequests(atOrBelow: .nearGrid)
     }
 
