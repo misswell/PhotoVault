@@ -18,6 +18,7 @@
 		A10000000000000000000009 /* PhotoViewerViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000009 /* PhotoViewerViews.swift */; };
 		A10000000000000000000012 /* PhotoIndexStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000012 /* PhotoIndexStore.swift */; };
 		A10000000000000000000013 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000013 /* Assets.xcassets */; };
+		A10000000000000000000014 /* RandomPhotoOrganizerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000014 /* RandomPhotoOrganizerView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -34,6 +35,7 @@
 		B10000000000000000000011 /* PhotoVault.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PhotoVault.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B10000000000000000000012 /* PhotoIndexStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoIndexStore.swift; sourceTree = "<group>"; };
 		B10000000000000000000013 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B10000000000000000000014 /* RandomPhotoOrganizerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RandomPhotoOrganizerView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -68,6 +70,7 @@
 				B10000000000000000000008 /* PhotoGridScreen.swift */,
 				B10000000000000000000009 /* PhotoViewerViews.swift */,
 				B10000000000000000000012 /* PhotoIndexStore.swift */,
+				B10000000000000000000014 /* RandomPhotoOrganizerView.swift */,
 				B10000000000000000000010 /* Info.plist */,
 				B10000000000000000000013 /* Assets.xcassets */,
 			);
@@ -161,6 +164,7 @@
 				A10000000000000000000008 /* PhotoGridScreen.swift in Sources */,
 				A10000000000000000000009 /* PhotoViewerViews.swift in Sources */,
 				A10000000000000000000012 /* PhotoIndexStore.swift in Sources */,
+				A10000000000000000000014 /* RandomPhotoOrganizerView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -221,7 +225,7 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconLight AppIconDark";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = U8U443D7ZL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoVault/Info.plist;
@@ -244,7 +248,7 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconLight AppIconDark";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = U8U443D7ZL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoVault/Info.plist;

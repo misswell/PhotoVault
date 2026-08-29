@@ -3,8 +3,14 @@ import SwiftUI
 import UIKit
 
 struct ContentView: View {
+    private enum RootTab: Hashable {
+        case library
+        case organizer
+    }
+
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var store = PhotoLibraryStore()
+    @State private var selectedRootTab = RootTab.library
     @State private var selection: PhotoSection? = .library
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
     @State private var searchText = ""
@@ -41,7 +47,7 @@ struct ContentView: View {
     var body: some View {
         Group {
             if store.canReadPhotos {
-                photoLibraryView
+                rootTabView
             } else {
                 PhotoPermissionView(store: store)
             }
@@ -59,6 +65,23 @@ struct ContentView: View {
                 break
             }
         }
+    }
+
+    private var rootTabView: some View {
+        TabView(selection: $selectedRootTab) {
+            photoLibraryView
+                .tabItem {
+                    Label("图库", systemImage: "photo.on.rectangle.angled")
+                }
+                .tag(RootTab.library)
+
+            RandomPhotoOrganizerView(store: store)
+                .tabItem {
+                    Label("整理", systemImage: "rectangle.stack.badge.play")
+                }
+                .tag(RootTab.organizer)
+        }
+        .tint(.blue)
     }
 
     private var photoLibraryView: some View {
@@ -131,7 +154,7 @@ struct ContentView: View {
             .navigationTitle("照片")
             .searchable(
                 text: $searchText,
-                placement: .sidebar,
+                placement: .navigationBarDrawer(displayMode: .always),
                 prompt: "搜索相册或照片"
             )
             .onSubmit(of: .search) {

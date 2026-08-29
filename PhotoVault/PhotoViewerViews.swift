@@ -164,9 +164,13 @@ private struct MediaAudioButton: View {
                 ? "speaker.slash.fill"
                 : "speaker.wave.2.fill")
                 .font(.headline)
+                .contentTransition(.symbolEffect(.replace))
                 .frame(width: 36, height: 36)
                 .glassEffect(.regular.interactive(), in: Circle())
+                .frame(width: 46, height: 46)
+                .contentShape(Rectangle())
         }
+        .animation(.snappy(duration: 0.22), value: audioSession.isMuted)
         .accessibilityLabel(audioSession.isMuted ? "打开声音" : "静音")
     }
 }
@@ -219,6 +223,107 @@ private func slideshowPageTransition(
     case .dissolve:
         return .opacity.combined(with: .scale(scale: 0.96))
     }
+}
+
+/// Shared motion geometry for both viewer variants. Keeping these values in
+/// one place prevents the regular library and the paged "Unsorted" viewer
+/// from drifting into two subtly different interactions.
+private enum ViewerMotion {
+    static let presentation = Animation.spring(
+        response: 0.44,
+        dampingFraction: 0.88,
+        blendDuration: 0.04
+    )
+    static let chrome = Animation.spring(
+        response: 0.3,
+        dampingFraction: 0.92,
+        blendDuration: 0
+    )
+    static let cancellation = Animation.spring(
+        response: 0.4,
+        dampingFraction: 0.82,
+        blendDuration: 0.02
+    )
+    static let dismissalDuration = 0.28
+    static let reducedMotionDuration = 0.18
+
+    static var dismissal: Animation {
+        .easeOut(duration: dismissalDuration)
+    }
+
+    static var dismissalFade: Animation {
+        .easeIn(duration: 0.24)
+    }
+
+    static var reducedMotion: Animation {
+        .easeOut(duration: reducedMotionDuration)
+    }
+
+    static func progress(
+        translation: CGFloat,
+        viewportHeight: CGFloat
+    ) -> CGFloat {
+        let travel = min(max(viewportHeight * 0.44, 340), 560)
+        return min(max(translation / travel, 0), 1)
+    }
+
+    static func easedProgress(_ progress: CGFloat) -> CGFloat {
+        let clamped = min(max(progress, 0), 1)
+        return clamped * (2 - clamped)
+    }
+
+    static func mediaScale(
+        progress: CGFloat,
+        reduceMotion: Bool
+    ) -> CGFloat {
+        guard !reduceMotion else { return 1 }
+        return 1 - easedProgress(progress) * 0.055
+    }
+
+    static func mediaOpacity(progress: CGFloat) -> Double {
+        1 - Double(easedProgress(progress)) * 0.08
+    }
+
+    static func backgroundOpacity(progress: CGFloat) -> Double {
+        1 - Double(easedProgress(progress)) * 0.9
+    }
+
+    static func cornerRadius(
+        progress: CGFloat,
+        reduceMotion: Bool
+    ) -> CGFloat {
+        guard !reduceMotion else { return 0 }
+        return easedProgress(progress) * 28
+    }
+
+    static func chromeOpacity(
+        isVisible: Bool,
+        progress: CGFloat
+    ) -> Double {
+        guard isVisible else { return 0 }
+        return 1 - Double(min(1, progress * 1.35))
+    }
+
+    static func shouldDismiss(
+        translation: CGFloat,
+        predictedTranslation: CGFloat,
+        viewportHeight: CGFloat
+    ) -> Bool {
+        let directThreshold = min(max(viewportHeight * 0.14, 112), 168)
+        let projectedThreshold = min(max(viewportHeight * 0.25, 220), 320)
+        return translation > directThreshold
+            || predictedTranslation > projectedThreshold
+    }
+
+    static func completionOffset(viewportHeight: CGFloat) -> CGFloat {
+        max(480, viewportHeight + 96)
+    }
+}
+
+private enum ViewerDragAxis: Equatable {
+    case undecided
+    case vertical
+    case horizontal
 }
 
 private struct ViewerMediaView: View {
@@ -1029,6 +1134,7 @@ struct PhotoViewerView: View {
     let onDismissRequested: (() -> Void)?
 
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     @State private var currentIndex: Int
     @State private var controlsVisible = true
     @State private var isShowingInfo = false
@@ -1040,6 +1146,10 @@ struct PhotoViewerView: View {
     @State private var isZooming = false
     @State private var isDismissing = false
     @State private var presentationProgress: CGFloat = 0
+    @State private var dismissalOpacity: Double = 1
+    @State private var viewportHeight: CGFloat = 844
+    @State private var dismissDragAxis = ViewerDragAxis.undecided
+    @State private var crossedDismissThreshold = false
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
     @State private var alert: PhotoVaultAlert?
@@ -1065,7 +1175,7 @@ struct PhotoViewerView: View {
     var body: some View {
         GeometryReader { presentationProxy in
             ZStack {
-                Color.black.opacity(Double(1 - dismissProgress * 0.72))
+                Color.black.opacity(ViewerMotion.backgroundOpacity(progress: dismissProgress))
                     .ignoresSafeArea()
 
                 GeometryReader { proxy in
@@ -1081,13 +1191,31 @@ struct PhotoViewerView: View {
                     )
                     .frame(width: proxy.size.width, height: proxy.size.height)
                     .offset(dismissDragOffset)
-                    .scaleEffect(1 - dismissProgress * 0.08)
+                    .scaleEffect(
+                        ViewerMotion.mediaScale(
+                            progress: dismissProgress,
+                            reduceMotion: accessibilityReduceMotion
+                        )
+                    )
+                    .clipShape(
+                        RoundedRectangle(
+                            cornerRadius: ViewerMotion.cornerRadius(
+                                progress: dismissProgress,
+                                reduceMotion: accessibilityReduceMotion
+                            ),
+                            style: .continuous
+                        )
+                    )
+                    .opacity(ViewerMotion.mediaOpacity(progress: dismissProgress))
+                    .shadow(
+                        color: .black.opacity(Double(dismissProgress) * 0.32),
+                        radius: dismissProgress * 24,
+                        y: dismissProgress * 10
+                    )
                     .contentShape(Rectangle())
                     .simultaneousGesture(
                         TapGesture().onEnded {
-                            withAnimation(.easeInOut(duration: 0.18)) {
-                                controlsVisible.toggle()
-                            }
+                            toggleControls()
                         }
                     )
                     // Keep the Photos-style pull-down-to-dismiss interaction
@@ -1102,10 +1230,14 @@ struct PhotoViewerView: View {
                 // area so its buttons remain tappable on iPhone and iPad.
                 .ignoresSafeArea(.container, edges: .all)
 
-                if controlsVisible {
+                VStack(spacing: 0) {
+                    topBar
+                        .opacity(chromeOpacity)
+                        .offset(y: controlsVisible ? -dismissProgress * 10 : -18)
+
+                    Spacer()
+
                     VStack(spacing: 0) {
-                        topBar
-                        Spacer()
                         if assets.count > 0 {
                             ViewerFilmstrip(
                                 assets: assets,
@@ -1125,19 +1257,29 @@ struct PhotoViewerView: View {
                         }
                         bottomBar
                     }
-                    .opacity(Double(1 - dismissProgress))
-                    .offset(y: dismissDragOffset.height * 0.28)
-                    .transition(.opacity)
-                    .allowsHitTesting(!isDismissing)
+                    .opacity(chromeOpacity)
+                    .offset(y: controlsVisible ? dismissProgress * 18 : 24)
                 }
+                .animation(chromeAnimation, value: controlsVisible)
+                .allowsHitTesting(controlsVisible && !isDismissing)
             }
             .opacity(viewerOpacity)
-            .offset(y: (1 - presentationProgress) * max(1, presentationProxy.size.height))
+            .offset(
+                y: accessibilityReduceMotion
+                    ? 0
+                    : (1 - presentationProgress) * max(1, presentationProxy.size.height)
+            )
+            .onAppear {
+                viewportHeight = max(1, presentationProxy.size.height)
+            }
+            .onChange(of: presentationProxy.size.height) { _, newHeight in
+                viewportHeight = max(1, newHeight)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
         .presentationBackground(.clear)
-        .statusBarHidden(!controlsVisible)
+        .statusBarHidden(!controlsVisible || isDismissing)
         .persistentSystemOverlays(.automatic)
         // The viewer owns the Photos-style pull-down gesture below. Keeping
         // the cover's default interactive dismissal disabled prevents UIKit
@@ -1181,10 +1323,17 @@ struct PhotoViewerView: View {
         }
         .onAppear {
             isDismissing = false
+            dismissalOpacity = 1
+            dismissDragAxis = .undecided
+            crossedDismissThreshold = false
             PagerDiagnostics.log(
                 "viewer appear kind=fetch count=\(assets.count) index=\(currentIndex)"
             )
-            withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+            withAnimation(
+                accessibilityReduceMotion
+                    ? ViewerMotion.reducedMotion
+                    : ViewerMotion.presentation
+            ) {
                 presentationProgress = 1
             }
         }
@@ -1200,13 +1349,30 @@ struct PhotoViewerView: View {
     }
 
     private var dismissProgress: CGFloat {
-        min(max(dismissDragOffset.height / 420, 0), 1)
+        ViewerMotion.progress(
+            translation: dismissDragOffset.height,
+            viewportHeight: viewportHeight
+        )
+    }
+
+    private var chromeOpacity: Double {
+        ViewerMotion.chromeOpacity(
+            isVisible: controlsVisible,
+            progress: dismissProgress
+        )
+    }
+
+    private var chromeAnimation: Animation {
+        accessibilityReduceMotion
+            ? ViewerMotion.reducedMotion
+            : ViewerMotion.chrome
     }
 
     private var viewerOpacity: Double {
-        let interactiveFade = 1 - Double(dismissProgress) * 0.28
-        let completionFade = isDismissing ? Double(presentationProgress) : 1
-        return max(0, interactiveFade * completionFade)
+        let presentationOpacity = accessibilityReduceMotion
+            ? Double(presentationProgress)
+            : 1
+        return max(0, dismissalOpacity * presentationOpacity)
     }
 
     private var currentAsset: PHAsset? {
@@ -1218,8 +1384,15 @@ struct PhotoViewerView: View {
         isFullScreen ? .aspectFill : .aspectFit
     }
 
+    private func toggleControls() {
+        guard !isDismissing, dismissDragOffset == .zero else { return }
+        withAnimation(chromeAnimation) {
+            controlsVisible.toggle()
+        }
+    }
+
     private func toggleFullScreen() {
-        withAnimation(.easeInOut(duration: 0.2)) {
+        withAnimation(chromeAnimation) {
             isFullScreen.toggle()
             controlsVisible = !isFullScreen
         }
@@ -1237,24 +1410,58 @@ struct PhotoViewerView: View {
         DragGesture(minimumDistance: 12)
             .onChanged { value in
                 guard !isDismissing, !isZooming else { return }
-                let isVertical = value.translation.height > abs(value.translation.width) * 1.15
-                guard isVertical else { return }
+
+                if dismissDragAxis == .undecided {
+                    let horizontalDistance = abs(value.translation.width)
+                    let verticalDistance = value.translation.height
+                    guard max(horizontalDistance, abs(verticalDistance)) >= 8 else { return }
+
+                    if verticalDistance > 0,
+                       verticalDistance > horizontalDistance * 1.08 {
+                        dismissDragAxis = .vertical
+                    } else if horizontalDistance > abs(verticalDistance) * 1.08
+                                || verticalDistance <= 0 {
+                        dismissDragAxis = .horizontal
+                    } else {
+                        return
+                    }
+                }
+
+                guard dismissDragAxis == .vertical else { return }
 
                 dismissDragOffset = CGSize(
-                    width: value.translation.width * 0.18,
+                    width: value.translation.width * 0.12,
                     height: max(0, value.translation.height)
                 )
+
+                let shouldDismiss = ViewerMotion.shouldDismiss(
+                    translation: value.translation.height,
+                    predictedTranslation: value.predictedEndTranslation.height,
+                    viewportHeight: viewportHeight
+                )
+                if shouldDismiss != crossedDismissThreshold {
+                    if shouldDismiss {
+                        UIImpactFeedbackGenerator(style: .soft)
+                            .impactOccurred(intensity: 0.65)
+                    }
+                    crossedDismissThreshold = shouldDismiss
+                }
             }
             .onEnded { value in
+                let resolvedAxis = dismissDragAxis
+                dismissDragAxis = .undecided
+                crossedDismissThreshold = false
                 guard !isDismissing, !isZooming else { return }
-                let isVertical = value.translation.height > abs(value.translation.width) * 1.15
-                guard isVertical else {
+                guard resolvedAxis == .vertical else {
                     resetDismissOffset()
                     return
                 }
 
-                let shouldDismiss = value.translation.height > 150
-                    || value.predictedEndTranslation.height > 280
+                let shouldDismiss = ViewerMotion.shouldDismiss(
+                    translation: value.translation.height,
+                    predictedTranslation: value.predictedEndTranslation.height,
+                    viewportHeight: viewportHeight
+                )
                 if shouldDismiss {
                     requestDismiss(reason: "pull-down")
                 } else {
@@ -1266,6 +1473,7 @@ struct PhotoViewerView: View {
     private func requestDismiss(reason: String) {
         guard !isDismissing else { return }
         isDismissing = true
+        crossedDismissThreshold = false
         PagerDiagnostics.log(
             "viewer dismiss requested kind=fetch reason=\(reason) index=\(currentIndex)"
         )
@@ -1273,15 +1481,32 @@ struct PhotoViewerView: View {
     }
 
     private func finishDismissAnimation(reason: String) {
-        withAnimation(.easeInOut(duration: 0.24)) {
-            presentationProgress = 0
+        let animation = accessibilityReduceMotion
+            ? ViewerMotion.reducedMotion
+            : ViewerMotion.dismissal
+        let delay: Duration = accessibilityReduceMotion
+            ? .milliseconds(180)
+            : .milliseconds(280)
+
+        withAnimation(animation) {
             if reason == "pull-down" {
-                dismissDragOffset.height = max(dismissDragOffset.height, 260)
+                dismissDragOffset.height = ViewerMotion.completionOffset(
+                    viewportHeight: viewportHeight
+                )
+            } else {
+                presentationProgress = 0
             }
+        }
+        withAnimation(
+            accessibilityReduceMotion
+                ? ViewerMotion.reducedMotion
+                : ViewerMotion.dismissalFade
+        ) {
+            dismissalOpacity = 0
         }
 
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(240))
+            try? await Task.sleep(for: delay)
             guard isDismissing else { return }
             PagerDiagnostics.log(
                 "viewer dismiss animation completed kind=fetch index=\(currentIndex)"
@@ -1292,13 +1517,17 @@ struct PhotoViewerView: View {
 
     private func resetDismissOffset() {
         guard !isDismissing, dismissDragOffset != .zero else { return }
-        withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+        withAnimation(
+            accessibilityReduceMotion
+                ? ViewerMotion.reducedMotion
+                : ViewerMotion.cancellation
+        ) {
             dismissDragOffset = .zero
         }
     }
 
     private var topBar: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 8) {
             Button {
                 requestDismiss(reason: "close-button")
             } label: {
@@ -1306,6 +1535,8 @@ struct PhotoViewerView: View {
                     .font(.headline.weight(.semibold))
                     .frame(width: 36, height: 36)
                     .glassEffect(.regular.interactive(), in: Circle())
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
             }
 
             Spacer()
@@ -1325,6 +1556,8 @@ struct PhotoViewerView: View {
                     .font(.title3)
                     .frame(width: 36, height: 36)
                     .glassEffect(.regular.interactive(), in: Circle())
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
             }
 
             Button(action: toggleFullScreen) {
@@ -1332,19 +1565,22 @@ struct PhotoViewerView: View {
                     ? "arrow.down.right.and.arrow.up.left"
                     : "arrow.up.left.and.arrow.down.right")
                     .font(.title3)
+                    .contentTransition(.symbolEffect(.replace))
                     .frame(width: 36, height: 36)
                     .glassEffect(.regular.interactive(), in: Circle())
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
             }
+            .animation(.snappy(duration: 0.22), value: isFullScreen)
             .accessibilityLabel(isFullScreen ? "退出全屏" : "全屏显示")
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 18)
-        .padding(.top, 12)
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
     }
 
-    /// Photos-style floating action bar: icon-only buttons in a glass
-    /// capsule, evenly distributed with full 46pt hit targets so it reads
-    /// like the native viewer toolbar instead of a cramped row.
+    /// Photos-style floating actions: each icon owns an independent liquid
+    /// glass circle and a full 46pt hit target; the row itself stays clear.
     private var bottomBar: some View {
         HStack(spacing: 0) {
             viewerBarAction {
@@ -1354,7 +1590,9 @@ struct PhotoViewerView: View {
             } label: {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
                     .symbolRenderingMode(.hierarchical)
+                    .contentTransition(.symbolEffect(.replace))
             }
+            .animation(.snappy(duration: 0.22), value: isFavorite)
             .disabled(assets.count == 0)
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
 
@@ -1424,6 +1662,7 @@ struct PhotoViewerView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: Circle())
     }
 
     private func removeTemporaryURLs(_ urls: [URL]) {
@@ -1584,7 +1823,7 @@ private struct ViewerFilmstrip: UIViewRepresentable {
                 for: indexPath
             ) as! ViewerFilmstripCell
             cell.configure(asset: assets.object(at: indexPath.item), targetSize: thumbnailSize)
-            cell.setSelected(indexPath.item == selectedIndex)
+            cell.setSelected(indexPath.item == selectedIndex, animated: false)
             return cell
         }
 
@@ -1712,7 +1951,10 @@ private struct ViewerFilmstrip: UIViewRepresentable {
                 guard let filmstripCell = cell as? ViewerFilmstripCell,
                       let indexPath = collectionView.indexPath(for: cell)
                 else { continue }
-                filmstripCell.setSelected(indexPath.item == selectedIndex)
+                filmstripCell.setSelected(
+                    indexPath.item == selectedIndex,
+                    animated: !isUserScrubbing
+                )
             }
         }
 
@@ -1773,6 +2015,8 @@ private final class ViewerFilmstripCell: UICollectionViewCell {
     private var representedIdentifier: String?
     private var representedAsset: PHAsset?
     private var representedTargetSize = CGSize.zero
+    private var visualSelection: Bool?
+    private var selectionAnimator: UIViewPropertyAnimator?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -1802,10 +2046,13 @@ private final class ViewerFilmstripCell: UICollectionViewCell {
     override func prepareForReuse() {
         super.prepareForReuse()
         cancelRequest()
+        selectionAnimator?.stopAnimation(true)
+        selectionAnimator = nil
+        visualSelection = nil
         representedIdentifier = nil
         representedAsset = nil
         imageView.image = nil
-        setSelected(false)
+        setSelected(false, animated: false)
     }
 
     func configure(asset: PHAsset, targetSize: CGSize) {
@@ -1843,9 +2090,35 @@ private final class ViewerFilmstripCell: UICollectionViewCell {
         imageView.image = nil
     }
 
-    func setSelected(_ selected: Bool) {
-        layer.borderWidth = selected ? 2 : 0
-        layer.borderColor = selected ? UIColor.white.cgColor : UIColor.clear.cgColor
+    func setSelected(_ selected: Bool, animated: Bool) {
+        guard visualSelection != selected else { return }
+        visualSelection = selected
+        selectionAnimator?.stopAnimation(true)
+        selectionAnimator = nil
+
+        let changes = {
+            self.contentView.transform = selected
+                ? .identity
+                : CGAffineTransform(scaleX: 0.84, y: 0.84)
+            self.imageView.alpha = selected ? 1 : 0.72
+            self.imageView.layer.borderWidth = selected ? 2 : 0
+            self.imageView.layer.borderColor = selected
+                ? UIColor.white.cgColor
+                : UIColor.clear.cgColor
+        }
+
+        guard animated, window != nil else {
+            UIView.performWithoutAnimation(changes)
+            return
+        }
+
+        let animator = UIViewPropertyAnimator(
+            duration: 0.22,
+            dampingRatio: 0.86,
+            animations: changes
+        )
+        selectionAnimator = animator
+        animator.startAnimation()
     }
 
     private func cancelRequest() {
@@ -2294,7 +2567,7 @@ private struct IndexedViewerFilmstrip: UIViewRepresentable {
                 cell.showPlaceholder()
                 loadPage(containing: indexPath.item, in: collectionView)
             }
-            cell.setSelected(indexPath.item == selectedIndex)
+            cell.setSelected(indexPath.item == selectedIndex, animated: false)
             return cell
         }
 
@@ -2403,7 +2676,10 @@ private struct IndexedViewerFilmstrip: UIViewRepresentable {
                 guard let filmstripCell = cell as? ViewerFilmstripCell,
                       let indexPath = collectionView.indexPath(for: cell)
                 else { continue }
-                filmstripCell.setSelected(indexPath.item == selectedIndex)
+                filmstripCell.setSelected(
+                    indexPath.item == selectedIndex,
+                    animated: !isUserScrubbing
+                )
             }
         }
 
@@ -2505,6 +2781,7 @@ struct IndexedPhotoViewerView: View {
     let onDismissRequested: (() -> Void)?
 
     @Environment(\.displayScale) private var displayScale
+    @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     @State private var currentIndex: Int
     @State private var assetsByIndex: [Int: PHAsset] = [:]
     @State private var controlsVisible = true
@@ -2516,6 +2793,10 @@ struct IndexedPhotoViewerView: View {
     @State private var isZooming = false
     @State private var isDismissing = false
     @State private var presentationProgress: CGFloat = 0
+    @State private var dismissalOpacity: Double = 1
+    @State private var viewportHeight: CGFloat = 844
+    @State private var dismissDragAxis = ViewerDragAxis.undecided
+    @State private var crossedDismissThreshold = false
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
     @State private var alert: PhotoVaultAlert?
@@ -2545,76 +2826,110 @@ struct IndexedPhotoViewerView: View {
 
     var body: some View {
         GeometryReader { presentationProxy in
-        ZStack {
-            Color.black.opacity(Double(1 - dismissProgress * 0.72))
+            ZStack {
+                Color.black.opacity(
+                    ViewerMotion.backgroundOpacity(progress: dismissProgress)
+                )
                 .ignoresSafeArea()
 
-            GeometryReader { proxy in
-                IndexedAssetPager(
-                    totalCount: totalCount,
-                    store: store,
-                    currentIndex: $currentIndex,
-                    assetsByIndex: $assetsByIndex,
-                    targetSize: mediaTargetSize(for: proxy.size),
-                    contentMode: viewerContentMode,
-                    onZoomingChanged: { zooming in
-                        isZooming = zooming
-                    },
-                    isScrubbing: isScrubbingFilmstrip,
-                    isIndexingUnsorted: store.isIndexingUnsorted
-                )
-                .frame(width: proxy.size.width, height: proxy.size.height)
-                .offset(dismissDragOffset)
-                .scaleEffect(1 - dismissProgress * 0.08)
-                .contentShape(Rectangle())
-                .simultaneousGesture(
-                    TapGesture().onEnded {
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            controlsVisible.toggle()
+                GeometryReader { proxy in
+                    IndexedAssetPager(
+                        totalCount: totalCount,
+                        store: store,
+                        currentIndex: $currentIndex,
+                        assetsByIndex: $assetsByIndex,
+                        targetSize: mediaTargetSize(for: proxy.size),
+                        contentMode: viewerContentMode,
+                        onZoomingChanged: { zooming in
+                            isZooming = zooming
+                        },
+                        isScrubbing: isScrubbingFilmstrip,
+                        isIndexingUnsorted: store.isIndexingUnsorted
+                    )
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .offset(dismissDragOffset)
+                    .scaleEffect(
+                        ViewerMotion.mediaScale(
+                            progress: dismissProgress,
+                            reduceMotion: accessibilityReduceMotion
+                        )
+                    )
+                    .clipShape(
+                        RoundedRectangle(
+                            cornerRadius: ViewerMotion.cornerRadius(
+                                progress: dismissProgress,
+                                reduceMotion: accessibilityReduceMotion
+                            ),
+                            style: .continuous
+                        )
+                    )
+                    .opacity(ViewerMotion.mediaOpacity(progress: dismissProgress))
+                    .shadow(
+                        color: .black.opacity(Double(dismissProgress) * 0.32),
+                        radius: dismissProgress * 24,
+                        y: dismissProgress * 10
+                    )
+                    .contentShape(Rectangle())
+                    .simultaneousGesture(
+                        TapGesture().onEnded {
+                            toggleControls()
                         }
-                    }
-                )
-                .simultaneousGesture(dismissGesture)
-                .allowsHitTesting(!isDismissing)
-            }
-            .ignoresSafeArea(.container, edges: .all)
+                    )
+                    .simultaneousGesture(dismissGesture)
+                    .allowsHitTesting(!isDismissing)
+                }
+                .ignoresSafeArea(.container, edges: .all)
 
-            if controlsVisible {
                 VStack(spacing: 0) {
                     topBar
+                        .opacity(chromeOpacity)
+                        .offset(y: controlsVisible ? -dismissProgress * 10 : -18)
+
                     Spacer()
-                    if totalCount > 0 {
-                        IndexedViewerFilmstrip(
-                            totalCount: totalCount,
-                            store: store,
-                            currentIndex: $currentIndex,
-                            onScrubbingChanged: { scrubbing in
-                                isScrubbingFilmstrip = scrubbing
-                            }
-                        )
-                        .frame(height: 64)
-                        .background(
-                            .ultraThinMaterial,
-                            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                        .padding(.horizontal, 10)
+
+                    VStack(spacing: 0) {
+                        if totalCount > 0 {
+                            IndexedViewerFilmstrip(
+                                totalCount: totalCount,
+                                store: store,
+                                currentIndex: $currentIndex,
+                                onScrubbingChanged: { scrubbing in
+                                    isScrubbingFilmstrip = scrubbing
+                                }
+                            )
+                            .frame(height: 64)
+                            .background(
+                                .ultraThinMaterial,
+                                in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .padding(.horizontal, 10)
+                        }
+                        bottomBar
                     }
-                    bottomBar
+                    .opacity(chromeOpacity)
+                    .offset(y: controlsVisible ? dismissProgress * 18 : 24)
                 }
-                .opacity(Double(1 - dismissProgress))
-                .offset(y: dismissDragOffset.height * 0.28)
-                .transition(.opacity)
-                .allowsHitTesting(!isDismissing)
+                .animation(chromeAnimation, value: controlsVisible)
+                .allowsHitTesting(controlsVisible && !isDismissing)
             }
-        }
-        .opacity(viewerOpacity)
-        .offset(y: (1 - presentationProgress) * max(1, presentationProxy.size.height))
+            .opacity(viewerOpacity)
+            .offset(
+                y: accessibilityReduceMotion
+                    ? 0
+                    : (1 - presentationProgress) * max(1, presentationProxy.size.height)
+            )
+            .onAppear {
+                viewportHeight = max(1, presentationProxy.size.height)
+            }
+            .onChange(of: presentationProxy.size.height) { _, newHeight in
+                viewportHeight = max(1, newHeight)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.clear)
         .presentationBackground(.clear)
-        .statusBarHidden(!controlsVisible)
+        .statusBarHidden(!controlsVisible || isDismissing)
         .persistentSystemOverlays(.automatic)
         .interactiveDismissDisabled(true)
         .sheet(isPresented: $isShowingInfo) {
@@ -2654,10 +2969,17 @@ struct IndexedPhotoViewerView: View {
         }
         .onAppear {
             isDismissing = false
+            dismissalOpacity = 1
+            dismissDragAxis = .undecided
+            crossedDismissThreshold = false
             PagerDiagnostics.log(
                 "viewer appear kind=indexed count=\(totalCount) index=\(currentIndex)"
             )
-            withAnimation(.spring(response: 0.24, dampingFraction: 0.9)) {
+            withAnimation(
+                accessibilityReduceMotion
+                    ? ViewerMotion.reducedMotion
+                    : ViewerMotion.presentation
+            ) {
                 presentationProgress = 1
             }
         }
@@ -2672,27 +2994,47 @@ struct IndexedPhotoViewerView: View {
     }
 
     private var dismissProgress: CGFloat {
-        min(max(dismissDragOffset.height / 420, 0), 1)
+        ViewerMotion.progress(
+            translation: dismissDragOffset.height,
+            viewportHeight: viewportHeight
+        )
+    }
+
+    private var chromeOpacity: Double {
+        ViewerMotion.chromeOpacity(
+            isVisible: controlsVisible,
+            progress: dismissProgress
+        )
+    }
+
+    private var chromeAnimation: Animation {
+        accessibilityReduceMotion
+            ? ViewerMotion.reducedMotion
+            : ViewerMotion.chrome
     }
 
     private var viewerOpacity: Double {
-        let interactiveFade = 1 - Double(dismissProgress) * 0.28
-        let completionFade = isDismissing ? Double(presentationProgress) : 1
-        return max(0, interactiveFade * completionFade)
+        let presentationOpacity = accessibilityReduceMotion
+            ? Double(presentationProgress)
+            : 1
+        return max(0, dismissalOpacity * presentationOpacity)
     }
 
     private var viewerContentMode: PHImageContentMode {
         isFullScreen ? .aspectFill : .aspectFit
     }
 
+    private func toggleControls() {
+        guard !isDismissing, dismissDragOffset == .zero else { return }
+        withAnimation(chromeAnimation) {
+            controlsVisible.toggle()
+        }
+    }
+
     private func toggleFullScreen() {
-        withAnimation(.easeInOut(duration: 0.2)) {
+        withAnimation(chromeAnimation) {
             isFullScreen.toggle()
-            if isFullScreen {
-                controlsVisible = false
-            } else {
-                controlsVisible = true
-            }
+            controlsVisible = !isFullScreen
         }
     }
 
@@ -2708,21 +3050,57 @@ struct IndexedPhotoViewerView: View {
         DragGesture(minimumDistance: 12)
             .onChanged { value in
                 guard !isDismissing, !isZooming else { return }
-                let isVertical = value.translation.height > abs(value.translation.width) * 1.15
-                guard isVertical else { return }
+
+                if dismissDragAxis == .undecided {
+                    let horizontalDistance = abs(value.translation.width)
+                    let verticalDistance = value.translation.height
+                    guard max(horizontalDistance, abs(verticalDistance)) >= 8 else { return }
+
+                    if verticalDistance > 0,
+                       verticalDistance > horizontalDistance * 1.08 {
+                        dismissDragAxis = .vertical
+                    } else if horizontalDistance > abs(verticalDistance) * 1.08
+                                || verticalDistance <= 0 {
+                        dismissDragAxis = .horizontal
+                    } else {
+                        return
+                    }
+                }
+
+                guard dismissDragAxis == .vertical else { return }
                 dismissDragOffset = CGSize(
-                    width: value.translation.width * 0.18,
+                    width: value.translation.width * 0.12,
                     height: max(0, value.translation.height)
                 )
+
+                let shouldDismiss = ViewerMotion.shouldDismiss(
+                    translation: value.translation.height,
+                    predictedTranslation: value.predictedEndTranslation.height,
+                    viewportHeight: viewportHeight
+                )
+                if shouldDismiss != crossedDismissThreshold {
+                    if shouldDismiss {
+                        UIImpactFeedbackGenerator(style: .soft)
+                            .impactOccurred(intensity: 0.65)
+                    }
+                    crossedDismissThreshold = shouldDismiss
+                }
             }
             .onEnded { value in
+                let resolvedAxis = dismissDragAxis
+                dismissDragAxis = .undecided
+                crossedDismissThreshold = false
                 guard !isDismissing, !isZooming else { return }
-                let isVertical = value.translation.height > abs(value.translation.width) * 1.15
-                guard isVertical else {
+                guard resolvedAxis == .vertical else {
                     resetDismissOffset()
                     return
                 }
-                if value.translation.height > 150 || value.predictedEndTranslation.height > 280 {
+
+                if ViewerMotion.shouldDismiss(
+                    translation: value.translation.height,
+                    predictedTranslation: value.predictedEndTranslation.height,
+                    viewportHeight: viewportHeight
+                ) {
                     requestDismiss(reason: "pull-down")
                 } else {
                     resetDismissOffset()
@@ -2733,6 +3111,7 @@ struct IndexedPhotoViewerView: View {
     private func requestDismiss(reason: String) {
         guard !isDismissing else { return }
         isDismissing = true
+        crossedDismissThreshold = false
         PagerDiagnostics.log(
             "viewer dismiss requested kind=indexed reason=\(reason) index=\(currentIndex)"
         )
@@ -2740,15 +3119,32 @@ struct IndexedPhotoViewerView: View {
     }
 
     private func finishDismissAnimation(reason: String) {
-        withAnimation(.easeInOut(duration: 0.24)) {
-            presentationProgress = 0
+        let animation = accessibilityReduceMotion
+            ? ViewerMotion.reducedMotion
+            : ViewerMotion.dismissal
+        let delay: Duration = accessibilityReduceMotion
+            ? .milliseconds(180)
+            : .milliseconds(280)
+
+        withAnimation(animation) {
             if reason == "pull-down" {
-                dismissDragOffset.height = max(dismissDragOffset.height, 260)
+                dismissDragOffset.height = ViewerMotion.completionOffset(
+                    viewportHeight: viewportHeight
+                )
+            } else {
+                presentationProgress = 0
             }
+        }
+        withAnimation(
+            accessibilityReduceMotion
+                ? ViewerMotion.reducedMotion
+                : ViewerMotion.dismissalFade
+        ) {
+            dismissalOpacity = 0
         }
 
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(240))
+            try? await Task.sleep(for: delay)
             guard isDismissing else { return }
             PagerDiagnostics.log(
                 "viewer dismiss animation completed kind=indexed index=\(currentIndex)"
@@ -2759,18 +3155,24 @@ struct IndexedPhotoViewerView: View {
 
     private func resetDismissOffset() {
         guard !isDismissing, dismissDragOffset != .zero else { return }
-        withAnimation(.spring(response: 0.36, dampingFraction: 0.86)) {
+        withAnimation(
+            accessibilityReduceMotion
+                ? ViewerMotion.reducedMotion
+                : ViewerMotion.cancellation
+        ) {
             dismissDragOffset = .zero
         }
     }
 
     private var topBar: some View {
-        HStack(spacing: 18) {
+        HStack(spacing: 8) {
             Button { requestDismiss(reason: "close-button") } label: {
                 Image(systemName: "xmark")
                     .font(.headline.weight(.semibold))
                     .frame(width: 36, height: 36)
                     .glassEffect(.regular.interactive(), in: Circle())
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
             }
 
             Spacer()
@@ -2788,6 +3190,8 @@ struct IndexedPhotoViewerView: View {
                     .font(.title3)
                     .frame(width: 36, height: 36)
                     .glassEffect(.regular.interactive(), in: Circle())
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
             }
             .disabled(currentAsset == nil)
 
@@ -2796,19 +3200,22 @@ struct IndexedPhotoViewerView: View {
                     ? "arrow.down.right.and.arrow.up.left"
                     : "arrow.up.left.and.arrow.down.right")
                     .font(.title3)
+                    .contentTransition(.symbolEffect(.replace))
                     .frame(width: 36, height: 36)
                     .glassEffect(.regular.interactive(), in: Circle())
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
             }
+            .animation(.snappy(duration: 0.22), value: isFullScreen)
             .accessibilityLabel(isFullScreen ? "退出全屏" : "全屏显示")
         }
         .foregroundStyle(.white)
-        .padding(.horizontal, 18)
-        .padding(.top, 12)
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
     }
 
-    /// Photos-style floating action bar: icon-only buttons in a glass
-    /// capsule, evenly distributed with full 46pt hit targets so it reads
-    /// like the native viewer toolbar instead of a cramped row.
+    /// Photos-style floating actions: each icon owns an independent liquid
+    /// glass circle and a full 46pt hit target; the row itself stays clear.
     private var bottomBar: some View {
         HStack(spacing: 0) {
             viewerBarAction {
@@ -2818,7 +3225,9 @@ struct IndexedPhotoViewerView: View {
             } label: {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
                     .symbolRenderingMode(.hierarchical)
+                    .contentTransition(.symbolEffect(.replace))
             }
+            .animation(.snappy(duration: 0.22), value: isFavorite)
             .disabled(currentAsset == nil)
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
 
@@ -2878,6 +3287,7 @@ struct IndexedPhotoViewerView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: Circle())
     }
 
     private func removeTemporaryURLs(_ urls: [URL]) {
