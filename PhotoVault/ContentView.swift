@@ -3,6 +3,7 @@ import SwiftUI
 import UIKit
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var store = PhotoLibraryStore()
     @State private var selection: PhotoSection? = .library
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
@@ -47,6 +48,16 @@ struct ContentView: View {
         }
         .task {
             store.start()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background:
+                store.suspendForBackground()
+            case .active:
+                store.resumeAfterBackground()
+            default:
+                break
+            }
         }
     }
 

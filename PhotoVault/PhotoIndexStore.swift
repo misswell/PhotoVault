@@ -66,9 +66,11 @@ final class PhotoIndexStore: @unchecked Sendable {
         label: "com.misswell.PhotoVault.photo-index-read",
         qos: .userInitiated
     )
+    private let generationLock = NSLock()
     private let databaseURL: URL
     private var database: OpaquePointer?
     private var readDatabase: OpaquePointer?
+    private var activeGeneration = 0
 
     init() {
         let applicationSupport = FileManager.default.urls(
@@ -95,6 +97,53 @@ final class PhotoIndexStore: @unchecked Sendable {
         }
     }
 
+    /// Advances the generation synchronously so work that is already queued
+    /// or scanning on the writer queue can stop before doing more stale work.
+    func setActiveGeneration(_ generation: Int) {
+        generationLock.lock()
+        activeGeneration = generation
+        generationLock.unlock()
+    }
+
+    private func isGenerationCurrent(_ generation: Int) -> Bool {
+        generationLock.lock()
+        defer { generationLock.unlock() }
+        return activeGeneration == generation
+    }
+
+    private func checkGeneration(_ generation: Int) throws {
+        guard isGenerationCurrent(generation) else {
+            throw CancellationError()
+        }
+    }
+
+    /// Close the snapshot reader and truncate an already-checkpointed WAL
+    /// after foreground work has stopped. Running this behind both serial
+    /// queues avoids racing a page read and keeps crash/rebuild history from
+    /// accumulating as persistent app-container storage.
+    func checkpointForBackground() {
+        readQueue.async { [weak self] in
+            guard let self else { return }
+            if let readDatabase {
+                sqlite3_close(readDatabase)
+                self.readDatabase = nil
+            }
+            queue.async { [weak self] in
+                guard let self else { return }
+                do {
+                    try self.withDatabase {
+                        try self.execute("PRAGMA incremental_vacuum(256)")
+                        try self.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    }
+                } catch {
+                    photoVaultTrace(
+                        "index background checkpoint skipped error=\(error.localizedDescription)"
+                    )
+                }
+            }
+        }
+    }
+
     /// Index usability no longer compares the library signature: a signature
     /// change is exactly what a single new screenshot looks like, and the
     /// persistent change token (whose validity PhotoKit itself enforces)
@@ -102,12 +151,27 @@ final class PhotoIndexStore: @unchecked Sendable {
     /// token remains the full rebuild in the caller.
     func hasUsableIndex(completion: @escaping (Bool) -> Void) {
         readQueue.async { [weak self] in
-            let result = (try? self?.withReadDatabase {
-                try self?.readMetaOnReadConnection("schema_version") == Self.schemaVersion
-                    && self?.readMetaOnReadConnection("index_ready") == "1"
+            guard let self else { return }
+            let usable = (try? self.withReadDatabase {
+                try self.readMetaOnReadConnection("schema_version") == Self.schemaVersion
+                    && self.readMetaOnReadConnection("index_ready") == "1"
             }) ?? false
-            DispatchQueue.main.async {
-                completion(result)
+            if usable {
+                DispatchQueue.main.async { completion(true) }
+                return
+            }
+            // A reader connection cannot run WAL recovery when the previous
+            // process was killed mid-write; retry the verdict on the writer
+            // connection instead of misreporting the index as unusable and
+            // triggering a pointless full rebuild.
+            photoVaultTrace("index usable-check falling back to writer connection")
+            self.queue.async { [weak self] in
+                guard let self else { return }
+                let usable = (try? self.withDatabase {
+                    try self.readMeta("schema_version") == Self.schemaVersion
+                        && self.readMeta("index_ready") == "1"
+                }) ?? false
+                DispatchQueue.main.async { completion(usable) }
             }
         }
     }
@@ -116,6 +180,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         assets: PHFetchResult<PHAsset>,
         userAlbums: [PHAssetCollection],
         librarySignature: String,
+        generation: Int,
         progress: @escaping (PhotoIndexProgress) -> Void,
         completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
     ) {
@@ -123,10 +188,12 @@ final class PhotoIndexStore: @unchecked Sendable {
             guard let self else { return }
 
             do {
+                try self.checkGeneration(generation)
                 let stats = try self.rebuildSynchronously(
                     assets: assets,
                     userAlbums: userAlbums,
                     librarySignature: librarySignature,
+                    generation: generation,
                     progress: progress
                 )
                 DispatchQueue.main.async {
@@ -143,6 +210,7 @@ final class PhotoIndexStore: @unchecked Sendable {
     func replaceAlbumMembership(
         userAlbums: [PHAssetCollection],
         librarySignature: String,
+        generation: Int,
         progress: @escaping (PhotoIndexProgress) -> Void,
         completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
     ) {
@@ -150,9 +218,11 @@ final class PhotoIndexStore: @unchecked Sendable {
             guard let self else { return }
 
             do {
+                try self.checkGeneration(generation)
                 let stats = try self.replaceAlbumMembershipSynchronously(
                     userAlbums: userAlbums,
                     librarySignature: librarySignature,
+                    generation: generation,
                     progress: progress
                 )
                 DispatchQueue.main.async {
@@ -170,16 +240,19 @@ final class PhotoIndexStore: @unchecked Sendable {
         _ assets: [PHAsset],
         deletedIDs: Set<String>,
         librarySignature: String,
+        generation: Int,
         completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
     ) {
         queue.async { [weak self] in
             guard let self else { return }
 
             do {
+                try self.checkGeneration(generation)
                 let stats = try self.upsertAssetsSynchronously(
                     assets,
                     deletedIDs: deletedIDs,
-                    librarySignature: librarySignature
+                    librarySignature: librarySignature,
+                    generation: generation
                 )
                 DispatchQueue.main.async {
                     completion(.success(stats))
@@ -188,6 +261,35 @@ final class PhotoIndexStore: @unchecked Sendable {
                 DispatchQueue.main.async {
                     completion(.failure(error))
                 }
+            }
+        }
+    }
+
+    /// Replaces only the albums reported by PhotoKit's persistent change
+    /// stream. The temporary table remembers both the old and new members so
+    /// album_count is recomputed only for assets whose membership can change.
+    func updateAlbumMemberships(
+        userAlbums: [PHAssetCollection],
+        deletedAlbumIDs: Set<String>,
+        librarySignature: String,
+        generation: Int,
+        progress: @escaping (PhotoIndexProgress) -> Void,
+        completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.checkGeneration(generation)
+                let stats = try self.updateAlbumMembershipsSynchronously(
+                    userAlbums: userAlbums,
+                    deletedAlbumIDs: deletedAlbumIDs,
+                    librarySignature: librarySignature,
+                    generation: generation,
+                    progress: progress
+                )
+                DispatchQueue.main.async { completion(.success(stats)) }
+            } catch {
+                DispatchQueue.main.async { completion(.failure(error)) }
             }
         }
     }
@@ -278,8 +380,22 @@ final class PhotoIndexStore: @unchecked Sendable {
                     completion(.success(stats))
                 }
             } catch {
-                DispatchQueue.main.async {
-                    completion(.failure(error))
+                photoVaultTrace(
+                    "index stats falling back to writer connection "
+                        + "error=\(error.localizedDescription)"
+                )
+                self.queue.async { [weak self] in
+                    guard let self else { return }
+                    do {
+                        let stats = try self.withDatabase { try self.readStats() }
+                        DispatchQueue.main.async {
+                            completion(.success(stats))
+                        }
+                    } catch {
+                        DispatchQueue.main.async {
+                            completion(.failure(error))
+                        }
+                    }
                 }
             }
         }
@@ -304,8 +420,27 @@ final class PhotoIndexStore: @unchecked Sendable {
                     completion(.success(identifiers))
                 }
             } catch {
-                DispatchQueue.main.async {
-                    completion(.failure(error))
+                // WAL recovery edge case (previous process killed mid-write):
+                // retry on the writer connection so Unsorted paging and the
+                // detail viewer never stall on a reader-side failure.
+                photoVaultTrace(
+                    "index unsorted-read falling back to writer connection "
+                        + "error=\(error.localizedDescription)"
+                )
+                self.queue.async { [weak self] in
+                    guard let self else { return }
+                    do {
+                        let identifiers = try self.withDatabase {
+                            try self.readUnsortedIdentifiers(limit: limit, offset: offset)
+                        }
+                        DispatchQueue.main.async {
+                            completion(.success(identifiers))
+                        }
+                    } catch {
+                        DispatchQueue.main.async {
+                            completion(.failure(error))
+                        }
+                    }
                 }
             }
         }
@@ -315,9 +450,11 @@ final class PhotoIndexStore: @unchecked Sendable {
         assets: PHFetchResult<PHAsset>,
         userAlbums: [PHAssetCollection],
         librarySignature: String,
+        generation: Int,
         progress: @escaping (PhotoIndexProgress) -> Void
     ) throws -> PhotoIndexStats {
-        try withDatabase {
+        try checkGeneration(generation)
+        return try withDatabase {
             try execute("BEGIN IMMEDIATE TRANSACTION")
             do {
                 try execute("UPDATE meta SET value = '0' WHERE key = 'index_ready'")
@@ -350,6 +487,9 @@ final class PhotoIndexStore: @unchecked Sendable {
                 assets.enumerateObjects { [weak self] asset, index, stop in
                     guard let self else { return }
                     do {
+                        if index % 256 == 0 {
+                            try self.checkGeneration(generation)
+                        }
                         try self.bindAsset(asset, to: assetStatement)
                         try self.stepAndReset(assetStatement)
                     } catch {
@@ -367,7 +507,12 @@ final class PhotoIndexStore: @unchecked Sendable {
                 }
                 if let indexError { throw indexError }
 
-                try insertAlbumsAndMemberships(userAlbums, progress: progress)
+                try insertAlbumsAndMemberships(
+                    userAlbums,
+                    generation: generation,
+                    progress: progress
+                )
+                try checkGeneration(generation)
                 progress(PhotoIndexProgress(
                     phase: .finalizing,
                     completed: totalAssets,
@@ -395,15 +540,22 @@ final class PhotoIndexStore: @unchecked Sendable {
     private func replaceAlbumMembershipSynchronously(
         userAlbums: [PHAssetCollection],
         librarySignature: String,
+        generation: Int,
         progress: @escaping (PhotoIndexProgress) -> Void
     ) throws -> PhotoIndexStats {
-        try withDatabase {
+        try checkGeneration(generation)
+        return try withDatabase {
             try execute("BEGIN IMMEDIATE TRANSACTION")
             do {
                 try execute("DELETE FROM album_asset")
                 try execute("DELETE FROM album_index")
                 try setMeta("library_signature", value: librarySignature)
-                try insertAlbumsAndMemberships(userAlbums, progress: progress)
+                try insertAlbumsAndMemberships(
+                    userAlbums,
+                    generation: generation,
+                    progress: progress
+                )
+                try checkGeneration(generation)
                 try execute("""
                     UPDATE asset_index
                     SET album_count = (
@@ -425,6 +577,7 @@ final class PhotoIndexStore: @unchecked Sendable {
 
     private func insertAlbumsAndMemberships(
         _ userAlbums: [PHAssetCollection],
+        generation: Int,
         progress: @escaping (PhotoIndexProgress) -> Void
     ) throws {
         let albumStatement = try prepare("""
@@ -446,15 +599,19 @@ final class PhotoIndexStore: @unchecked Sendable {
 
         let totalAlbums = userAlbums.count
         for (albumIndex, collection) in userAlbums.enumerated() {
+            try checkGeneration(generation)
             try bindText(collection.localIdentifier, at: 1, to: albumStatement)
             try bindText(collection.localizedTitle ?? "未命名相册", at: 2, to: albumStatement)
             try stepAndReset(albumStatement)
 
             let albumAssets = PHAsset.fetchAssets(in: collection, options: Self.makeMediaOptions())
             var membershipError: Error?
-            albumAssets.enumerateObjects { [weak self] asset, _, stop in
+            albumAssets.enumerateObjects { [weak self] asset, memberIndex, stop in
                 guard let self else { return }
                 do {
+                    if memberIndex % 256 == 0 {
+                        try self.checkGeneration(generation)
+                    }
                     try self.bindText(collection.localIdentifier, at: 1, to: membershipStatement)
                     try self.bindText(asset.localIdentifier, at: 2, to: membershipStatement)
                     // Album fetches can briefly contain an asset that is no
@@ -479,12 +636,87 @@ final class PhotoIndexStore: @unchecked Sendable {
         }
     }
 
+    private func updateAlbumMembershipsSynchronously(
+        userAlbums: [PHAssetCollection],
+        deletedAlbumIDs: Set<String>,
+        librarySignature: String,
+        generation: Int,
+        progress: @escaping (PhotoIndexProgress) -> Void
+    ) throws -> PhotoIndexStats {
+        try checkGeneration(generation)
+        return try withDatabase {
+            try execute("BEGIN IMMEDIATE TRANSACTION")
+            do {
+                try execute("""
+                    CREATE TEMP TABLE IF NOT EXISTS affected_asset_ids (
+                        asset_id TEXT PRIMARY KEY NOT NULL
+                    )
+                    """)
+                try execute("DELETE FROM affected_asset_ids")
+                try setMeta("library_signature", value: librarySignature)
+
+                let changedAlbumIDs = Set(userAlbums.map(\.localIdentifier))
+                    .union(deletedAlbumIDs)
+                let captureStatement = try prepare("""
+                    INSERT OR IGNORE INTO affected_asset_ids (asset_id)
+                    SELECT asset_id FROM album_asset WHERE album_id = ?
+                    """)
+                let deleteStatement = try prepare(
+                    "DELETE FROM album_index WHERE album_id = ?"
+                )
+                defer {
+                    sqlite3_finalize(captureStatement)
+                    sqlite3_finalize(deleteStatement)
+                }
+
+                for albumID in changedAlbumIDs {
+                    try checkGeneration(generation)
+                    try bindText(albumID, at: 1, to: captureStatement)
+                    try stepAndReset(captureStatement)
+                    try bindText(albumID, at: 1, to: deleteStatement)
+                    try stepAndReset(deleteStatement)
+                }
+
+                try insertAlbumsAndMemberships(
+                    userAlbums,
+                    generation: generation,
+                    progress: progress
+                )
+
+                for albumID in userAlbums.map(\.localIdentifier) {
+                    try checkGeneration(generation)
+                    try bindText(albumID, at: 1, to: captureStatement)
+                    try stepAndReset(captureStatement)
+                }
+
+                try execute("""
+                    UPDATE asset_index
+                    SET album_count = (
+                        SELECT COUNT(*)
+                        FROM album_asset
+                        WHERE album_asset.asset_id = asset_index.asset_id
+                    )
+                    WHERE asset_id IN (SELECT asset_id FROM affected_asset_ids)
+                    """)
+                try checkGeneration(generation)
+                try execute("UPDATE meta SET value = '1' WHERE key = 'index_ready'")
+                try execute("COMMIT")
+            } catch {
+                try? execute("ROLLBACK")
+                throw error
+            }
+            return try readStats()
+        }
+    }
+
     private func upsertAssetsSynchronously(
         _ assets: [PHAsset],
         deletedIDs: Set<String>,
-        librarySignature: String
+        librarySignature: String,
+        generation: Int
     ) throws -> PhotoIndexStats {
-        try withDatabase {
+        try checkGeneration(generation)
+        return try withDatabase {
             try execute("BEGIN IMMEDIATE TRANSACTION")
             do {
                 try setMeta("library_signature", value: librarySignature)
@@ -501,7 +733,10 @@ final class PhotoIndexStore: @unchecked Sendable {
                     """)
                 defer { sqlite3_finalize(statement) }
 
-                for asset in assets {
+                for (index, asset) in assets.enumerated() {
+                    if index % 256 == 0 {
+                        try checkGeneration(generation)
+                    }
                     try bindAsset(asset, to: statement, includeExistingID: true)
                     try stepAndReset(statement)
                 }
@@ -515,6 +750,7 @@ final class PhotoIndexStore: @unchecked Sendable {
                     }
                 }
 
+                try checkGeneration(generation)
                 try execute("UPDATE meta SET value = '1' WHERE key = 'index_ready'")
                 try execute("COMMIT")
             } catch {
@@ -562,14 +798,20 @@ final class PhotoIndexStore: @unchecked Sendable {
                     try stepAndReset(membershipStatement)
                 }
 
-                try execute("""
+                let countStatement = try prepare("""
                     UPDATE asset_index
                     SET album_count = (
                         SELECT COUNT(*)
                         FROM album_asset
                         WHERE album_asset.asset_id = asset_index.asset_id
                     )
+                    WHERE asset_id = ?
                     """)
+                defer { sqlite3_finalize(countStatement) }
+                for assetID in assetIDs {
+                    try bindText(assetID, at: 1, to: countStatement)
+                    try stepAndReset(countStatement)
+                }
                 try execute("UPDATE meta SET value = '1' WHERE key = 'index_ready'")
                 try execute("COMMIT")
             } catch {
@@ -610,11 +852,13 @@ final class PhotoIndexStore: @unchecked Sendable {
         return identifiers
     }
 
-    /// Readers use a dedicated read-only connection. WAL lets it serve the
-    /// last committed snapshot while the writer runs a long rebuild
-    /// transaction, so Unsorted paging and viewer loading never stall behind
-    /// indexing work. READONLY without CREATE also means a fresh install
-    /// simply reports "no index" and the writer side builds it.
+    /// Readers use a dedicated connection so a long rebuild transaction never
+    /// blocks paging. WAL lets this connection serve the last committed
+    /// snapshot while the writer works. It is opened READWRITE on purpose: a
+    /// READONLY connection cannot run WAL recovery when the previous process
+    /// was killed mid-write, which failed every read. Nothing writes through
+    /// it; if the file is missing the open fails and the caller's writer
+    /// fallback creates and migrates the database.
     private func withReadDatabase<T>(_ body: () throws -> T) throws -> T {
         try openReadIfNeeded()
         return try body()
@@ -626,7 +870,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         let result = sqlite3_open_v2(
             databaseURL.path,
             &handle,
-            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
             nil
         )
         guard result == SQLITE_OK, let handle else {
@@ -728,6 +972,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         try execute("PRAGMA journal_mode = WAL")
         try execute("PRAGMA synchronous = NORMAL")
         try execute("PRAGMA foreign_keys = ON")
+        try execute("PRAGMA auto_vacuum = INCREMENTAL")
         try repairIfNeeded()
         try execute("""
             CREATE TABLE IF NOT EXISTS meta (
@@ -775,7 +1020,11 @@ final class PhotoIndexStore: @unchecked Sendable {
                 PRIMARY KEY (album_id, asset_id)
             )
             """)
-        try execute("CREATE INDEX IF NOT EXISTS asset_index_unassigned ON asset_index(album_count, creation_date DESC)")
+        // The ordered covering index fully subsumes the old two-column index;
+        // keeping both doubles part of the write and disk cost for no query
+        // benefit after the paging ORDER BY gained asset_id as a tie-breaker.
+        try execute("DROP INDEX IF EXISTS asset_index_unassigned")
+        try execute("CREATE INDEX IF NOT EXISTS asset_index_unassigned_ordered ON asset_index(album_count, creation_date DESC, asset_id DESC)")
         try execute("CREATE INDEX IF NOT EXISTS album_asset_asset ON album_asset(asset_id)")
     }
 

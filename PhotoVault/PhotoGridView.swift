@@ -1302,6 +1302,11 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             collectionView.delegate = nil
             collectionView.prefetchDataSource = nil
             self.collectionView = nil
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
         }
 
         func makeCollectionView() -> UICollectionView {
@@ -1353,6 +1358,13 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             )
             pinchDriver.attach(to: collectionView)
             self.pinchDriver = pinchDriver
+
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleMemoryWarning),
+                name: UIApplication.didReceiveMemoryWarningNotification,
+                object: nil
+            )
 
             DispatchQueue.main.async { [weak self, weak collectionView] in
                 guard let self, let collectionView else { return }
@@ -1610,6 +1622,32 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                     isSelected: selectedIDs.contains(asset.localIdentifier)
                 )
             }
+        }
+
+        @objc private func handleMemoryWarning() {
+            PhotoImageManager.shared.stopCachingAll()
+            guard let collectionView else {
+                assetsByIndex.removeAll(keepingCapacity: false)
+                pageOrder.removeAll(keepingCapacity: false)
+                return
+            }
+
+            for case let cell as PhotoGridCell in collectionView.visibleCells {
+                cell.releaseDecodedImage()
+            }
+
+            let visiblePages = Set(
+                collectionView.indexPathsForVisibleItems.map { $0.item / pageSize }
+            )
+            let pagesToRelease = pageOrder.filter { !visiblePages.contains($0) }
+            for page in pagesToRelease {
+                let start = page * pageSize
+                let end = min(totalCount, start + pageSize)
+                for index in start..<end {
+                    assetsByIndex.removeValue(forKey: index)
+                }
+            }
+            pageOrder.removeAll { !visiblePages.contains($0) }
         }
 
         private func loadPage(containing index: Int, in collectionView: UICollectionView) {

@@ -321,18 +321,41 @@ final class PhotoImageManager {
     private let albumThumbnailCache = NSCache<NSString, UIImage>()
 
     private init() {
+        let physicalMemory = ProcessInfo.processInfo.physicalMemory
+        let gibibyte = UInt64(1_024 * 1_024 * 1_024)
+        let standardCacheLimit: Int
+        let albumCacheLimit: Int
+        let standardCountLimit: Int
+        let albumCountLimit: Int
+        if physicalMemory <= 4 * gibibyte {
+            standardCacheLimit = 48 * 1_024 * 1_024
+            albumCacheLimit = 8 * 1_024 * 1_024
+            standardCountLimit = 4
+            albumCountLimit = 128
+        } else if physicalMemory <= 6 * gibibyte {
+            standardCacheLimit = 64 * 1_024 * 1_024
+            albumCacheLimit = 12 * 1_024 * 1_024
+            standardCountLimit = 5
+            albumCountLimit = 192
+        } else {
+            standardCacheLimit = 80 * 1_024 * 1_024
+            albumCacheLimit = 16 * 1_024 * 1_024
+            standardCountLimit = 5
+            albumCountLimit = 256
+        }
+
         // Only the small number of full-size slideshow look-ahead images are
         // retained in the standard cache. Grid requests do not opt into this
         // cache, so a 100k-photo library cannot fill it while scrolling.
-        imageCache.countLimit = 6
-        imageCache.totalCostLimit = 96 * 1024 * 1024
+        imageCache.countLimit = standardCountLimit
+        imageCache.totalCostLimit = standardCacheLimit
 
         // Album rows display one small preview per album. Keep this cache
         // bounded independently from viewer images so revisiting a list does
         // not start a new PhotoKit request for every row, while still putting
         // a hard ceiling on memory for unusually large album collections.
-        albumThumbnailCache.countLimit = 256
-        albumThumbnailCache.totalCostLimit = 16 * 1024 * 1024
+        albumThumbnailCache.countLimit = albumCountLimit
+        albumThumbnailCache.totalCostLimit = albumCacheLimit
         scheduler = PhotoRequestScheduler(imageManager: manager)
     }
 
@@ -562,7 +585,7 @@ final class PhotoImageManager {
         manager.stopCachingImagesForAllAssets()
         imageCache.removeAllObjects()
         albumThumbnailCache.removeAllObjects()
-        scheduler.cancelRequests(atOrBelow: .nearGrid)
+        scheduler.cancelRequests(atOrBelow: .viewer)
     }
 
     /// Frees viewer/grid decode caches when the app leaves the foreground.
@@ -573,7 +596,7 @@ final class PhotoImageManager {
     func dropTransientCaches() {
         manager.stopCachingImagesForAllAssets()
         imageCache.removeAllObjects()
-        scheduler.cancelRequests(atOrBelow: .nearGrid)
+        scheduler.cancelRequests(atOrBelow: .viewer)
     }
 
     private func imageCacheKey(

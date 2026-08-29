@@ -89,7 +89,6 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     @Published private(set) var allPhotos: PHFetchResult<PHAsset>?
     @Published private(set) var albums: [PhotoAlbum] = []
     @Published private(set) var albumFolders: [PhotoAlbumFolder] = []
-    @Published private(set) var unsortedPhotos: PHFetchResult<PHAsset>?
     @Published private(set) var isIndexingUnsorted = false
     @Published private(set) var isLoadingAlbums = false
     @Published private(set) var lastIndexedAt: Date?
@@ -113,6 +112,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     private let changeTokenDefaultsKey = "PhotoVault.photoLibrary.changeToken.v1"
     private let changeTokenSignatureDefaultsKey = "PhotoVault.photoLibrary.changeTokenSignature.v1"
     private let albumCacheDefaultsKey = "PhotoVault.photoLibrary.albumSnapshot.v1"
+    nonisolated private static let shareTemporaryFilePrefix = "PhotoVault-Share-"
     private var hasLoadedAlbumCache = false
 
     var canReadPhotos: Bool {
@@ -151,6 +151,9 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     func start() {
         guard !hasStarted else { return }
         hasStarted = true
+        DispatchQueue.global(qos: .utility).async {
+            Self.removeAbandonedShareFiles(olderThan: nil)
+        }
 
         authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         PHPhotoLibrary.shared().register(self)
@@ -161,6 +164,35 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         } else if authorizationStatus == .notDetermined {
             requestAccess()
         }
+    }
+
+    func suspendForBackground() {
+        albumFetchResults.removeAll(keepingCapacity: true)
+
+        if isIndexingUnsorted || isLoadingAlbums {
+            needsUnsortedIndex = true
+            indexGeneration &+= 1
+            indexStore.setActiveGeneration(indexGeneration)
+            isIndexingUnsorted = false
+            isLoadingAlbums = false
+            indexProgress = nil
+        }
+
+        indexStore.checkpointForBackground()
+        DispatchQueue.global(qos: .utility).async {
+            Self.removeAbandonedShareFiles(
+                olderThan: Date().addingTimeInterval(-60 * 60)
+            )
+        }
+    }
+
+    func resumeAfterBackground() {
+        guard canReadPhotos,
+              needsUnsortedIndex,
+              !isIndexingUnsorted,
+              !isLoadingAlbums
+        else { return }
+        retryUnsortedIndex()
     }
 
     func requestAccess() {
@@ -188,6 +220,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         needsUnsortedIndex = true
         indexGeneration &+= 1
         let generation = indexGeneration
+        indexStore.setActiveGeneration(generation)
 
         photoVaultTrace(
             "store refresh generation=\(generation) cachedAlbums=\(albums.count)"
@@ -218,6 +251,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                                 + "albums=\(fetchedAlbums.albums.count) "
                                 + "folders=\(fetchedAlbums.folders.count)"
                         )
+                        self.albumFetchResults.removeAll(keepingCapacity: true)
                         self.albums = fetchedAlbums.albums
                         self.albumFolders = fetchedAlbums.folders
                         self.saveAlbumCache(
@@ -269,6 +303,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
         indexGeneration &+= 1
         let generation = indexGeneration
+        indexStore.setActiveGeneration(generation)
         let userAlbums = albums
             .filter { $0.kind == .user }
             .map(\.collection)
@@ -570,7 +605,9 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                     ? "mov"
                     : originalURL.pathExtension
                 let destination = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("PhotoVault-\(UUID().uuidString)")
+                    .appendingPathComponent(
+                        "\(Self.shareTemporaryFilePrefix)\(UUID().uuidString)"
+                    )
                     .appendingPathExtension(extensionName)
                 let options = PHAssetResourceRequestOptions()
                 options.isNetworkAccessAllowed = true
@@ -581,6 +618,8 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 ) { error in
                     if error == nil {
                         accumulator.store(destination, at: index)
+                    } else {
+                        try? FileManager.default.removeItem(at: destination)
                     }
                     group.leave()
                 }
@@ -660,10 +699,10 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         // result is still valid and can be reused without a full asset fetch.
         let updatedPhotos = details?.fetchResultAfterChanges ?? currentPhotos
         allPhotos = updatedPhotos
-        unsortedPhotos = nil
         needsUnsortedIndex = true
         indexGeneration &+= 1
         let generation = indexGeneration
+        indexStore.setActiveGeneration(generation)
 
         isLoadingAlbums = true
         DispatchQueue.global(qos: .userInitiated).async {
@@ -671,6 +710,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.indexGeneration == generation else { return }
+                self.albumFetchResults.removeAll(keepingCapacity: true)
                 self.albums = fetchedAlbums.albums
                 self.albumFolders = fetchedAlbums.folders
                 self.saveAlbumCache(
@@ -1003,6 +1043,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         generation: Int
     ) {
         guard generation == indexGeneration else { return }
+        indexStore.setActiveGeneration(generation)
         photoVaultTrace(
             "store index start generation=\(generation) assets=\(allPhotos.count) "
                 + "userAlbums=\(userAlbums.count)"
@@ -1051,6 +1092,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             assets: allPhotos,
             userAlbums: userAlbums,
             librarySignature: librarySignature,
+            generation: generation,
             progress: { [weak self] progress in
                 Task { @MainActor [weak self] in
                     guard let self, self.indexGeneration == generation else { return }
@@ -1118,7 +1160,8 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             var insertedIDs = Set<String>()
             var updatedIDs = Set<String>()
             var deletedIDs = Set<String>()
-            var collectionsChanged = false
+            var changedCollectionIDs = Set<String>()
+            var deletedCollectionIDs = Set<String>()
 
             for change in changes {
                 if let details = try? change.changeDetails(for: .asset) {
@@ -1127,11 +1170,10 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                     deletedIDs.formUnion(details.deletedLocalIdentifiers)
                 }
 
-                if (try? change.changeDetails(for: .assetCollection)) != nil {
-                    collectionsChanged = true
-                }
-                if (try? change.changeDetails(for: .collectionList)) != nil {
-                    collectionsChanged = true
+                if let details = try? change.changeDetails(for: .assetCollection) {
+                    changedCollectionIDs.formUnion(details.insertedLocalIdentifiers)
+                    changedCollectionIDs.formUnion(details.updatedLocalIdentifiers)
+                    deletedCollectionIDs.formUnion(details.deletedLocalIdentifiers)
                 }
             }
 
@@ -1154,17 +1196,31 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 self.indexStore.upsertAssets(
                     changedAssets,
                     deletedIDs: deletedIDs,
-                    librarySignature: librarySignature
+                    librarySignature: librarySignature,
+                    generation: generation
                 ) { [weak self] result in
                     guard let self, self.indexGeneration == generation else { return }
                     switch result {
                     case .failure(let error):
                         self.failIndexing(error)
                     case .success:
-                        if collectionsChanged {
-                            self.indexStore.replaceAlbumMembership(
-                                userAlbums: userAlbums,
+                        let collectionIDsToRefresh = changedCollectionIDs
+                            .subtracting(deletedCollectionIDs)
+                        if !collectionIDsToRefresh.isEmpty || !deletedCollectionIDs.isEmpty {
+                            let changedUserAlbums = userAlbums.filter {
+                                collectionIDsToRefresh.contains($0.localIdentifier)
+                            }
+                            let currentUserAlbumIDs = Set(
+                                changedUserAlbums.map(\.localIdentifier)
+                            )
+                            let removedOrNonUserAlbumIDs = deletedCollectionIDs.union(
+                                collectionIDsToRefresh.subtracting(currentUserAlbumIDs)
+                            )
+                            self.indexStore.updateAlbumMemberships(
+                                userAlbums: changedUserAlbums,
+                                deletedAlbumIDs: removedOrNonUserAlbumIDs,
                                 librarySignature: librarySignature,
+                                generation: generation,
                                 progress: { [weak self] progress in
                                     Task { @MainActor [weak self] in
                                         guard let self, self.indexGeneration == generation else { return }
@@ -1331,6 +1387,30 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             else { return }
             self.indexStats = stats
             self.unsortedCount = stats.unsortedCount
+        }
+    }
+
+    nonisolated private static func removeAbandonedShareFiles(
+        olderThan cutoff: Date?
+    ) {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+        guard let urls = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        // `PhotoVault-<UUID>` was used before the explicit Share prefix.
+        // Both formats live in this app's private temporary directory.
+        for url in urls where url.lastPathComponent.hasPrefix("PhotoVault-") {
+            if let cutoff {
+                let modifiedAt = try? url.resourceValues(
+                    forKeys: [.contentModificationDateKey]
+                ).contentModificationDate
+                guard let modifiedAt, modifiedAt < cutoff else { continue }
+            }
+            try? fileManager.removeItem(at: url)
         }
     }
 }

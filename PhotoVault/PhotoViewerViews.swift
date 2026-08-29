@@ -6,14 +6,18 @@ import PhotosUI
 import OSLog
 
 #if DEBUG
-@MainActor
 enum PagerDiagnostics {
     private static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.misswell.PhotoVault",
         category: "Pager"
     )
     private static let maxLogBytes = 512 * 1024
-    private static var hasStartedSession = false
+    private static let fileQueue = DispatchQueue(
+        label: "com.misswell.PhotoVault.pager-diagnostics",
+        qos: .utility
+    )
+    private static let sessionLock = NSLock()
+    nonisolated(unsafe) private static var hasStartedSession = false
 
     private static var logURL: URL {
         let cachesDirectory = FileManager.default.urls(
@@ -26,14 +30,21 @@ enum PagerDiagnostics {
     }
 
     static func beginSession() {
-        guard !hasStartedSession else { return }
+        sessionLock.lock()
+        guard !hasStartedSession else {
+            sessionLock.unlock()
+            return
+        }
         hasStartedSession = true
+        sessionLock.unlock()
         let url = logURL
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        try? Data().write(to: url, options: .atomic)
+        fileQueue.async {
+            try? FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try? Data().write(to: url, options: .atomic)
+        }
         log("session started")
     }
 
@@ -43,19 +54,30 @@ enum PagerDiagnostics {
         let line = "\(Date()) \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
         let url = logURL
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-
-        let existing = (try? Data(contentsOf: url)) ?? Data()
-        var combined = existing
-        if existing.count + data.count > maxLogBytes {
-            combined = data
-        } else {
-            combined.append(data)
+        fileQueue.async {
+            let fileManager = FileManager.default
+            try? fileManager.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            if let attributes = try? fileManager.attributesOfItem(atPath: url.path),
+               let size = attributes[.size] as? NSNumber,
+               size.intValue + data.count > maxLogBytes {
+                try? fileManager.removeItem(at: url)
+            }
+            if fileManager.fileExists(atPath: url.path),
+               let handle = try? FileHandle(forWritingTo: url) {
+                do {
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: data)
+                    try handle.close()
+                } catch {
+                    try? handle.close()
+                }
+            } else {
+                try? data.write(to: url, options: .atomic)
+            }
         }
-        try? combined.write(to: url, options: .atomic)
     }
 }
 #else
@@ -75,6 +97,25 @@ private final class MediaAudioSession: ObservableObject {
 
     func toggleMuted() {
         setMuted(!isMuted)
+    }
+
+    func suspendForBackground() {
+        guard !isMuted else { return }
+        try? AVAudioSession.sharedInstance().setActive(
+            false,
+            options: .notifyOthersOnDeactivation
+        )
+    }
+
+    func resumeAfterBackground() {
+        guard !isMuted else { return }
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            try audioSession.setCategory(.playback, mode: .moviePlayback)
+            try audioSession.setActive(true)
+        } catch {
+            isMuted = true
+        }
     }
 
     private func setMuted(_ muted: Bool) {
@@ -745,6 +786,7 @@ private struct VideoAssetViewer: View {
     let requestPriority: PhotoRequestPriority
     let onReady: (Bool) -> Void
 
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var audioSession = MediaAudioSession.shared
     @State private var player: AVPlayer?
     @State private var requestHandle: PhotoRequestHandle?
@@ -759,7 +801,9 @@ private struct VideoAssetViewer: View {
                 VideoPlayer(player: player)
                     .onAppear {
                         player.isMuted = audioSession.isMuted
-                        player.play()
+                        if scenePhase == .active {
+                            player.play()
+                        }
                     }
                     .onDisappear {
                         player.pause()
@@ -789,6 +833,17 @@ private struct VideoAssetViewer: View {
         }
         .onChange(of: audioSession.isMuted) { _, isMuted in
             player?.isMuted = isMuted
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                audioSession.resumeAfterBackground()
+                player?.play()
+            } else {
+                player?.pause()
+                if phase == .background {
+                    audioSession.suspendForBackground()
+                }
+            }
         }
         .onDisappear {
             PhotoImageManager.shared.cancel(requestHandle)
@@ -1816,6 +1871,9 @@ private struct IndexedAssetPager: View {
     // True while the user is scrubbing the filmstrip: transitions become
     // instant swaps so the main photo tracks the strip in real time.
     let isScrubbing: Bool
+    // Mirrors the store's indexing flag; when a sync finishes this pager
+    // re-requests its window in case an in-flight page load was dropped.
+    let isIndexingUnsorted: Bool
 
     @State private var loadingOffsets = Set<Int>()
     @State private var loadedOffsets = Set<Int>()
@@ -1839,7 +1897,8 @@ private struct IndexedAssetPager: View {
         neighborPriority: PhotoRequestPriority = .slideshow,
         onMediaReady: ((Bool) -> Void)? = nil,
         onZoomingChanged: ((Bool) -> Void)? = nil,
-        isScrubbing: Bool = false
+        isScrubbing: Bool = false,
+        isIndexingUnsorted: Bool = false
     ) {
         self.totalCount = max(0, totalCount)
         self.store = store
@@ -1851,6 +1910,7 @@ private struct IndexedAssetPager: View {
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
         self.isScrubbing = isScrubbing
+        self.isIndexingUnsorted = isIndexingUnsorted
     }
 
     private var swipeStyle: PhotoSwipeStyle {
@@ -1901,6 +1961,23 @@ private struct IndexedAssetPager: View {
             loadWindow(around: newValue)
         }
         .onChange(of: totalCount) { _, newValue in
+            loadGeneration &+= 1
+            loadingOffsets.removeAll()
+            loadedOffsets.removeAll()
+            assetsByIndex.removeAll()
+            let clampedIndex = min(max(0, currentIndex), max(0, newValue - 1))
+            if currentIndex != clampedIndex {
+                currentIndex = clampedIndex
+            }
+            loadWindow(around: clampedIndex)
+        }
+        .onChange(of: isIndexingUnsorted) { _, indexing in
+            // A page load can be dropped by the store's generation guard
+            // while an index sync runs. Once the sync finishes, re-request
+            // whatever window is still missing instead of leaving the
+            // viewer on a placeholder forever.
+            guard !indexing else { return }
+            loadGeneration &+= 1
             loadingOffsets.removeAll()
             loadedOffsets.removeAll()
             assetsByIndex.removeAll()
@@ -2483,7 +2560,8 @@ struct IndexedPhotoViewerView: View {
                     onZoomingChanged: { zooming in
                         isZooming = zooming
                     },
-                    isScrubbing: isScrubbingFilmstrip
+                    isScrubbing: isScrubbingFilmstrip,
+                    isIndexingUnsorted: store.isIndexingUnsorted
                 )
                 .frame(width: proxy.size.width, height: proxy.size.height)
                 .offset(dismissDragOffset)

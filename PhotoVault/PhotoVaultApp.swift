@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct PhotoVaultApp: App {
@@ -7,6 +8,13 @@ struct PhotoVaultApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .onReceive(
+                    NotificationCenter.default.publisher(
+                        for: UIApplication.didReceiveMemoryWarningNotification
+                    )
+                ) { _ in
+                    PhotoImageManager.shared.stopCachingAll()
+                }
         }
         .onChange(of: scenePhase) { _, phase in
             // Only a real backgrounding releases decode caches; .inactive
@@ -15,7 +23,6 @@ struct PhotoVaultApp: App {
             // on return.
             guard phase == .background else { return }
             PhotoImageManager.shared.dropTransientCaches()
-            PhotoImageManager.shared.cancelRequests(exactly: .slideshow)
         }
     }
 }
