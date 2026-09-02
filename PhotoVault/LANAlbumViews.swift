@@ -212,6 +212,14 @@ struct LANFolderGridScreen: View {
     }
 
     private func enumerate() async {
+        // Re-entry replays the session cache: hitting the share again was
+        // stacking a second full traversal on top of the first one.
+        if let cached = LANFolderSessionCache.files(for: folder.id) {
+            files = cached
+            isEnumerating = false
+            return
+        }
+
         isEnumerating = files.isEmpty
         enumerateError = nil
         let album = folder
@@ -224,8 +232,11 @@ struct LANFolderGridScreen: View {
             LANFolderScopeManager.shared.activate(id: album.id, url: url)
             return LANFolderImageLoader.enumerateImageFiles(under: url)
         }
-        files = (result ?? nil) ?? []
-        if result == nil {
+        let flattened: [URL]? = (result ?? nil)
+        files = flattened ?? []
+        if let flattened {
+            LANFolderSessionCache.store(files: flattened, for: album.id)
+        } else {
             enumerateError = "文件夹访问超时或已不可访问，请检查共享连接后重试，或删除后重新添加。"
         }
         isEnumerating = false

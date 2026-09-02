@@ -247,48 +247,87 @@ enum LANFolderImageLoaderQueue {
     }
 }
 
-/// Runs blocking work on a GCD thread (its own growable pool) so a hung
-/// share can never occupy a Swift cooperative thread, and races it against
-/// a timeout. On timeout the work keeps running in the background; the
-/// caller just stops waiting.
+/// Races blocking work against a timeout entirely on GCD threads: the first
+/// finisher wins and the caller resumes immediately. The loser's work keeps
+/// running in the background (blocking SMB traversals ignore cancellation),
+/// so the caller must not wait on it — a task-group implementation that
+/// awaits both children would never return for a hung share.
 enum LANFolderTimeout {
+    private final class ResultBox<T: Sendable>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: T?
+        private var finished = false
+
+        /// Returns true when this call is the first finisher.
+        func finish(_ newValue: T) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if finished { return false }
+            value = newValue
+            finished = true
+            return true
+        }
+
+        /// Returns true when this call is the first finisher (a timeout).
+        func markTimedOut() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if finished { return false }
+            finished = true
+            return true
+        }
+
+        func takeIfFinished() -> T? {
+            lock.lock()
+            defer { lock.unlock() }
+            return finished ? value : nil
+        }
+    }
+
     static func run<T: Sendable>(
         seconds: Double,
         _ work: @escaping @Sendable () -> T
     ) async -> T? {
-        let workTask = Task.detached(priority: .userInitiated) {
-            await LANFolderGCDBridge.run(work)
-        }
-        let timeoutTask = Task {
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            return nil as T?
-        }
-        let winner = await groupFirst(workTask, timeoutTask)
-        timeoutTask.cancel()
-        return winner
-    }
+        await withCheckedContinuation { (continuation: CheckedContinuation<T?, Never>) in
+            let box = ResultBox<T>()
+            let semaphore = DispatchSemaphore(value: 0)
 
-    private static func groupFirst<T: Sendable>(
-        _ workTask: Task<T, Never>,
-        _ timeoutTask: Task<T?, Never>
-    ) async -> T? {
-        await withTaskGroup(of: T?.self) { group in
-            group.addTask { await workTask.value }
-            group.addTask { await timeoutTask.value }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            _ = await group.next()
-            return first
+            DispatchQueue.global(qos: .userInitiated).async {
+                let value = work()
+                if box.finish(value) {
+                    semaphore.signal()
+                }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + seconds) {
+                if box.markTimedOut() {
+                    semaphore.signal()
+                }
+            }
+            DispatchQueue.global().async {
+                semaphore.wait()
+                continuation.resume(returning: box.takeIfFinished())
+            }
         }
     }
 }
 
-private enum LANFolderGCDBridge {
-    static func run<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                continuation.resume(returning: work())
-            }
-        }
+/// Session-scoped enumeration results. Re-entering a folder replays the
+/// cached list instead of traversing the SMB share again — the repeat-visit
+/// freeze was overlapping full traversals stacked on a timeout that never
+/// actually fired.
+enum LANFolderSessionCache {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var filesByFolder: [UUID: [URL]] = [:]
+
+    static func files(for id: UUID) -> [URL]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return filesByFolder[id]
+    }
+
+    static func store(files: [URL], for id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        filesByFolder[id] = files
     }
 }
