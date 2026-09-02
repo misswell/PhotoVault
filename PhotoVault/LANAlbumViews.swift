@@ -215,16 +215,18 @@ struct LANFolderGridScreen: View {
         isEnumerating = files.isEmpty
         enumerateError = nil
         let album = folder
-        let result: [URL]? = await Task.detached(priority: .userInitiated) {
+        // Resolve + activate + enumerate can each block against a dead or
+        // slow share; cap the whole pass so the screen never spins forever.
+        let result: [URL]?? = await LANFolderTimeout.run(seconds: 20) {
             guard let url = LANFolderLibrary.resolve(album) else { return nil }
             // Hold the security scope for the whole session; re-acquiring it
             // on every visit stalled the album behind provider round trips.
             LANFolderScopeManager.shared.activate(id: album.id, url: url)
             return LANFolderImageLoader.enumerateImageFiles(under: url)
-        }.value
-        files = result ?? []
+        }
+        files = (result ?? nil) ?? []
         if result == nil {
-            enumerateError = "共享文件夹已不可访问，可能断开了连接，请删除后重新添加。"
+            enumerateError = "文件夹访问超时或已不可访问，请检查共享连接后重试，或删除后重新添加。"
         }
         isEnumerating = false
     }

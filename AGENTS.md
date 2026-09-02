@@ -107,7 +107,7 @@
 
 - “局域网相册”的实体是用户通过文件 App（含 SMB/NAS 共享）选中的文件夹：`LANFolderLibrary` 保存安全作用域书签（`PhotoVault.lanFolders.v1`），跨启动靠 `URL(resolvingBookmarkData:)` 恢复访问；书签失效（共享断开）时提示重新添加，不做静默失败。
 - 图片枚举递归全文件夹、按修改时间倒序，走 `FileManager.enumerator`（后台线程）；图片解码必须走 ImageIO 降采样（`CGImageSourceCreateThumbnailAtIndex` + `ThumbnailMaxPixelSize`，缩略图 512、查看 2048），禁止 `UIImage(data:)` 全尺寸解码进网格——50MP 文件全解码是主线程杀手。
-- 安全作用域由 `LANFolderScopeManager` 会话期内持有（幂等激活，不随页面退出释放），反复启停 scope 会触发 SMB provider 往返、表现为相册卡死；图片加载一律走 `LANFolderImageLoaderQueue`（信号量限 3 并发 + 缓存优先），禁止每个 cell 直接 detached 任务做同步网络文件解码——SMB 读是网络往返，几十个并发阻塞任务会榨干 Swift 协作线程池，整个 App 冻结。
+- 安全作用域由 `LANFolderScopeManager` 会话期内持有（幂等激活，不随页面退出释放），反复启停 scope 会触发 SMB provider 往返、表现为相册卡死；图片加载一律走 `LANFolderImageLoaderQueue`：同 URL 请求必须合并（in-flight 去重），信号量限 3 并发且等待带超时（毒槽不放大队列），禁止每个 cell 直接 detached 任务做同步网络文件解码——SMB 读是网络往返，几十个并发阻塞任务会榨干 Swift 协作线程池，整个 App 冻结。文件夹解析/激活/枚举整链必须经 `LANFolderTimeout` 跑在 GCD 线程上并限时 20 秒，超时明确报错而不是无限转圈。
 - 幻灯片与本地规则一致：单可见页单向推进（5 秒）、crossfade、点击暂停/继续，不用重建式 TabView。
 - 文件夹访问（`startAccessingSecurityScopedResource`）必须与 `stopAccessing` 成对出现；图片加载按文件各自包裹即可。
 

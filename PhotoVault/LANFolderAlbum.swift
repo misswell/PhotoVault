@@ -94,7 +94,9 @@ enum LANFolderImageLoader {
 
     /// Lists image files under the folder recursively, newest modification
     /// first. Runs off the main thread at the call site; the caller must
-    /// hold the folder's security scope via `LANFolderScopeManager`.
+    /// hold the folder's security scope via `LANFolderScopeManager`. Each
+    /// entry hits the provider over SMB, so the caller should wrap this in
+    /// a timeout instead of letting a dead share spin forever.
     static func enumerateImageFiles(under folderURL: URL) -> [URL] {
         let fileManager = FileManager.default
         guard let enumerator = fileManager.enumerator(
@@ -109,15 +111,26 @@ enum LANFolderImageLoader {
 
         var files: [(url: URL, date: Date?)] = []
         for case let fileURL as URL in enumerator {
+            let ext = fileURL.pathExtension.lowercased()
+            // Extension match first: querying the content type of every
+            // entry on an SMB share is a network round trip per file.
+            guard imageExtensions.contains(ext) else {
+                let values = try? fileURL.resourceValues(forKeys: [
+                    .isRegularFileKey,
+                    .contentTypeKey,
+                    .contentModificationDateKey,
+                ])
+                guard values?.isRegularFile == true,
+                      values?.contentType?.conforms(to: .image) == true
+                else { continue }
+                files.append((fileURL, values?.contentModificationDate))
+                continue
+            }
             let values = try? fileURL.resourceValues(forKeys: [
                 .isRegularFileKey,
-                .contentTypeKey,
                 .contentModificationDateKey,
             ])
             guard values?.isRegularFile == true else { continue }
-            let isImage = values?.contentType?.conforms(to: .image) == true
-                || imageExtensions.contains(fileURL.pathExtension.lowercased())
-            guard isImage else { continue }
             files.append((fileURL, values?.contentModificationDate))
         }
 
@@ -171,33 +184,110 @@ final class LANFolderImageCache: @unchecked Sendable {
 }
 
 /// Bounded loader for LAN folder images. SMB reads are network round trips:
-/// letting every visible cell run a blocking decode on a detached task once
-/// starved Swift's cooperative thread pool and froze the entire app. Loads
-/// are capped at three in flight, cache hits skip the gate, and waiters park
-/// on this GCD queue instead of blocking concurrency threads.
+/// unbounded concurrent decodes once starved Swift's cooperative thread pool
+/// and froze the entire app, and repeated screen visits queued duplicate
+/// work for the same files. Loads are therefore coalesced per file, capped
+/// at three concurrent decodes, and the gate wait times out so a poisoned
+/// slot can never back the queue up forever. All bookkeeping happens on a
+/// dedicated GCD queue, never on Swift concurrency threads.
 enum LANFolderImageLoaderQueue {
+    private static let lock = NSLock()
+    // Guarded by `lock`.
+    nonisolated(unsafe) private static var waiters: [NSString: [(UIImage?) -> Void]] = [:]
+    nonisolated(unsafe) private static var inFlight: Set<NSString> = []
+
     private static let queue = DispatchQueue(
         label: "com.misswell.PhotoVault.lan-image-load",
         qos: .userInitiated,
         attributes: .concurrent
     )
     private static let loadGate = DispatchSemaphore(value: 3)
+    private static let gateTimeout: TimeInterval = 45
 
     static func load(at url: URL, maxPixelSize: CGFloat) async -> UIImage? {
-        await withCheckedContinuation { continuation in
-            queue.async {
-                let key = "\(url.path)#\(Int(maxPixelSize))" as NSString
-                if let cached = LANFolderImageCache.shared.image(forKey: key) {
-                    continuation.resume(returning: cached)
-                    return
-                }
-                loadGate.wait()
-                let image = LANFolderImageLoader.image(at: url, maxPixelSize: maxPixelSize)
-                loadGate.signal()
-                if let image {
-                    LANFolderImageCache.shared.store(image, forKey: key)
-                }
+        let key: NSString = "\(url.path)#\(Int(maxPixelSize))" as NSString
+        if let cached = LANFolderImageCache.shared.image(forKey: key) {
+            return cached
+        }
+        return await withCheckedContinuation { continuation in
+            lock.lock()
+            waiters[key, default: []].append { image in
                 continuation.resume(returning: image)
+            }
+            let shouldStart = inFlight.insert(key).inserted
+            lock.unlock()
+
+            guard shouldStart else { return }
+            queue.async {
+                process(key: key, url: url, maxPixelSize: maxPixelSize)
+            }
+        }
+    }
+
+    private static func process(key: NSString, url: URL, maxPixelSize: CGFloat) {
+        var image: UIImage?
+        if loadGate.wait(timeout: .now() + gateTimeout) == .success {
+            image = LANFolderImageLoader.image(at: url, maxPixelSize: maxPixelSize)
+            loadGate.signal()
+        } else {
+            photoVaultTrace("lan image gate timeout path=\(url.lastPathComponent)")
+        }
+        finish(key: key, image: image)
+    }
+
+    private static func finish(key: NSString, image: UIImage?) {
+        lock.lock()
+        let callbacks = waiters.removeValue(forKey: key) ?? []
+        inFlight.remove(key)
+        lock.unlock()
+        if let image {
+            LANFolderImageCache.shared.store(image, forKey: key)
+        }
+        callbacks.forEach { $0(image) }
+    }
+}
+
+/// Runs blocking work on a GCD thread (its own growable pool) so a hung
+/// share can never occupy a Swift cooperative thread, and races it against
+/// a timeout. On timeout the work keeps running in the background; the
+/// caller just stops waiting.
+enum LANFolderTimeout {
+    static func run<T: Sendable>(
+        seconds: Double,
+        _ work: @escaping @Sendable () -> T
+    ) async -> T? {
+        let workTask = Task.detached(priority: .userInitiated) {
+            await LANFolderGCDBridge.run(work)
+        }
+        let timeoutTask = Task {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            return nil as T?
+        }
+        let winner = await groupFirst(workTask, timeoutTask)
+        timeoutTask.cancel()
+        return winner
+    }
+
+    private static func groupFirst<T: Sendable>(
+        _ workTask: Task<T, Never>,
+        _ timeoutTask: Task<T?, Never>
+    ) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask { await workTask.value }
+            group.addTask { await timeoutTask.value }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            _ = await group.next()
+            return first
+        }
+    }
+}
+
+private enum LANFolderGCDBridge {
+    static func run<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                continuation.resume(returning: work())
             }
         }
     }
