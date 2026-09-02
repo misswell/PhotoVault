@@ -56,6 +56,36 @@ enum LANFolderLibrary {
     }
 }
 
+/// Holds security-scoped access for picked folders for the whole app
+/// session. Re-acquiring the scope on every screen visit means repeated
+/// file-provider round trips against the share, which presented as a frozen
+/// album on re-entry; the references are reclaimed when the process ends.
+final class LANFolderScopeManager: @unchecked Sendable {
+    static let shared = LANFolderScopeManager()
+
+    private struct ActiveScope {
+        let url: URL
+        var started: Bool
+    }
+
+    private var active: [UUID: ActiveScope] = [:]
+    private let lock = NSLock()
+
+    /// Idempotent: activating an already-active folder is a no-op.
+    func activate(id: UUID, url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = active[id] {
+            guard existing.url != url || !existing.started else { return }
+            if existing.started {
+                existing.url.stopAccessingSecurityScopedResource()
+            }
+        }
+        let started = url.startAccessingSecurityScopedResource()
+        active[id] = ActiveScope(url: url, started: started)
+    }
+}
+
 enum LANFolderImageLoader {
     static let imageExtensions: Set<String> = [
         "jpg", "jpeg", "png", "heic", "heif", "gif", "webp",
@@ -63,15 +93,9 @@ enum LANFolderImageLoader {
     ]
 
     /// Lists image files under the folder recursively, newest modification
-    /// first. Runs off the main thread at the call site.
+    /// first. Runs off the main thread at the call site; the caller must
+    /// hold the folder's security scope via `LANFolderScopeManager`.
     static func enumerateImageFiles(under folderURL: URL) -> [URL] {
-        let started = folderURL.startAccessingSecurityScopedResource()
-        defer {
-            if started {
-                folderURL.stopAccessingSecurityScopedResource()
-            }
-        }
-
         let fileManager = FileManager.default
         guard let enumerator = fileManager.enumerator(
             at: folderURL,
@@ -104,15 +128,9 @@ enum LANFolderImageLoader {
 
     /// Downscaled decode through ImageIO. A full-resolution decode of a 50MP
     /// file inside a grid cell is exactly the main-thread hitch we never
-    /// allow; callers run this off the main actor.
+    /// allow; callers run this off the main actor. Folder scope must already
+    /// be held via `LANFolderScopeManager`.
     static func image(at url: URL, maxPixelSize: CGFloat) -> UIImage? {
-        let started = url.startAccessingSecurityScopedResource()
-        defer {
-            if started {
-                url.stopAccessingSecurityScopedResource()
-            }
-        }
-
         let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
             return nil
@@ -133,7 +151,7 @@ enum LANFolderImageLoader {
 }
 
 /// NSCache-backed image access for LAN folder screens. NSCache is thread
-/// safe, so cells can decode on detached tasks without actor hops.
+/// safe, so cells can decode off the main actor.
 final class LANFolderImageCache: @unchecked Sendable {
     static let shared = LANFolderImageCache()
 
@@ -143,15 +161,44 @@ final class LANFolderImageCache: @unchecked Sendable {
         cache.countLimit = 800
     }
 
-    func image(at url: URL, maxPixelSize: CGFloat) -> UIImage? {
-        let key = "\(url.path)#\(Int(maxPixelSize))" as NSString
-        if let hit = cache.object(forKey: key) {
-            return hit
-        }
-        guard let image = LANFolderImageLoader.image(at: url, maxPixelSize: maxPixelSize) else {
-            return nil
-        }
+    func image(forKey key: NSString) -> UIImage? {
+        cache.object(forKey: key)
+    }
+
+    func store(_ image: UIImage, forKey key: NSString) {
         cache.setObject(image, forKey: key)
-        return image
+    }
+}
+
+/// Bounded loader for LAN folder images. SMB reads are network round trips:
+/// letting every visible cell run a blocking decode on a detached task once
+/// starved Swift's cooperative thread pool and froze the entire app. Loads
+/// are capped at three in flight, cache hits skip the gate, and waiters park
+/// on this GCD queue instead of blocking concurrency threads.
+enum LANFolderImageLoaderQueue {
+    private static let queue = DispatchQueue(
+        label: "com.misswell.PhotoVault.lan-image-load",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
+    private static let loadGate = DispatchSemaphore(value: 3)
+
+    static func load(at url: URL, maxPixelSize: CGFloat) async -> UIImage? {
+        await withCheckedContinuation { continuation in
+            queue.async {
+                let key = "\(url.path)#\(Int(maxPixelSize))" as NSString
+                if let cached = LANFolderImageCache.shared.image(forKey: key) {
+                    continuation.resume(returning: cached)
+                    return
+                }
+                loadGate.wait()
+                let image = LANFolderImageLoader.image(at: url, maxPixelSize: maxPixelSize)
+                loadGate.signal()
+                if let image {
+                    LANFolderImageCache.shared.store(image, forKey: key)
+                }
+                continuation.resume(returning: image)
+            }
+        }
     }
 }

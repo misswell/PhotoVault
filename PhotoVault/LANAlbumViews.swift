@@ -215,10 +215,12 @@ struct LANFolderGridScreen: View {
         isEnumerating = files.isEmpty
         enumerateError = nil
         let album = folder
-        let result = await Task.detached(priority: .userInitiated) {
-            LANFolderLibrary.resolve(album).map {
-                LANFolderImageLoader.enumerateImageFiles(under: $0)
-            }
+        let result: [URL]? = await Task.detached(priority: .userInitiated) {
+            guard let url = LANFolderLibrary.resolve(album) else { return nil }
+            // Hold the security scope for the whole session; re-acquiring it
+            // on every visit stalled the album behind provider round trips.
+            LANFolderScopeManager.shared.activate(id: album.id, url: url)
+            return LANFolderImageLoader.enumerateImageFiles(under: url)
         }.value
         files = result ?? []
         if result == nil {
@@ -248,9 +250,10 @@ private struct LANFolderImageView: View {
             }
         }
         .task(id: "\(url.path)#\(Int(maxPixelSize))") {
-            image = await Task.detached(priority: .userInitiated) {
-                LANFolderImageCache.shared.image(at: url, maxPixelSize: maxPixelSize)
-            }.value
+            image = await LANFolderImageLoaderQueue.load(
+                at: url,
+                maxPixelSize: maxPixelSize
+            )
         }
     }
 }
