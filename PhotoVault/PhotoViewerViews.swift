@@ -326,6 +326,11 @@ private enum ViewerDragAxis: Equatable {
     case horizontal
 }
 
+private struct ViewerDismissDrag {
+    let translation: CGSize
+    let predictedEndTranslation: CGSize
+}
+
 private struct ViewerMediaView: View {
     let asset: PHAsset
     let targetSize: CGSize
@@ -395,6 +400,9 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
     let neighborPriority: PhotoRequestPriority
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
+    let onPagingChanged: ((Bool) -> Void)?
+    let onDismissDragChanged: ((ViewerDismissDrag) -> Void)?
+    let onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         PagerDiagnostics.beginSession()
@@ -421,7 +429,10 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             contentMode: contentMode,
             neighborPriority: neighborPriority,
             onMediaReady: onMediaReady,
-            onZoomingChanged: onZoomingChanged
+            onZoomingChanged: onZoomingChanged,
+            onPagingChanged: onPagingChanged,
+            onDismissDragChanged: onDismissDragChanged,
+            onDismissDragEnded: onDismissDragEnded
         )
         return controller
     }
@@ -439,7 +450,10 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             contentMode: contentMode,
             neighborPriority: neighborPriority,
             onMediaReady: onMediaReady,
-            onZoomingChanged: onZoomingChanged
+            onZoomingChanged: onZoomingChanged,
+            onPagingChanged: onPagingChanged,
+            onDismissDragChanged: onDismissDragChanged,
+            onDismissDragEnded: onDismissDragEnded
         )
     }
 
@@ -451,7 +465,8 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, UIPageViewControllerDataSource, UIPageViewControllerDelegate {
+    final class Coordinator: NSObject, UIPageViewControllerDataSource,
+        UIPageViewControllerDelegate, UIGestureRecognizerDelegate {
         private weak var pageController: UIPageViewController?
         private var pageCount = 0
         private var displayedIndex: Int?
@@ -461,12 +476,18 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         private var neighborPriority: PhotoRequestPriority = .slideshow
         private var onMediaReady: ((Bool) -> Void)?
         private var onZoomingChanged: ((Bool) -> Void)?
+        private var onPagingChanged: ((Bool) -> Void)?
+        private var onDismissDragChanged: ((ViewerDismissDrag) -> Void)?
+        private var onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
+        private var dismissPanGesture: UIPanGestureRecognizer?
         private var isZooming = false
         private var pages: [Int: PhotoPagerPageController] = [:]
         private var currentIndexBinding: Binding<Int>
         private var pendingProgrammaticIndex: Int?
         private var isScrubbing = false
         private var lastUpdateSignature = ""
+        private var lastPageContentSignature = ""
+        private var isManualTransitionInProgress = false
 
         init(currentIndex: Binding<Int>) {
             currentIndexBinding = currentIndex
@@ -475,6 +496,24 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
 
         func attach(controller: UIPageViewController) {
             pageController = controller
+            let dismissPan = UIPanGestureRecognizer(
+                target: self,
+                action: #selector(handleDismissPan(_:))
+            )
+            dismissPan.delegate = self
+            dismissPan.cancelsTouchesInView = false
+            dismissPan.maximumNumberOfTouches = 1
+            controller.view.addGestureRecognizer(dismissPan)
+            dismissPanGesture = dismissPan
+
+            // Decide vertical dismissal before UIKit's horizontal scroll view
+            // is allowed to begin. A horizontal pan makes this recognizer fail
+            // immediately, then the page controller owns the gesture alone.
+            if let pageScrollView = controller.view.subviews
+                .compactMap({ $0 as? UIScrollView })
+                .first {
+                pageScrollView.panGestureRecognizer.require(toFail: dismissPan)
+            }
         }
 
         func invalidate() {
@@ -490,6 +529,11 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             pageController?.dataSource = nil
             pageController?.delegate = nil
             pageController?.view.isUserInteractionEnabled = false
+            if let dismissPanGesture {
+                dismissPanGesture.delegate = nil
+                dismissPanGesture.view?.removeGestureRecognizer(dismissPanGesture)
+                self.dismissPanGesture = nil
+            }
             pages.removeAll()
             pendingProgrammaticIndex = nil
             displayedIndex = nil
@@ -497,8 +541,15 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                 isZooming = false
                 onZoomingChanged?(false)
             }
+            if isManualTransitionInProgress {
+                isManualTransitionInProgress = false
+                onPagingChanged?(false)
+            }
             onMediaReady = nil
             onZoomingChanged = nil
+            onPagingChanged = nil
+            onDismissDragChanged = nil
+            onDismissDragEnded = nil
             assetProvider = { _ in nil }
             pageController = nil
         }
@@ -512,7 +563,10 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             contentMode: PHImageContentMode,
             neighborPriority: PhotoRequestPriority,
             onMediaReady: ((Bool) -> Void)?,
-            onZoomingChanged: ((Bool) -> Void)?
+            onZoomingChanged: ((Bool) -> Void)?,
+            onPagingChanged: ((Bool) -> Void)?,
+            onDismissDragChanged: ((ViewerDismissDrag) -> Void)?,
+            onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
         ) {
             self.pageCount = max(0, pageCount)
             self.assetProvider = assetProvider
@@ -521,6 +575,9 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             self.neighborPriority = neighborPriority
             self.onMediaReady = onMediaReady
             self.onZoomingChanged = onZoomingChanged
+            self.onPagingChanged = onPagingChanged
+            self.onDismissDragChanged = onDismissDragChanged
+            self.onDismissDragEnded = onDismissDragEnded
             self.isScrubbing = isScrubbing
 
             guard self.pageCount > 0,
@@ -540,11 +597,21 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                 PagerDiagnostics.log("update \(updateSignature)")
             }
 
-            refreshPages(around: clampedIndex)
-
             guard let displayedIndex else {
                 setInitialPage(to: clampedIndex)
                 return
+            }
+
+            let pageContentSignature = makePageContentSignature(around: clampedIndex)
+            if pageContentSignature != lastPageContentSignature {
+                lastPageContentSignature = pageContentSignature
+                if isManualTransitionInProgress || pendingProgrammaticIndex != nil {
+                    // The completed transition refreshes the stable pages.
+                    // Never replace a hosting controller's root view while
+                    // UIPageViewController is tracking an interactive scroll.
+                } else {
+                    refreshPages(around: clampedIndex)
+                }
             }
 
             if displayedIndex != clampedIndex {
@@ -569,6 +636,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                             isZooming = false
                             onZoomingChanged?(false)
                         }
+                        refreshPages(around: clampedIndex)
                     }
                     return
                 }
@@ -615,6 +683,82 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             }
         }
 
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard gestureRecognizer === dismissPanGesture,
+                  let dismissPan = gestureRecognizer as? UIPanGestureRecognizer,
+                  !isZooming,
+                  !isManualTransitionInProgress,
+                  pendingProgrammaticIndex == nil
+            else { return false }
+
+            let coordinateView = dismissPan.view?.window ?? dismissPan.view
+            let velocity = dismissPan.velocity(in: coordinateView)
+            let translation = dismissPan.translation(in: coordinateView)
+            let horizontalVelocity = abs(velocity.x)
+            let downwardVelocity = velocity.y
+            let isClearlyDownward: Bool
+            if max(horizontalVelocity, abs(downwardVelocity)) >= 80 {
+                isClearlyDownward = downwardVelocity > 0
+                    && downwardVelocity > horizontalVelocity * 1.3
+            } else {
+                isClearlyDownward = translation.y > 0
+                    && translation.y > abs(translation.x) * 1.3
+            }
+
+            PagerDiagnostics.log(
+                "dismiss pan decision accepted=\(isClearlyDownward) velocity=(\(Int(velocity.x)),\(Int(velocity.y)))"
+            )
+            return isClearlyDownward
+        }
+
+        @objc private func handleDismissPan(_ recognizer: UIPanGestureRecognizer) {
+            guard let view = recognizer.view else { return }
+            let coordinateView = view.window ?? view.superview ?? view
+            let translation = recognizer.translation(in: coordinateView)
+            let velocity = recognizer.velocity(in: coordinateView)
+            let projectionDuration: CGFloat = 0.2
+            let sample = ViewerDismissDrag(
+                translation: CGSize(
+                    width: translation.x,
+                    height: translation.y
+                ),
+                predictedEndTranslation: CGSize(
+                    width: translation.x + velocity.x * projectionDuration,
+                    height: translation.y + velocity.y * projectionDuration
+                )
+            )
+
+            switch recognizer.state {
+            case .began:
+                PagerDiagnostics.log("dismiss pan began")
+                onDismissDragChanged?(sample)
+            case .changed:
+                onDismissDragChanged?(sample)
+            case .ended:
+                PagerDiagnostics.log(
+                    "dismiss pan ended translation=\(Int(translation.y)) velocity=\(Int(velocity.y))"
+                )
+                onDismissDragEnded?(sample, false)
+            case .cancelled, .failed:
+                PagerDiagnostics.log("dismiss pan cancelled")
+                onDismissDragEnded?(sample, true)
+            default:
+                break
+            }
+        }
+
+        func pageViewController(
+            _ pageViewController: UIPageViewController,
+            willTransitionTo pendingViewControllers: [UIViewController]
+        ) {
+            isManualTransitionInProgress = true
+            onPagingChanged?(true)
+            let target = (pendingViewControllers.first as? PhotoPagerPageController)?.index
+            PagerDiagnostics.log(
+                "transition began target=\(target.map(String.init) ?? "none")"
+            )
+        }
+
         func pageViewController(
             _ pageViewController: UIPageViewController,
             viewControllerBefore viewController: UIViewController
@@ -652,22 +796,29 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             PagerDiagnostics.log(
                 "transition finished=\(finished) completed=\(completed) visible=\(visibleIndex)"
             )
-            guard finished,
-                  completed,
-                  let visiblePage = pageViewController.viewControllers?.first as? PhotoPagerPageController
-            else { return }
+            isManualTransitionInProgress = false
+            onPagingChanged?(false)
 
-            let newIndex = visiblePage.index
-            pendingProgrammaticIndex = nil
-            displayedIndex = newIndex
-            if isZooming {
-                isZooming = false
-                onZoomingChanged?(false)
+            if finished,
+               completed,
+               let visiblePage = pageViewController.viewControllers?
+                .first as? PhotoPagerPageController {
+                let newIndex = visiblePage.index
+                pendingProgrammaticIndex = nil
+                displayedIndex = newIndex
+                lastPageContentSignature = makePageContentSignature(around: newIndex)
+                if isZooming {
+                    isZooming = false
+                    onZoomingChanged?(false)
+                }
+
+                if currentIndexBinding.wrappedValue != newIndex {
+                    currentIndexBinding.wrappedValue = newIndex
+                }
             }
-            refreshPages(around: newIndex)
 
-            if currentIndexBinding.wrappedValue != newIndex {
-                currentIndexBinding.wrappedValue = newIndex
+            if let stableIndex = displayedIndex {
+                refreshPages(around: stableIndex)
             }
         }
 
@@ -681,6 +832,8 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                 animated: false
             )
             displayedIndex = index
+            lastPageContentSignature = makePageContentSignature(around: index)
+            refreshPages(around: index)
             if isZooming {
                 isZooming = false
                 onZoomingChanged?(false)
@@ -691,7 +844,6 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             guard index >= 0, index < pageCount else { return nil }
 
             if let existing = pages[index] {
-                existing.rootView = makePageView(for: index)
                 return existing
             }
 
@@ -702,6 +854,21 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             )
             pages[index] = page
             return page
+        }
+
+        private func makePageContentSignature(around index: Int) -> String {
+            let assetIDs = ((index - 1)...(index + 1)).map { candidate -> String in
+                guard candidate >= 0, candidate < pageCount else { return "edge" }
+                return assetProvider(candidate)?.localIdentifier ?? "pending"
+            }
+            return [
+                String(pageCount),
+                String(Int(targetSize.width.rounded())),
+                String(Int(targetSize.height.rounded())),
+                String(contentMode.rawValue),
+                String(neighborPriority.rawValue),
+                assetIDs.joined(separator: ",")
+            ].joined(separator: "|")
         }
 
         private func makePageView(for index: Int) -> AnyView {
@@ -759,7 +926,11 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             )
 
             for nearbyIndex in nearbyIndexes {
-                _ = page(at: nearbyIndex)
+                if let existing = pages[nearbyIndex] {
+                    existing.rootView = makePageView(for: nearbyIndex)
+                } else {
+                    _ = page(at: nearbyIndex)
+                }
             }
 
             pages = pages.filter { nearbyIndexes.contains($0.key) }
@@ -987,7 +1158,7 @@ private struct VideoAssetViewer: View {
     }
 }
 
-struct AssetPager: View {
+private struct AssetPager: View {
     let assets: PHFetchResult<PHAsset>
     @Binding var currentIndex: Int
     let targetSize: CGSize
@@ -995,12 +1166,16 @@ struct AssetPager: View {
     let neighborPriority: PhotoRequestPriority
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
+    let onPagingChanged: ((Bool) -> Void)?
+    let onDismissDragChanged: ((ViewerDismissDrag) -> Void)?
+    let onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
     // True while the user is scrubbing the filmstrip: transitions become
     // instant swaps so the main photo tracks the strip in real time.
     let isScrubbing: Bool
 
     @State private var isZooming = false
     @State private var customDirection = 1
+    @State private var customDragAxis = ViewerDragAxis.undecided
     @AppStorage(PhotoSwipeStyle.storageKey)
     private var swipeStyleRawValue = PhotoSwipeStyle.system.rawValue
 
@@ -1012,6 +1187,9 @@ struct AssetPager: View {
         neighborPriority: PhotoRequestPriority = .slideshow,
         onMediaReady: ((Bool) -> Void)? = nil,
         onZoomingChanged: ((Bool) -> Void)? = nil,
+        onPagingChanged: ((Bool) -> Void)? = nil,
+        onDismissDragChanged: ((ViewerDismissDrag) -> Void)? = nil,
+        onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)? = nil,
         isScrubbing: Bool = false
     ) {
         self.assets = assets
@@ -1021,6 +1199,9 @@ struct AssetPager: View {
         self.neighborPriority = neighborPriority
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
+        self.onPagingChanged = onPagingChanged
+        self.onDismissDragChanged = onDismissDragChanged
+        self.onDismissDragEnded = onDismissDragEnded
         self.isScrubbing = isScrubbing
     }
 
@@ -1073,7 +1254,10 @@ struct AssetPager: View {
             contentMode: contentMode,
             neighborPriority: neighborPriority,
             onMediaReady: onMediaReady,
-            onZoomingChanged: onZoomingChanged
+            onZoomingChanged: onZoomingChanged,
+            onPagingChanged: onPagingChanged,
+            onDismissDragChanged: onDismissDragChanged,
+            onDismissDragEnded: onDismissDragEnded
         )
     }
 
@@ -1104,9 +1288,62 @@ struct AssetPager: View {
     }
 
     private var customSwipeGesture: some Gesture {
-        DragGesture(minimumDistance: 24)
-            .onEnded { value in
+        DragGesture(minimumDistance: 12)
+            .onChanged { value in
                 guard !isZooming else { return }
+                let horizontalDistance = abs(value.translation.width)
+                let verticalDistance = value.translation.height
+
+                if customDragAxis == .undecided {
+                    guard max(horizontalDistance, abs(verticalDistance)) >= 14 else { return }
+                    if verticalDistance >= 18,
+                       verticalDistance > horizontalDistance * 1.3 {
+                        customDragAxis = .vertical
+                    } else if horizontalDistance > abs(verticalDistance) * 1.15
+                                || verticalDistance <= 0 {
+                        customDragAxis = .horizontal
+                    } else {
+                        return
+                    }
+                }
+
+                guard customDragAxis == .vertical else { return }
+                if horizontalDistance > verticalDistance * 1.2 {
+                    customDragAxis = .horizontal
+                    onDismissDragEnded?(
+                        ViewerDismissDrag(
+                            translation: value.translation,
+                            predictedEndTranslation: value.predictedEndTranslation
+                        ),
+                        true
+                    )
+                    return
+                }
+                onDismissDragChanged?(
+                    ViewerDismissDrag(
+                        translation: value.translation,
+                        predictedEndTranslation: value.predictedEndTranslation
+                    )
+                )
+            }
+            .onEnded { value in
+                let resolvedAxis = customDragAxis
+                customDragAxis = .undecided
+                let sample = ViewerDismissDrag(
+                    translation: value.translation,
+                    predictedEndTranslation: value.predictedEndTranslation
+                )
+                guard !isZooming else {
+                    onDismissDragEnded?(sample, true)
+                    return
+                }
+                if resolvedAxis == .vertical {
+                    let isStillVertical = value.translation.height
+                        > abs(value.translation.width) * 1.2
+                    onDismissDragEnded?(sample, !isStillVertical)
+                    return
+                }
+                guard resolvedAxis == .horizontal else { return }
                 let horizontalDistance = abs(value.translation.width)
                 let verticalDistance = abs(value.translation.height)
                 guard horizontalDistance > 72,
@@ -1144,11 +1381,11 @@ struct PhotoViewerView: View {
     @State private var isScrubbingFilmstrip = false
     @State private var dismissDragOffset: CGSize = .zero
     @State private var isZooming = false
+    @State private var isPaging = false
     @State private var isDismissing = false
     @State private var presentationProgress: CGFloat = 0
     @State private var dismissalOpacity: Double = 1
     @State private var viewportHeight: CGFloat = 844
-    @State private var dismissDragAxis = ViewerDragAxis.undecided
     @State private var crossedDismissThreshold = false
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
@@ -1178,52 +1415,56 @@ struct PhotoViewerView: View {
                 Color.black.opacity(ViewerMotion.backgroundOpacity(progress: dismissProgress))
                     .ignoresSafeArea()
 
+                // Keep UIKit's page controller on its original stable layer.
+                // Transforming a container around UIPageViewController during
+                // an interactive scroll can invalidate UIKit's transition
+                // bookkeeping. The pure-SwiftUI chrome mirrors the same drag
+                // offset independently below, which keeps positions aligned
+                // without disturbing the pager hierarchy.
                 GeometryReader { proxy in
-                    AssetPager(
-                        assets: assets,
-                        currentIndex: $currentIndex,
-                        targetSize: mediaTargetSize(for: proxy.size),
-                        contentMode: viewerContentMode,
-                        onZoomingChanged: { zooming in
-                            isZooming = zooming
-                        },
-                        isScrubbing: isScrubbingFilmstrip
-                    )
-                    .frame(width: proxy.size.width, height: proxy.size.height)
-                    .offset(dismissDragOffset)
-                    .scaleEffect(
-                        ViewerMotion.mediaScale(
-                            progress: dismissProgress,
-                            reduceMotion: accessibilityReduceMotion
+                        AssetPager(
+                            assets: assets,
+                            currentIndex: $currentIndex,
+                            targetSize: mediaTargetSize(for: proxy.size),
+                            contentMode: viewerContentMode,
+                            onZoomingChanged: { zooming in
+                                isZooming = zooming
+                            },
+                            onPagingChanged: handlePagingChanged,
+                            onDismissDragChanged: handleDismissDragChanged,
+                            onDismissDragEnded: handleDismissDragEnded,
+                            isScrubbing: isScrubbingFilmstrip
                         )
-                    )
-                    .clipShape(
-                        RoundedRectangle(
-                            cornerRadius: ViewerMotion.cornerRadius(
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .offset(dismissDragOffset)
+                        .scaleEffect(
+                            ViewerMotion.mediaScale(
                                 progress: dismissProgress,
                                 reduceMotion: accessibilityReduceMotion
-                            ),
-                            style: .continuous
+                            )
                         )
-                    )
-                    .opacity(ViewerMotion.mediaOpacity(progress: dismissProgress))
-                    .shadow(
-                        color: .black.opacity(Double(dismissProgress) * 0.32),
-                        radius: dismissProgress * 24,
-                        y: dismissProgress * 10
-                    )
-                    .contentShape(Rectangle())
-                    .simultaneousGesture(
-                        TapGesture().onEnded {
-                            toggleControls()
-                        }
-                    )
-                    // Keep the Photos-style pull-down-to-dismiss interaction
-                    // simultaneous with the page controller. The gesture only
-                    // changes state for a clearly vertical drag, so horizontal
-                    // swipes remain owned by the photo pager.
-                    .simultaneousGesture(dismissGesture)
-                    .allowsHitTesting(!isDismissing)
+                        .clipShape(
+                            RoundedRectangle(
+                                cornerRadius: ViewerMotion.cornerRadius(
+                                    progress: dismissProgress,
+                                    reduceMotion: accessibilityReduceMotion
+                                ),
+                                style: .continuous
+                            )
+                        )
+                        .opacity(ViewerMotion.mediaOpacity(progress: dismissProgress))
+                        .shadow(
+                            color: .black.opacity(Double(dismissProgress) * 0.32),
+                            radius: dismissProgress * 24,
+                            y: dismissProgress * 10
+                        )
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(
+                            TapGesture().onEnded {
+                                toggleControls()
+                            }
+                        )
+                        .allowsHitTesting(!isDismissing)
                 }
                 // Only the media canvas is allowed to extend under the status bar
                 // and home indicator. Keep the control layer in the cover's safe
@@ -1231,35 +1472,42 @@ struct PhotoViewerView: View {
                 .ignoresSafeArea(.container, edges: .all)
 
                 VStack(spacing: 0) {
-                    topBar
-                        .opacity(chromeOpacity)
-                        .offset(y: controlsVisible ? -dismissProgress * 10 : -18)
+                        topBar
+                            .opacity(chromeOpacity)
+                            .offset(y: controlsVisible ? 0 : -18)
 
-                    Spacer()
+                        Spacer()
 
-                    VStack(spacing: 0) {
-                        if assets.count > 0 {
-                            ViewerFilmstrip(
-                                assets: assets,
-                                currentIndex: $currentIndex,
-                                position: $filmstripPosition,
-                                onScrubbingChanged: { scrubbing in
-                                    isScrubbingFilmstrip = scrubbing
-                                }
-                            )
-                            .frame(height: 64)
-                            .background(
-                                .ultraThinMaterial,
-                                in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            )
-                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                            .padding(.horizontal, 10)
+                        VStack(spacing: 0) {
+                            if assets.count > 0 {
+                                ViewerFilmstrip(
+                                    assets: assets,
+                                    currentIndex: $currentIndex,
+                                    position: $filmstripPosition,
+                                    onScrubbingChanged: { scrubbing in
+                                        isScrubbingFilmstrip = scrubbing
+                                    }
+                                )
+                                .frame(height: 64)
+                                .background(
+                                    .ultraThinMaterial,
+                                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                )
+                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .padding(.horizontal, 10)
+                            }
+                            bottomBar
                         }
-                        bottomBar
-                    }
-                    .opacity(chromeOpacity)
-                    .offset(y: controlsVisible ? dismissProgress * 18 : 24)
+                        .opacity(chromeOpacity)
+                        .offset(y: controlsVisible ? 0 : 24)
                 }
+                .offset(dismissDragOffset)
+                .scaleEffect(
+                    ViewerMotion.mediaScale(
+                        progress: dismissProgress,
+                        reduceMotion: accessibilityReduceMotion
+                    )
+                )
                 .animation(chromeAnimation, value: controlsVisible)
                 .allowsHitTesting(controlsVisible && !isDismissing)
             }
@@ -1324,7 +1572,7 @@ struct PhotoViewerView: View {
         .onAppear {
             isDismissing = false
             dismissalOpacity = 1
-            dismissDragAxis = .undecided
+            isPaging = false
             crossedDismissThreshold = false
             PagerDiagnostics.log(
                 "viewer appear kind=fetch count=\(assets.count) index=\(currentIndex)"
@@ -1406,78 +1654,74 @@ struct PhotoViewerView: View {
         )
     }
 
-    private var dismissGesture: some Gesture {
-        DragGesture(minimumDistance: 12)
-            .onChanged { value in
-                guard !isDismissing, !isZooming else { return }
+    private func handleDismissDragChanged(_ drag: ViewerDismissDrag) {
+        guard !isDismissing, !isZooming, !isPaging else { return }
+        dismissDragOffset = CGSize(
+            width: drag.translation.width * 0.12,
+            height: max(0, drag.translation.height)
+        )
 
-                if dismissDragAxis == .undecided {
-                    let horizontalDistance = abs(value.translation.width)
-                    let verticalDistance = value.translation.height
-                    guard max(horizontalDistance, abs(verticalDistance)) >= 8 else { return }
-
-                    if verticalDistance > 0,
-                       verticalDistance > horizontalDistance * 1.08 {
-                        dismissDragAxis = .vertical
-                    } else if horizontalDistance > abs(verticalDistance) * 1.08
-                                || verticalDistance <= 0 {
-                        dismissDragAxis = .horizontal
-                    } else {
-                        return
-                    }
-                }
-
-                guard dismissDragAxis == .vertical else { return }
-
-                dismissDragOffset = CGSize(
-                    width: value.translation.width * 0.12,
-                    height: max(0, value.translation.height)
-                )
-
-                let shouldDismiss = ViewerMotion.shouldDismiss(
-                    translation: value.translation.height,
-                    predictedTranslation: value.predictedEndTranslation.height,
-                    viewportHeight: viewportHeight
-                )
-                if shouldDismiss != crossedDismissThreshold {
-                    if shouldDismiss {
-                        UIImpactFeedbackGenerator(style: .soft)
-                            .impactOccurred(intensity: 0.65)
-                    }
-                    crossedDismissThreshold = shouldDismiss
-                }
+        let shouldDismiss = ViewerMotion.shouldDismiss(
+            translation: drag.translation.height,
+            predictedTranslation: drag.predictedEndTranslation.height,
+            viewportHeight: viewportHeight
+        )
+        if shouldDismiss != crossedDismissThreshold {
+            if shouldDismiss {
+                UIImpactFeedbackGenerator(style: .soft)
+                    .impactOccurred(intensity: 0.65)
             }
-            .onEnded { value in
-                let resolvedAxis = dismissDragAxis
-                dismissDragAxis = .undecided
-                crossedDismissThreshold = false
-                guard !isDismissing, !isZooming else { return }
-                guard resolvedAxis == .vertical else {
-                    resetDismissOffset()
-                    return
-                }
+            crossedDismissThreshold = shouldDismiss
+        }
+    }
 
-                let shouldDismiss = ViewerMotion.shouldDismiss(
-                    translation: value.translation.height,
-                    predictedTranslation: value.predictedEndTranslation.height,
-                    viewportHeight: viewportHeight
-                )
-                if shouldDismiss {
-                    requestDismiss(reason: "pull-down")
-                } else {
-                    resetDismissOffset()
-                }
-            }
+    private func handleDismissDragEnded(_ drag: ViewerDismissDrag, cancelled: Bool) {
+        crossedDismissThreshold = false
+        guard !cancelled, !isDismissing, !isZooming, !isPaging else {
+            resetDismissOffset()
+            return
+        }
+
+        let shouldDismiss = ViewerMotion.shouldDismiss(
+            translation: drag.translation.height,
+            predictedTranslation: drag.predictedEndTranslation.height,
+            viewportHeight: viewportHeight
+        )
+        if shouldDismiss {
+            requestDismiss(reason: "pull-down")
+        } else {
+            resetDismissOffset()
+        }
     }
 
     private func requestDismiss(reason: String) {
-        guard !isDismissing else { return }
+        guard !isDismissing, !isPaging else {
+            if isPaging {
+                PagerDiagnostics.log(
+                    "viewer dismiss ignored kind=fetch reason=\(reason) paging=true index=\(currentIndex)"
+                )
+            }
+            return
+        }
         isDismissing = true
         crossedDismissThreshold = false
         PagerDiagnostics.log(
             "viewer dismiss requested kind=fetch reason=\(reason) index=\(currentIndex)"
         )
         finishDismissAnimation(reason: reason)
+    }
+
+    private func handlePagingChanged(_ paging: Bool) {
+        isPaging = paging
+        guard paging else { return }
+        crossedDismissThreshold = false
+        if dismissDragOffset != .zero {
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                dismissDragOffset = .zero
+            }
+        }
     }
 
     private func finishDismissAnimation(reason: String) {
@@ -1595,6 +1839,28 @@ struct PhotoViewerView: View {
             .animation(.snappy(duration: 0.22), value: isFavorite)
             .disabled(assets.count == 0)
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
+
+            Spacer()
+
+            viewerBarAction {
+                guard assets.count > 0 else { return }
+                let asset = assets.object(at: currentIndex)
+                if store.isInRecycleBin(asset) {
+                    store.removeFromRecycleBin(asset)
+                } else {
+                    store.addToRecycleBin(asset)
+                }
+            } label: {
+                Image(systemName: assets.count > 0
+                    && store.isInRecycleBin(assets.object(at: currentIndex))
+                    ? "trash.slash"
+                    : "trash")
+            }
+            .disabled(assets.count == 0)
+            .accessibilityLabel(assets.count > 0
+                && store.isInRecycleBin(assets.object(at: currentIndex))
+                ? "移出回收站"
+                : "加入回收站")
 
             Spacer()
 
@@ -2141,6 +2407,9 @@ private struct IndexedAssetPager: View {
     let neighborPriority: PhotoRequestPriority
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
+    let onPagingChanged: ((Bool) -> Void)?
+    let onDismissDragChanged: ((ViewerDismissDrag) -> Void)?
+    let onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
     // True while the user is scrubbing the filmstrip: transitions become
     // instant swaps so the main photo tracks the strip in real time.
     let isScrubbing: Bool
@@ -2155,6 +2424,7 @@ private struct IndexedAssetPager: View {
     @State private var loadError: String?
     @State private var isZooming = false
     @State private var customDirection = 1
+    @State private var customDragAxis = ViewerDragAxis.undecided
     @AppStorage(PhotoSwipeStyle.storageKey)
     private var swipeStyleRawValue = PhotoSwipeStyle.system.rawValue
 
@@ -2170,6 +2440,9 @@ private struct IndexedAssetPager: View {
         neighborPriority: PhotoRequestPriority = .slideshow,
         onMediaReady: ((Bool) -> Void)? = nil,
         onZoomingChanged: ((Bool) -> Void)? = nil,
+        onPagingChanged: ((Bool) -> Void)? = nil,
+        onDismissDragChanged: ((ViewerDismissDrag) -> Void)? = nil,
+        onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)? = nil,
         isScrubbing: Bool = false,
         isIndexingUnsorted: Bool = false
     ) {
@@ -2182,6 +2455,9 @@ private struct IndexedAssetPager: View {
         self.neighborPriority = neighborPriority
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
+        self.onPagingChanged = onPagingChanged
+        self.onDismissDragChanged = onDismissDragChanged
+        self.onDismissDragEnded = onDismissDragEnded
         self.isScrubbing = isScrubbing
         self.isIndexingUnsorted = isIndexingUnsorted
     }
@@ -2293,7 +2569,10 @@ private struct IndexedAssetPager: View {
             contentMode: contentMode,
             neighborPriority: neighborPriority,
             onMediaReady: onMediaReady,
-            onZoomingChanged: onZoomingChanged
+            onZoomingChanged: onZoomingChanged,
+            onPagingChanged: onPagingChanged,
+            onDismissDragChanged: onDismissDragChanged,
+            onDismissDragEnded: onDismissDragEnded
         )
     }
 
@@ -2333,9 +2612,62 @@ private struct IndexedAssetPager: View {
     }
 
     private var customSwipeGesture: some Gesture {
-        DragGesture(minimumDistance: 24)
-            .onEnded { value in
+        DragGesture(minimumDistance: 12)
+            .onChanged { value in
                 guard !isZooming else { return }
+                let horizontalDistance = abs(value.translation.width)
+                let verticalDistance = value.translation.height
+
+                if customDragAxis == .undecided {
+                    guard max(horizontalDistance, abs(verticalDistance)) >= 14 else { return }
+                    if verticalDistance >= 18,
+                       verticalDistance > horizontalDistance * 1.3 {
+                        customDragAxis = .vertical
+                    } else if horizontalDistance > abs(verticalDistance) * 1.15
+                                || verticalDistance <= 0 {
+                        customDragAxis = .horizontal
+                    } else {
+                        return
+                    }
+                }
+
+                guard customDragAxis == .vertical else { return }
+                if horizontalDistance > verticalDistance * 1.2 {
+                    customDragAxis = .horizontal
+                    onDismissDragEnded?(
+                        ViewerDismissDrag(
+                            translation: value.translation,
+                            predictedEndTranslation: value.predictedEndTranslation
+                        ),
+                        true
+                    )
+                    return
+                }
+                onDismissDragChanged?(
+                    ViewerDismissDrag(
+                        translation: value.translation,
+                        predictedEndTranslation: value.predictedEndTranslation
+                    )
+                )
+            }
+            .onEnded { value in
+                let resolvedAxis = customDragAxis
+                customDragAxis = .undecided
+                let sample = ViewerDismissDrag(
+                    translation: value.translation,
+                    predictedEndTranslation: value.predictedEndTranslation
+                )
+                guard !isZooming else {
+                    onDismissDragEnded?(sample, true)
+                    return
+                }
+                if resolvedAxis == .vertical {
+                    let isStillVertical = value.translation.height
+                        > abs(value.translation.width) * 1.2
+                    onDismissDragEnded?(sample, !isStillVertical)
+                    return
+                }
+                guard resolvedAxis == .horizontal else { return }
                 let horizontalDistance = abs(value.translation.width)
                 let verticalDistance = abs(value.translation.height)
                 guard horizontalDistance > 72,
@@ -2791,11 +3123,11 @@ struct IndexedPhotoViewerView: View {
     @State private var isScrubbingFilmstrip = false
     @State private var dismissDragOffset: CGSize = .zero
     @State private var isZooming = false
+    @State private var isPaging = false
     @State private var isDismissing = false
     @State private var presentationProgress: CGFloat = 0
     @State private var dismissalOpacity: Double = 1
     @State private var viewportHeight: CGFloat = 844
-    @State private var dismissDragAxis = ViewerDragAxis.undecided
     @State private var crossedDismissThreshold = false
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
@@ -2832,84 +3164,96 @@ struct IndexedPhotoViewerView: View {
                 )
                 .ignoresSafeArea()
 
+                // Same stable-layer rule as the regular viewer: never wrap
+                // UIPageViewController in the continuously transformed chrome
+                // container.
                 GeometryReader { proxy in
-                    IndexedAssetPager(
-                        totalCount: totalCount,
-                        store: store,
-                        currentIndex: $currentIndex,
-                        assetsByIndex: $assetsByIndex,
-                        targetSize: mediaTargetSize(for: proxy.size),
-                        contentMode: viewerContentMode,
-                        onZoomingChanged: { zooming in
-                            isZooming = zooming
-                        },
-                        isScrubbing: isScrubbingFilmstrip,
-                        isIndexingUnsorted: store.isIndexingUnsorted
-                    )
-                    .frame(width: proxy.size.width, height: proxy.size.height)
-                    .offset(dismissDragOffset)
-                    .scaleEffect(
-                        ViewerMotion.mediaScale(
-                            progress: dismissProgress,
-                            reduceMotion: accessibilityReduceMotion
+                        IndexedAssetPager(
+                            totalCount: totalCount,
+                            store: store,
+                            currentIndex: $currentIndex,
+                            assetsByIndex: $assetsByIndex,
+                            targetSize: mediaTargetSize(for: proxy.size),
+                            contentMode: viewerContentMode,
+                            onZoomingChanged: { zooming in
+                                isZooming = zooming
+                            },
+                            onPagingChanged: handlePagingChanged,
+                            onDismissDragChanged: handleDismissDragChanged,
+                            onDismissDragEnded: handleDismissDragEnded,
+                            isScrubbing: isScrubbingFilmstrip,
+                            isIndexingUnsorted: store.isIndexingUnsorted
                         )
-                    )
-                    .clipShape(
-                        RoundedRectangle(
-                            cornerRadius: ViewerMotion.cornerRadius(
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .offset(dismissDragOffset)
+                        .scaleEffect(
+                            ViewerMotion.mediaScale(
                                 progress: dismissProgress,
                                 reduceMotion: accessibilityReduceMotion
-                            ),
-                            style: .continuous
+                            )
                         )
-                    )
-                    .opacity(ViewerMotion.mediaOpacity(progress: dismissProgress))
-                    .shadow(
-                        color: .black.opacity(Double(dismissProgress) * 0.32),
-                        radius: dismissProgress * 24,
-                        y: dismissProgress * 10
-                    )
-                    .contentShape(Rectangle())
-                    .simultaneousGesture(
-                        TapGesture().onEnded {
-                            toggleControls()
-                        }
-                    )
-                    .simultaneousGesture(dismissGesture)
-                    .allowsHitTesting(!isDismissing)
+                        .clipShape(
+                            RoundedRectangle(
+                                cornerRadius: ViewerMotion.cornerRadius(
+                                    progress: dismissProgress,
+                                    reduceMotion: accessibilityReduceMotion
+                                ),
+                                style: .continuous
+                            )
+                        )
+                        .opacity(ViewerMotion.mediaOpacity(progress: dismissProgress))
+                        .shadow(
+                            color: .black.opacity(Double(dismissProgress) * 0.32),
+                            radius: dismissProgress * 24,
+                            y: dismissProgress * 10
+                        )
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(
+                            TapGesture().onEnded {
+                                toggleControls()
+                            }
+                        )
+                        .allowsHitTesting(!isDismissing)
                 }
                 .ignoresSafeArea(.container, edges: .all)
 
                 VStack(spacing: 0) {
-                    topBar
-                        .opacity(chromeOpacity)
-                        .offset(y: controlsVisible ? -dismissProgress * 10 : -18)
+                        topBar
+                            .opacity(chromeOpacity)
+                            .offset(y: controlsVisible ? 0 : -18)
 
-                    Spacer()
+                        Spacer()
 
-                    VStack(spacing: 0) {
-                        if totalCount > 0 {
-                            IndexedViewerFilmstrip(
-                                totalCount: totalCount,
-                                store: store,
-                                currentIndex: $currentIndex,
-                                onScrubbingChanged: { scrubbing in
-                                    isScrubbingFilmstrip = scrubbing
-                                }
-                            )
-                            .frame(height: 64)
-                            .background(
-                                .ultraThinMaterial,
-                                in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            )
-                            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                            .padding(.horizontal, 10)
+                        VStack(spacing: 0) {
+                            if totalCount > 0 {
+                                IndexedViewerFilmstrip(
+                                    totalCount: totalCount,
+                                    store: store,
+                                    currentIndex: $currentIndex,
+                                    onScrubbingChanged: { scrubbing in
+                                        isScrubbingFilmstrip = scrubbing
+                                    }
+                                )
+                                .frame(height: 64)
+                                .background(
+                                    .ultraThinMaterial,
+                                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                )
+                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .padding(.horizontal, 10)
+                            }
+                            bottomBar
                         }
-                        bottomBar
-                    }
-                    .opacity(chromeOpacity)
-                    .offset(y: controlsVisible ? dismissProgress * 18 : 24)
+                        .opacity(chromeOpacity)
+                        .offset(y: controlsVisible ? 0 : 24)
                 }
+                .offset(dismissDragOffset)
+                .scaleEffect(
+                    ViewerMotion.mediaScale(
+                        progress: dismissProgress,
+                        reduceMotion: accessibilityReduceMotion
+                    )
+                )
                 .animation(chromeAnimation, value: controlsVisible)
                 .allowsHitTesting(controlsVisible && !isDismissing)
             }
@@ -2970,7 +3314,7 @@ struct IndexedPhotoViewerView: View {
         .onAppear {
             isDismissing = false
             dismissalOpacity = 1
-            dismissDragAxis = .undecided
+            isPaging = false
             crossedDismissThreshold = false
             PagerDiagnostics.log(
                 "viewer appear kind=indexed count=\(totalCount) index=\(currentIndex)"
@@ -3046,76 +3390,73 @@ struct IndexedPhotoViewerView: View {
         )
     }
 
-    private var dismissGesture: some Gesture {
-        DragGesture(minimumDistance: 12)
-            .onChanged { value in
-                guard !isDismissing, !isZooming else { return }
+    private func handleDismissDragChanged(_ drag: ViewerDismissDrag) {
+        guard !isDismissing, !isZooming, !isPaging else { return }
+        dismissDragOffset = CGSize(
+            width: drag.translation.width * 0.12,
+            height: max(0, drag.translation.height)
+        )
 
-                if dismissDragAxis == .undecided {
-                    let horizontalDistance = abs(value.translation.width)
-                    let verticalDistance = value.translation.height
-                    guard max(horizontalDistance, abs(verticalDistance)) >= 8 else { return }
-
-                    if verticalDistance > 0,
-                       verticalDistance > horizontalDistance * 1.08 {
-                        dismissDragAxis = .vertical
-                    } else if horizontalDistance > abs(verticalDistance) * 1.08
-                                || verticalDistance <= 0 {
-                        dismissDragAxis = .horizontal
-                    } else {
-                        return
-                    }
-                }
-
-                guard dismissDragAxis == .vertical else { return }
-                dismissDragOffset = CGSize(
-                    width: value.translation.width * 0.12,
-                    height: max(0, value.translation.height)
-                )
-
-                let shouldDismiss = ViewerMotion.shouldDismiss(
-                    translation: value.translation.height,
-                    predictedTranslation: value.predictedEndTranslation.height,
-                    viewportHeight: viewportHeight
-                )
-                if shouldDismiss != crossedDismissThreshold {
-                    if shouldDismiss {
-                        UIImpactFeedbackGenerator(style: .soft)
-                            .impactOccurred(intensity: 0.65)
-                    }
-                    crossedDismissThreshold = shouldDismiss
-                }
+        let shouldDismiss = ViewerMotion.shouldDismiss(
+            translation: drag.translation.height,
+            predictedTranslation: drag.predictedEndTranslation.height,
+            viewportHeight: viewportHeight
+        )
+        if shouldDismiss != crossedDismissThreshold {
+            if shouldDismiss {
+                UIImpactFeedbackGenerator(style: .soft)
+                    .impactOccurred(intensity: 0.65)
             }
-            .onEnded { value in
-                let resolvedAxis = dismissDragAxis
-                dismissDragAxis = .undecided
-                crossedDismissThreshold = false
-                guard !isDismissing, !isZooming else { return }
-                guard resolvedAxis == .vertical else {
-                    resetDismissOffset()
-                    return
-                }
+            crossedDismissThreshold = shouldDismiss
+        }
+    }
 
-                if ViewerMotion.shouldDismiss(
-                    translation: value.translation.height,
-                    predictedTranslation: value.predictedEndTranslation.height,
-                    viewportHeight: viewportHeight
-                ) {
-                    requestDismiss(reason: "pull-down")
-                } else {
-                    resetDismissOffset()
-                }
-            }
+    private func handleDismissDragEnded(_ drag: ViewerDismissDrag, cancelled: Bool) {
+        crossedDismissThreshold = false
+        guard !cancelled, !isDismissing, !isZooming, !isPaging else {
+            resetDismissOffset()
+            return
+        }
+
+        if ViewerMotion.shouldDismiss(
+            translation: drag.translation.height,
+            predictedTranslation: drag.predictedEndTranslation.height,
+            viewportHeight: viewportHeight
+        ) {
+            requestDismiss(reason: "pull-down")
+        } else {
+            resetDismissOffset()
+        }
     }
 
     private func requestDismiss(reason: String) {
-        guard !isDismissing else { return }
+        guard !isDismissing, !isPaging else {
+            if isPaging {
+                PagerDiagnostics.log(
+                    "viewer dismiss ignored kind=indexed reason=\(reason) paging=true index=\(currentIndex)"
+                )
+            }
+            return
+        }
         isDismissing = true
         crossedDismissThreshold = false
         PagerDiagnostics.log(
             "viewer dismiss requested kind=indexed reason=\(reason) index=\(currentIndex)"
         )
         finishDismissAnimation(reason: reason)
+    }
+
+    private func handlePagingChanged(_ paging: Bool) {
+        isPaging = paging
+        guard paging else { return }
+        crossedDismissThreshold = false
+        if dismissDragOffset != .zero {
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                dismissDragOffset = .zero
+            }
+        }
     }
 
     private func finishDismissAnimation(reason: String) {
@@ -3230,6 +3571,25 @@ struct IndexedPhotoViewerView: View {
             .animation(.snappy(duration: 0.22), value: isFavorite)
             .disabled(currentAsset == nil)
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
+
+            Spacer()
+
+            viewerBarAction {
+                guard let currentAsset else { return }
+                if store.isInRecycleBin(currentAsset) {
+                    store.removeFromRecycleBin(currentAsset)
+                } else {
+                    store.addToRecycleBin(currentAsset)
+                }
+            } label: {
+                Image(systemName: currentAsset.map {
+                    store.isInRecycleBin($0) ? "trash.slash" : "trash"
+                } ?? "trash")
+            }
+            .disabled(currentAsset == nil)
+            .accessibilityLabel(currentAsset.map {
+                store.isInRecycleBin($0) ? "移出回收站" : "加入回收站"
+            } ?? "加入回收站")
 
             Spacer()
 

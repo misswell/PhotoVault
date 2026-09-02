@@ -184,6 +184,7 @@ enum AppIconPreference: String, CaseIterable, Identifiable {
 enum PhotoSection: Hashable {
     case library
     case unsorted
+    case lan
     case album(String)
     case search(String)
 }

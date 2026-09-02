@@ -401,6 +401,52 @@ final class PhotoIndexStore: @unchecked Sendable {
         }
     }
 
+    /// Returns a bounded, newest-first launch window from the last committed
+    /// index. This lets the library grid render immediately after a cold
+    /// process launch without asking PhotoKit to resolve the complete library
+    /// first. A rebuild never leaks a partial window because index_ready is
+    /// checked in the same database snapshot as the identifier query.
+    func recentAssetIdentifiers(
+        limit: Int,
+        completion: @escaping @MainActor (Result<[String], Error>) -> Void
+    ) {
+        readQueue.async { [weak self] in
+            guard let self else { return }
+
+            do {
+                let identifiers = try self.withReadDatabase {
+                    try self.readRecentAssetIdentifiersOnReadConnection(limit: limit)
+                }
+                DispatchQueue.main.async {
+                    completion(.success(identifiers))
+                }
+            } catch {
+                // Match the paging read path: the writer connection can
+                // recover a WAL left behind by a force-quit, while a failed
+                // launch-cache read must never delay the fresh PhotoKit fetch.
+                photoVaultTrace(
+                    "index recent-read falling back to writer connection "
+                        + "error=\(error.localizedDescription)"
+                )
+                self.queue.async { [weak self] in
+                    guard let self else { return }
+                    do {
+                        let identifiers = try self.withDatabase {
+                            try self.readRecentAssetIdentifiers(limit: limit)
+                        }
+                        DispatchQueue.main.async {
+                            completion(.success(identifiers))
+                        }
+                    } catch {
+                        DispatchQueue.main.async {
+                            completion(.failure(error))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func unsortedIdentifiers(
         limit: Int,
         offset: Int = 0,
@@ -830,6 +876,27 @@ final class PhotoIndexStore: @unchecked Sendable {
         )
     }
 
+    private func readRecentAssetIdentifiers(limit: Int) throws -> [String] {
+        let statement = try prepare("""
+            SELECT asset_id
+            FROM asset_index
+            WHERE (SELECT value FROM meta WHERE key = 'index_ready') = '1'
+            ORDER BY creation_date DESC, asset_id DESC
+            LIMIT ?
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bindInt64(Int64(max(0, limit)), at: 1, to: statement)
+
+        var identifiers = [String]()
+        identifiers.reserveCapacity(min(max(0, limit), 4096))
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let value = sqlite3_column_text(statement, 0) {
+                identifiers.append(String(cString: value))
+            }
+        }
+        return identifiers
+    }
+
     private func readUnsortedIdentifiers(limit: Int, offset: Int) throws -> [String] {
         let statement = try prepare("""
             SELECT asset_id
@@ -918,6 +985,27 @@ final class PhotoIndexStore: @unchecked Sendable {
                 "SELECT COUNT(*) FROM asset_index WHERE album_count = 0"
             )
         )
+    }
+
+    private func readRecentAssetIdentifiersOnReadConnection(limit: Int) throws -> [String] {
+        let statement = try prepareRead("""
+            SELECT asset_id
+            FROM asset_index
+            WHERE (SELECT value FROM meta WHERE key = 'index_ready') = '1'
+            ORDER BY creation_date DESC, asset_id DESC
+            LIMIT ?
+            """)
+        defer { sqlite3_finalize(statement) }
+        try bindInt64(Int64(max(0, limit)), at: 1, to: statement)
+
+        var identifiers = [String]()
+        identifiers.reserveCapacity(min(max(0, limit), 4096))
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let value = sqlite3_column_text(statement, 0) {
+                identifiers.append(String(cString: value))
+            }
+        }
+        return identifiers
     }
 
     private func readUnsortedIdentifiersOnReadConnection(limit: Int, offset: Int) throws -> [String] {

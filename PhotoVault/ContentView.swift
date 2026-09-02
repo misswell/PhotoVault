@@ -102,6 +102,9 @@ struct ContentView: View {
                         }
                     }
                     .tag(PhotoSection.unsorted)
+
+                    Label("局域网相册", systemImage: "wifi")
+                        .tag(PhotoSection.lan)
                 }
 
                 if searchQuery.isEmpty {
@@ -226,7 +229,7 @@ struct ContentView: View {
         }
 #endif
         .sheet(isPresented: $isShowingSettings) {
-            PhotoVaultSettingsView()
+            PhotoVaultSettingsView(store: store)
         }
     }
 
@@ -494,6 +497,9 @@ struct ContentView: View {
         case .unsorted:
             UnsortedPhotosScreen(store: store)
                 .id("unsorted-detail")
+        case .lan:
+            LANAlbumHomeScreen()
+                .id("lan-detail")
         case .album(let id):
             if let album = store.album(withID: id) {
                 PhotoGridScreen(
@@ -1299,6 +1305,7 @@ private struct DebugPerformanceView: View {
 #endif
 
 struct PhotoVaultSettingsView: View {
+    @ObservedObject var store: PhotoLibraryStore
     @Environment(\.dismiss) private var dismiss
     @AppStorage(AlbumTileColumnCount.storageKey)
     private var albumTileColumnCountRawValue = AlbumTileColumnCount.automatic.rawValue
@@ -1308,6 +1315,8 @@ struct PhotoVaultSettingsView: View {
     private var slideshowTransitionRawValue = SlideshowTransitionStyle.fade.rawValue
     @AppStorage(AppIconPreference.storageKey)
     private var appIconPreferenceRawValue = AppIconPreference.system.rawValue
+    @State private var isDeletingRecycleBin = false
+    @State private var alert: PhotoVaultAlert?
 
     private var selectedAlbumTileColumnCount: AlbumTileColumnCount {
         AlbumTileColumnCount(rawValue: albumTileColumnCountRawValue) ?? .automatic
@@ -1383,6 +1392,42 @@ struct PhotoVaultSettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
+                Section("回收站") {
+                    LabeledContent("待删除照片", value: store.recycleBinCount.formatted())
+
+                    Text("加入回收站的照片仍保留在照片库。删除回收站内容时，会弹出系统确认并将其移入系统“最近删除”。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Button(role: .destructive) {
+                        guard !isDeletingRecycleBin else { return }
+                        guard store.recycleBinCount > 0 else {
+                            alert = PhotoVaultAlert(
+                                title: "回收站为空",
+                                message: "请先在照片详情中点击垃圾桶按钮，将照片加入回收站。"
+                            )
+                            return
+                        }
+                        isDeletingRecycleBin = true
+                        store.deleteRecycleBinContents { result in
+                            isDeletingRecycleBin = false
+                            if case .failure(let error) = result {
+                                alert = PhotoVaultAlert(
+                                    title: "无法删除回收站内容",
+                                    message: error.localizedDescription
+                                )
+                            }
+                        }
+                    } label: {
+                        if isDeletingRecycleBin {
+                            Label("正在删除…", systemImage: "hourglass")
+                        } else {
+                            Label("删除回收站内容", systemImage: "trash")
+                        }
+                    }
+                    .disabled(isDeletingRecycleBin)
+                }
+
                 Section {
                     Text("图片会预读相邻照片的高质量版本，尽量避免从 iCloud 切换时出现黑屏或闪烁。")
                         .font(.footnote)
@@ -1396,6 +1441,13 @@ struct PhotoVaultSettingsView: View {
                     Button("完成") { dismiss() }
                 }
             }
+        }
+        .alert(item: $alert) { alert in
+            Alert(
+                title: Text(alert.title),
+                message: Text(alert.message),
+                dismissButton: .default(Text("好"))
+            )
         }
         .presentationDetents([.medium, .large])
     }

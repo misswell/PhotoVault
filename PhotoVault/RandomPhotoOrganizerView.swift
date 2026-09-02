@@ -10,9 +10,20 @@ private struct RandomAssetIndexSampler {
     private(set) var remainingCount = 0
     private var replacements: [Int: Int] = [:]
 
-    mutating func reset(count: Int) {
+    mutating func reset(count: Int, excluding excludedIndex: Int? = nil) {
         remainingCount = max(0, count)
         replacements.removeAll(keepingCapacity: true)
+
+        guard let excludedIndex,
+              excludedIndex >= 0,
+              excludedIndex < remainingCount
+        else { return }
+
+        let lastPosition = remainingCount - 1
+        if excludedIndex != lastPosition {
+            replacements[excludedIndex] = lastPosition
+        }
+        remainingCount -= 1
     }
 
     mutating func next() -> Int? {
@@ -32,10 +43,6 @@ private struct RandomAssetIndexSampler {
     }
 }
 
-private enum OrganizerPendingTrashStore {
-    static let storageKey = "PhotoVault.organizer.pendingTrashAssetIDs.v1"
-}
-
 private enum OrganizerDecision: String {
     case recycle
     case keep
@@ -44,11 +51,11 @@ private enum OrganizerDecision: String {
     var title: String {
         switch self {
         case .recycle:
-            return "待回收"
+            return "加入回收站"
         case .keep:
             return "保留"
         case .album:
-            return "放入相册"
+            return "加入相册"
         }
     }
 
@@ -92,6 +99,7 @@ struct RandomPhotoOrganizerView: View {
     @State private var currentAsset: PHAsset?
     @State private var nextAsset: PHAsset?
     @State private var previewAsset: PHAsset?
+    @State private var previewAssetIndex: Int?
 
     @State private var pendingTrash: [PHAsset] = []
     @State private var pendingTrashIDs = Set<String>()
@@ -160,7 +168,7 @@ struct RandomPhotoOrganizerView: View {
                     }
                     .foregroundStyle(pendingTrash.isEmpty ? Color.secondary : Color.white)
                     .disabled(pendingTrash.isEmpty)
-                    .accessibilityLabel("待回收站，共 \(pendingTrash.count) 项")
+                    .accessibilityLabel("回收站，共 \(pendingTrash.count) 项")
                 }
             }
         }
@@ -197,6 +205,11 @@ struct RandomPhotoOrganizerView: View {
             guard !isSessionActive else { return }
             choosePreviewAsset()
         }
+        .onChange(of: store.recycleBinIDs) { _, _ in
+            guard !isSessionActive else { return }
+            updatePendingTrash(store.recycleBinAssets())
+            choosePreviewAsset()
+        }
     }
 
     private var organizerBackground: some View {
@@ -226,16 +239,16 @@ struct RandomPhotoOrganizerView: View {
                     spacing: 10
                 ) {
                     organizerModeGuide(
+                        decision: .album,
+                        detail: "左滑，加入指定相册"
+                    )
+                    organizerModeGuide(
                         decision: .recycle,
-                        detail: "先暂存，统一确认"
+                        detail: "上滑，添加到待回收"
                     )
                     organizerModeGuide(
                         decision: .keep,
-                        detail: "保留并继续下一张"
-                    )
-                    organizerModeGuide(
-                        decision: .album,
-                        detail: "加入指定系统相册"
+                        detail: "右滑，保留并继续"
                     )
                 }
             }
@@ -350,7 +363,7 @@ struct RandomPhotoOrganizerView: View {
                     isShowingPendingTrash = true
                 } label: {
                     HStack {
-                        Label("待回收站", systemImage: "trash")
+                        Label("回收站", systemImage: "trash")
                         Spacer()
                         Text("\(pendingTrash.count) 项")
                             .monospacedDigit()
@@ -503,7 +516,7 @@ struct RandomPhotoOrganizerView: View {
                     .contentShape(Rectangle())
                     .gesture(cardDragGesture)
                     .allowsHitTesting(!actionsLocked)
-                    .accessibilityHint("向左滑放入待回收站，向右滑保留，向上滑选择相册")
+                    .accessibilityHint("向上滑添加到待回收，向左滑加入相册，向右滑保留")
                 }
             }
             .onAppear {
@@ -517,16 +530,16 @@ struct RandomPhotoOrganizerView: View {
 
     private var actionBar: some View {
         HStack(spacing: 10) {
+            organizerActionButton(decision: .album) {
+                isShowingAlbumPicker = true
+            }
+
             organizerActionButton(decision: .recycle) {
                 commitDecision(.recycle)
             }
 
             organizerActionButton(decision: .keep) {
                 commitDecision(.keep)
-            }
-
-            organizerActionButton(decision: .album) {
-                isShowingAlbumPicker = true
             }
         }
     }
@@ -584,7 +597,7 @@ struct RandomPhotoOrganizerView: View {
                     isShowingPendingTrash = true
                 } label: {
                     Label(
-                        "处理待回收站（\(pendingTrash.count)）",
+                        "处理回收站（\(pendingTrash.count)）",
                         systemImage: "trash"
                     )
                     .font(.headline)
@@ -622,10 +635,10 @@ struct RandomPhotoOrganizerView: View {
         let horizontalDistance = abs(cardOffset.width)
         let verticalDistance = abs(cardOffset.height)
         if horizontalDistance > 28, horizontalDistance > verticalDistance * 1.08 {
-            return cardOffset.width < 0 ? .recycle : .keep
+            return cardOffset.width < 0 ? .album : .keep
         }
         if cardOffset.height < -28, verticalDistance > horizontalDistance * 1.08 {
-            return .album
+            return .recycle
         }
         return nil
     }
@@ -658,7 +671,8 @@ struct RandomPhotoOrganizerView: View {
                 if value.translation.width < 0,
                    horizontalDistance > verticalDistance * 1.08,
                    horizontalDistance > 96 || predictedHorizontal > 190 {
-                    commitDecision(.recycle)
+                    resetCardPosition()
+                    isShowingAlbumPicker = true
                 } else if value.translation.width > 0,
                           horizontalDistance > verticalDistance * 1.08,
                           horizontalDistance > 96 || predictedHorizontal > 190 {
@@ -666,8 +680,7 @@ struct RandomPhotoOrganizerView: View {
                 } else if value.translation.height < 0,
                           verticalDistance > horizontalDistance * 1.08,
                           verticalDistance > 96 || predictedVertical > 190 {
-                    resetCardPosition()
-                    isShowingAlbumPicker = true
+                    commitDecision(.recycle)
                 } else {
                     resetCardPosition()
                 }
@@ -683,8 +696,9 @@ struct RandomPhotoOrganizerView: View {
             return
         }
 
+        let firstIndex = resolvedPreviewIndex(in: assets)
         sessionAssets = assets
-        sampler.reset(count: assets.count)
+        sampler.reset(count: assets.count, excluding: firstIndex)
         sessionTotal = max(0, assets.count - pendingTrashIDs.count)
         reviewedCount = 0
         keptCount = 0
@@ -694,14 +708,14 @@ struct RandomPhotoOrganizerView: View {
         isSessionActive = true
         resetCardStateWithoutAnimation()
 
-        currentAsset = drawNextAsset()
+        currentAsset = firstIndex.map { assets.object(at: $0) } ?? drawNextAsset()
         nextAsset = drawNextAsset()
 
         if currentAsset == nil {
             isSessionActive = false
             alert = OrganizerAlert(
                 title: "没有新的照片",
-                message: "当前可见照片都已在待回收站中，请先处理待回收站。"
+                message: "当前可见照片都已在回收站中，请先处理回收站。"
             )
         }
     }
@@ -764,10 +778,10 @@ struct RandomPhotoOrganizerView: View {
                 switch decision {
                 case .recycle:
                     cardOffset = CGSize(
-                        width: -max(520, cardCanvasSize.width * 1.25),
-                        height: max(20, cardOffset.height * 0.22)
+                        width: cardOffset.width * 0.12,
+                        height: -max(680, cardCanvasSize.height * 1.18)
                     )
-                    cardRotation = -12
+                    cardRotation = 0
                 case .keep:
                     cardOffset = CGSize(
                         width: max(520, cardCanvasSize.width * 1.25),
@@ -776,10 +790,10 @@ struct RandomPhotoOrganizerView: View {
                     cardRotation = 12
                 case .album:
                     cardOffset = CGSize(
-                        width: cardOffset.width * 0.12,
-                        height: -max(680, cardCanvasSize.height * 1.18)
+                        width: -max(520, cardCanvasSize.width * 1.25),
+                        height: max(20, cardOffset.height * 0.22)
                     )
-                    cardRotation = 0
+                    cardRotation = -12
                 }
                 cardScale = 0.9
                 cardOpacity = 0.08
@@ -869,10 +883,12 @@ struct RandomPhotoOrganizerView: View {
 
     private func enqueueForPendingTrash(_ asset: PHAsset) {
         guard !pendingTrashIDs.contains(asset.localIdentifier) else { return }
+        store.addToRecycleBin(asset)
         updatePendingTrash(pendingTrash + [asset])
     }
 
     private func removeFromPendingTrash(_ asset: PHAsset) {
+        store.removeFromRecycleBin(asset)
         updatePendingTrash(
             pendingTrash.filter { $0.localIdentifier != asset.localIdentifier }
         )
@@ -924,21 +940,7 @@ struct RandomPhotoOrganizerView: View {
     private func restorePendingTrashIfNeeded() {
         guard !hasRestoredPendingTrash else { return }
         hasRestoredPendingTrash = true
-
-        let identifiers = UserDefaults.standard.stringArray(
-            forKey: OrganizerPendingTrashStore.storageKey
-        ) ?? []
-        guard !identifiers.isEmpty else { return }
-
-        let result = PHAsset.fetchAssets(
-            withLocalIdentifiers: identifiers,
-            options: nil
-        )
-        var assetsByID: [String: PHAsset] = [:]
-        result.enumerateObjects { asset, _, _ in
-            assetsByID[asset.localIdentifier] = asset
-        }
-        updatePendingTrash(identifiers.compactMap { assetsByID[$0] })
+        updatePendingTrash(store.recycleBinAssets())
     }
 
     private func updatePendingTrash(_ assets: [PHAsset]) {
@@ -948,26 +950,43 @@ struct RandomPhotoOrganizerView: View {
         }
         pendingTrash = uniqueAssets
         pendingTrashIDs = seen
-        UserDefaults.standard.set(
-            uniqueAssets.map(\.localIdentifier),
-            forKey: OrganizerPendingTrashStore.storageKey
-        )
     }
 
     private func choosePreviewAsset() {
         guard let assets = store.allPhotos, assets.count > 0 else {
             previewAsset = nil
+            previewAssetIndex = nil
             return
         }
 
         for _ in 0..<min(24, assets.count) {
-            let candidate = assets.object(at: Int.random(in: 0..<assets.count))
+            let candidateIndex = Int.random(in: 0..<assets.count)
+            let candidate = assets.object(at: candidateIndex)
             if !pendingTrashIDs.contains(candidate.localIdentifier) {
                 previewAsset = candidate
+                previewAssetIndex = candidateIndex
                 return
             }
         }
         previewAsset = assets.firstObject
+        previewAssetIndex = 0
+    }
+
+    private func resolvedPreviewIndex(in assets: PHFetchResult<PHAsset>) -> Int? {
+        guard let previewAsset,
+              !pendingTrashIDs.contains(previewAsset.localIdentifier)
+        else { return nil }
+
+        if let previewAssetIndex,
+           previewAssetIndex >= 0,
+           previewAssetIndex < assets.count,
+           assets.object(at: previewAssetIndex).localIdentifier == previewAsset.localIdentifier {
+            return previewAssetIndex
+        }
+
+        let resolvedIndex = assets.index(of: previewAsset)
+        guard resolvedIndex != NSNotFound else { return nil }
+        return resolvedIndex
     }
 
     private func targetSize(for size: CGSize) -> CGSize {
@@ -985,48 +1004,53 @@ private struct OrganizerPhotoCard: View {
     let requestPriority: PhotoRequestPriority
 
     var body: some View {
-        ZStack(alignment: .bottom) {
-            AssetImageView(
-                asset: asset,
-                targetSize: targetSize,
-                contentMode: .aspectFill,
-                requestPriority: requestPriority,
-                cacheResult: true
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        GeometryReader { proxy in
+            ZStack(alignment: .bottom) {
+                AssetImageView(
+                    asset: asset,
+                    targetSize: targetSize,
+                    contentMode: .aspectFill,
+                    requestPriority: requestPriority,
+                    cacheResult: true
+                )
+                // A max-only frame lets aspectFill expand the layout size to
+                // the image's own aspect ratio, blowing the card up to the
+                // full screen. Pin the image to the card's exact bounds.
+                .frame(width: proxy.size.width, height: proxy.size.height)
 
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.03), .black.opacity(0.78)],
-                startPoint: .center,
-                endPoint: .bottom
-            )
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.03), .black.opacity(0.78)],
+                    startPoint: .center,
+                    endPoint: .bottom
+                )
 
-            HStack(alignment: .bottom, spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(asset.creationDate?.formatted(date: .abbreviated, time: .omitted) ?? "未知日期")
+                HStack(alignment: .bottom, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(asset.creationDate?.formatted(date: .abbreviated, time: .omitted) ?? "未知日期")
+                            .font(.headline)
+                        Text(mediaDescription)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
+                    }
+
+                    Spacer()
+
+                    Image(systemName: mediaSymbol)
                         .font(.headline)
-                    Text(mediaDescription)
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.7))
+                        .frame(width: 38, height: 38)
+                        .glassEffect(.regular, in: Circle())
                 }
-
-                Spacer()
-
-                Image(systemName: mediaSymbol)
-                    .font(.headline)
-                    .frame(width: 38, height: 38)
-                    .glassEffect(.regular, in: Circle())
+                .foregroundStyle(.white)
+                .padding(16)
             }
-            .foregroundStyle(.white)
-            .padding(16)
+            .background(.black)
+            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .stroke(.white.opacity(0.15), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.28), radius: 22, y: 10)
         }
-        .background(.black)
-        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 28, style: .continuous)
-                .stroke(.white.opacity(0.15), lineWidth: 1)
-        }
-        .shadow(color: .black.opacity(0.28), radius: 22, y: 10)
     }
 
     private var mediaDescription: String {
@@ -1093,9 +1117,9 @@ private struct OrganizerPendingTrashSheet: View {
             Group {
                 if assets.isEmpty {
                     ContentUnavailableView(
-                        "待回收站为空",
+                        "回收站为空",
                         systemImage: "trash",
-                        description: Text("整理时选择“待回收”的照片会先出现在这里。")
+                        description: Text("整理时选择“加入回收站”的照片会先出现在这里。")
                     )
                 } else {
                     ScrollView {
@@ -1108,7 +1132,7 @@ private struct OrganizerPendingTrashSheet: View {
                     }
                 }
             }
-            .navigationTitle("待回收站")
+            .navigationTitle("回收站")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
@@ -1159,7 +1183,12 @@ private struct OrganizerPendingTrashSheet: View {
                 contentMode: .aspectFill,
                 requestPriority: .visibleGrid
             )
-            .aspectRatio(1, contentMode: .fill)
+            // Fit reports a bounded square; fill would let the image expand
+            // the cell to its own aspect ratio. Clip at the outer frame so
+            // the overflowing fill can never paint outside the cell.
+            .frame(maxWidth: .infinity)
+            .aspectRatio(1, contentMode: .fit)
+            .clipped()
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
             Button {
@@ -1172,7 +1201,7 @@ private struct OrganizerPendingTrashSheet: View {
                     .glassEffect(.regular.interactive(), in: Circle())
             }
             .disabled(isDeleting)
-            .accessibilityLabel("移出待回收站")
+            .accessibilityLabel("移出回收站")
             .padding(6)
         }
         .overlay(alignment: .bottomLeading) {

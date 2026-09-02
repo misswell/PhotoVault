@@ -75,6 +75,14 @@ enum PhotoQuickAlbums {
     static let legacyStorageKey = "PhotoVault.quickCollectionAlbumID"
 }
 
+/// Photos queued by the app stay in this queue until the user explicitly
+/// empties it. Keep the old organizer key as a migration source so photos
+/// queued before the shared recycle bin was introduced are preserved.
+enum PhotoRecycleBinStore {
+    static let storageKey = "PhotoVault.recycleBinAssetIDs.v1"
+    static let legacyOrganizerStorageKey = "PhotoVault.organizer.pendingTrashAssetIDs.v1"
+}
+
 /// Declining the system delete prompt surfaces as this PhotoKit error code.
 /// It is a deliberate no-op, not a failure.
 private func isUserCancelledPhotoChange(_ error: Error) -> Bool {
@@ -98,6 +106,9 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     @Published private(set) var indexErrorMessage: String?
     /// Album identifiers pinned by the user for the grid's quick-add menu.
     @Published private(set) var quickAlbumIDs: [String] = []
+    /// Asset identifiers queued for deferred deletion. The assets remain in
+    /// PhotoKit until the user explicitly empties the recycle bin.
+    @Published private(set) var recycleBinIDs: [String] = []
 
     private var hasStarted = false
     private var indexGeneration = 0
@@ -112,8 +123,15 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     private let changeTokenDefaultsKey = "PhotoVault.photoLibrary.changeToken.v1"
     private let changeTokenSignatureDefaultsKey = "PhotoVault.photoLibrary.changeTokenSignature.v1"
     private let albumCacheDefaultsKey = "PhotoVault.photoLibrary.albumSnapshot.v1"
+    private let launchPreviewDefaultsKey = "PhotoVault.photoLibrary.launchPreviewAssetIDs.v1"
     nonisolated private static let shareTemporaryFilePrefix = "PhotoVault-Share-"
+    nonisolated private static let launchPreviewAssetLimit = 512
     private var hasLoadedAlbumCache = false
+    private var hasPublishedFreshAlbums = false
+    /// Distinguishes the complete PhotoKit result from the bounded launch
+    /// window. Index synchronization must never treat those 512 cached rows
+    /// as the whole library if startup is interrupted by backgrounding.
+    private var hasFreshLibraryFetch = false
 
     var canReadPhotos: Bool {
         authorizationStatus == .authorized || authorizationStatus == .limited
@@ -142,6 +160,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     override init() {
         super.init()
         loadQuickAlbumIDs()
+        loadRecycleBinIDs()
     }
 
     deinit {
@@ -192,7 +211,11 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
               !isIndexingUnsorted,
               !isLoadingAlbums
         else { return }
-        retryUnsortedIndex()
+        if hasFreshLibraryFetch {
+            retryUnsortedIndex()
+        } else {
+            refresh()
+        }
     }
 
     func requestAccess() {
@@ -227,14 +250,21 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         )
 
         isLoadingAlbums = true
+        restoreCachedLibraryPreview(generation: generation)
         DispatchQueue.global(qos: .userInitiated).async {
             let fetchedPhotos = PHAsset.fetchAssets(with: Self.makeLibraryFetchOptions())
+            let launchPreviewIDs = Self.makeLaunchPreviewIdentifiers(from: fetchedPhotos)
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.indexGeneration == generation else { return }
                 photoVaultTrace(
                     "store photos fetched generation=\(generation) count=\(fetchedPhotos.count)"
                 )
+                UserDefaults.standard.set(
+                    launchPreviewIDs,
+                    forKey: self.launchPreviewDefaultsKey
+                )
+                self.hasFreshLibraryFetch = true
                 self.allPhotos = fetchedPhotos
 
                 // Album enumeration also fetches collection membership and
@@ -251,6 +281,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                                 + "albums=\(fetchedAlbums.albums.count) "
                                 + "folders=\(fetchedAlbums.folders.count)"
                         )
+                        self.hasPublishedFreshAlbums = true
                         self.albumFetchResults.removeAll(keepingCapacity: true)
                         self.albums = fetchedAlbums.albums
                         self.albumFolders = fetchedAlbums.folders
@@ -296,7 +327,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
     func retryUnsortedIndex() {
         guard canReadPhotos else { return }
-        guard let allPhotos else {
+        guard hasFreshLibraryFetch, let allPhotos else {
             refresh()
             return
         }
@@ -464,6 +495,91 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         UserDefaults.standard.set(quickAlbumIDs, forKey: PhotoQuickAlbums.storageKey)
     }
 
+    var recycleBinCount: Int {
+        recycleBinIDs.count
+    }
+
+    func isInRecycleBin(_ asset: PHAsset) -> Bool {
+        recycleBinIDs.contains(asset.localIdentifier)
+    }
+
+    func addToRecycleBin(_ asset: PHAsset) {
+        guard !isInRecycleBin(asset) else { return }
+        recycleBinIDs.append(asset.localIdentifier)
+        persistRecycleBinIDs()
+    }
+
+    func removeFromRecycleBin(_ asset: PHAsset) {
+        removeFromRecycleBin(ids: [asset.localIdentifier])
+    }
+
+    /// Resolves only the queued identifiers. This intentionally does not
+    /// materialize the whole library and also prunes assets deleted elsewhere.
+    func recycleBinAssets() -> [PHAsset] {
+        guard !recycleBinIDs.isEmpty else { return [] }
+
+        let result = PHAsset.fetchAssets(
+            withLocalIdentifiers: recycleBinIDs,
+            options: nil
+        )
+        var assetsByID: [String: PHAsset] = [:]
+        result.enumerateObjects { asset, _, _ in
+            assetsByID[asset.localIdentifier] = asset
+        }
+
+        let resolvedIDs = recycleBinIDs.filter { assetsByID[$0] != nil }
+        if resolvedIDs != recycleBinIDs {
+            recycleBinIDs = resolvedIDs
+            persistRecycleBinIDs()
+        }
+        return resolvedIDs.compactMap { assetsByID[$0] }
+    }
+
+    func deleteRecycleBinContents(
+        completion: @escaping @MainActor (Result<Void, Error>) -> Void = { _ in }
+    ) {
+        let candidates = recycleBinAssets()
+        guard !candidates.isEmpty else {
+            recycleBinIDs = []
+            persistRecycleBinIDs()
+            completion(.success(()))
+            return
+        }
+        deleteAssets(candidates, completion: completion)
+    }
+
+    private func removeFromRecycleBin(ids: Set<String>) {
+        guard !ids.isEmpty else { return }
+        let remaining = recycleBinIDs.filter { !ids.contains($0) }
+        guard remaining.count != recycleBinIDs.count else { return }
+        recycleBinIDs = remaining
+        persistRecycleBinIDs()
+    }
+
+    private func removeFromRecycleBin(ids: [String]) {
+        removeFromRecycleBin(ids: Set(ids))
+    }
+
+    private func persistRecycleBinIDs() {
+        UserDefaults.standard.set(recycleBinIDs, forKey: PhotoRecycleBinStore.storageKey)
+    }
+
+    private func loadRecycleBinIDs() {
+        let defaults = UserDefaults.standard
+        let hasSharedQueue = defaults.object(forKey: PhotoRecycleBinStore.storageKey) != nil
+        let storedIDs = defaults.stringArray(
+            forKey: hasSharedQueue
+                ? PhotoRecycleBinStore.storageKey
+                : PhotoRecycleBinStore.legacyOrganizerStorageKey
+        ) ?? []
+        var seen = Set<String>()
+        recycleBinIDs = storedIDs.filter { seen.insert($0).inserted }
+        if !hasSharedQueue {
+            persistRecycleBinIDs()
+            defaults.removeObject(forKey: PhotoRecycleBinStore.legacyOrganizerStorageKey)
+        }
+    }
+
     private func loadQuickAlbumIDs() {
         let defaults = UserDefaults.standard
         if defaults.object(forKey: PhotoQuickAlbums.storageKey) != nil {
@@ -552,6 +668,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         }) { [weak self] result in
             switch result {
             case .success:
+                self?.removeFromRecycleBin(ids: assets.map(\.localIdentifier))
                 self?.optimisticallyRemoveAssets(assets)
                 completion(result)
             case .failure(let error):
@@ -679,7 +796,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     /// separately because this store keeps the album list as value models,
     /// while the asset result itself remains incremental.
     private func applyPhotoLibraryChange(_ change: PHChange) {
-        guard let currentPhotos = allPhotos else {
+        guard hasFreshLibraryFetch, let currentPhotos = allPhotos else {
             // A missing/non-incremental change detail means PhotoKit cannot
             // safely describe the delta. This is the exceptional full-refresh
             // path, not the normal change-observer path.
@@ -710,6 +827,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.indexGeneration == generation else { return }
+                self.hasPublishedFreshAlbums = true
                 self.albumFetchResults.removeAll(keepingCapacity: true)
                 self.albums = fetchedAlbums.albums
                 self.albumFolders = fetchedAlbums.folders
@@ -729,21 +847,131 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         }
     }
 
-    /// Restore only album metadata and collection references synchronously.
-    /// No image request or per-album asset enumeration happens here, so the
-    /// sidebar can render the last known hierarchy while the fresh PhotoKit
-    /// scan runs in the background.
+    /// Restore only album metadata and collection references. Even this
+    /// bounded PhotoKit lookup can take noticeable time with many iCloud
+    /// albums, so keep it off the main actor and never let it delay the
+    /// cached library window or the fresh full-library fetch.
     private func loadCachedAlbumsIfNeeded() {
         guard !hasLoadedAlbumCache else { return }
         hasLoadedAlbumCache = true
-        guard let data = UserDefaults.standard.data(forKey: albumCacheDefaultsKey),
-              let snapshot = try? JSONDecoder().decode(
-                  PhotoAlbumCacheSnapshot.self,
-                  from: data
-              ),
-              snapshot.version == PhotoAlbumCacheSnapshot.currentVersion
-        else {
+        guard let data = UserDefaults.standard.data(forKey: albumCacheDefaultsKey) else {
             return
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let cached = Self.restoreAlbumCache(from: data) else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, !self.hasPublishedFreshAlbums else { return }
+                self.albums = cached.albums
+                self.albumFolders = cached.folders
+                photoVaultTrace(
+                    "store album cache restored albums=\(cached.albums.count) "
+                        + "folders=\(cached.folders.count)"
+                )
+            }
+        }
+    }
+
+    /// Resolve only enough indexed assets to fill several screens. The full
+    /// PHFetchResult is still fetched concurrently and atomically replaces
+    /// this launch window when ready, so a newly captured screenshot appears
+    /// without blocking the first visible grid.
+    private func restoreCachedLibraryPreview(generation: Int) {
+        guard allPhotos == nil else { return }
+
+        if let identifiers = UserDefaults.standard.array(
+            forKey: launchPreviewDefaultsKey
+        ) as? [String], !identifiers.isEmpty {
+            publishCachedLibraryPreview(
+                identifiers: identifiers,
+                generation: generation,
+                source: "snapshot"
+            )
+        } else {
+            restoreLibraryPreviewFromIndex(generation: generation)
+        }
+
+        // The cached count is presentation data too. Restoring it early keeps
+        // the sidebar stable while the persistent-change delta is applied.
+        indexStore.stats { [weak self] result in
+            guard let self,
+                  self.indexGeneration == generation,
+                  self.indexStats == nil,
+                  case .success(let stats) = result
+            else { return }
+            self.indexStats = stats
+            self.unsortedCount = stats.unsortedCount
+        }
+    }
+
+    /// Existing installs do not have the lightweight defaults snapshot until
+    /// their first refresh on this version. Fall back to the committed SQLite
+    /// index once, then persist that bounded window for later launches.
+    private func restoreLibraryPreviewFromIndex(generation: Int) {
+        guard allPhotos == nil else { return }
+
+        indexStore.recentAssetIdentifiers(
+            limit: Self.launchPreviewAssetLimit
+        ) { [weak self] result in
+            guard let self,
+                  self.indexGeneration == generation,
+                  self.allPhotos == nil,
+                  case .success(let identifiers) = result,
+                  !identifiers.isEmpty
+            else { return }
+            UserDefaults.standard.set(
+                identifiers,
+                forKey: self.launchPreviewDefaultsKey
+            )
+            self.publishCachedLibraryPreview(
+                identifiers: identifiers,
+                generation: generation,
+                source: "index"
+            )
+        }
+    }
+
+    private func publishCachedLibraryPreview(
+        identifiers: [String],
+        generation: Int,
+        source: String
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let cachedPhotos = PHAsset.fetchAssets(
+                withLocalIdentifiers: identifiers,
+                options: Self.makeLibraryFetchOptions()
+            )
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.indexGeneration == generation,
+                      self.allPhotos == nil,
+                      cachedPhotos.count > 0
+                else { return }
+                self.allPhotos = cachedPhotos
+                photoVaultTrace(
+                    "store launch cache published generation=\(generation) "
+                        + "source=\(source) count=\(cachedPhotos.count)"
+                )
+            }
+        }
+    }
+
+    nonisolated private static func makeLaunchPreviewIdentifiers(
+        from assets: PHFetchResult<PHAsset>
+    ) -> [String] {
+        let count = min(launchPreviewAssetLimit, assets.count)
+        guard count > 0 else { return [] }
+        return (0..<count).map { assets.object(at: $0).localIdentifier }
+    }
+
+    nonisolated private static func restoreAlbumCache(
+        from data: Data
+    ) -> PhotoAlbumFetchResult? {
+        guard let snapshot = try? JSONDecoder().decode(
+            PhotoAlbumCacheSnapshot.self,
+            from: data
+        ), snapshot.version == PhotoAlbumCacheSnapshot.currentVersion else {
+            return nil
         }
 
         let albumFetchResult = PHAssetCollection.fetchAssetCollections(
@@ -755,9 +983,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             collectionsByID[collection.localIdentifier] = collection
         }
 
-        let previewIDs = Array(
-            Set(snapshot.albums.compactMap(\.previewAssetID))
-        )
+        let previewIDs = Array(Set(snapshot.albums.compactMap(\.previewAssetID)))
         let previewFetchResult = PHAsset.fetchAssets(
             withLocalIdentifiers: previewIDs,
             options: nil
@@ -777,14 +1003,12 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 previewAsset: entry.previewAssetID.flatMap { previewsByID[$0] }
             )
         }
-        guard !cachedAlbums.isEmpty || snapshot.albums.isEmpty else { return }
+        guard !cachedAlbums.isEmpty || snapshot.albums.isEmpty else { return nil }
 
         let albumsByID = Dictionary(
             uniqueKeysWithValues: cachedAlbums.map { ($0.id, $0) }
         )
-        func collectFolderIDs(
-            _ entry: PhotoAlbumFolderCacheEntry
-        ) -> [String] {
+        func collectFolderIDs(_ entry: PhotoAlbumFolderCacheEntry) -> [String] {
             [entry.id] + entry.subfolders.flatMap(collectFolderIDs)
         }
 
@@ -798,22 +1022,20 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             foldersByID[folder.localIdentifier] = folder
         }
 
-        func makeFolder(
-            _ entry: PhotoAlbumFolderCacheEntry
-        ) -> PhotoAlbumFolder? {
+        func makeFolder(_ entry: PhotoAlbumFolderCacheEntry) -> PhotoAlbumFolder? {
             guard let collection = foldersByID[entry.id] else { return nil }
-            let albums = entry.albumIDs.compactMap { albumsByID[$0] }
-            let subfolders = entry.subfolders.compactMap(makeFolder)
             return PhotoAlbumFolder(
                 collection: collection,
                 title: entry.title,
-                albums: albums,
-                subfolders: subfolders
+                albums: entry.albumIDs.compactMap { albumsByID[$0] },
+                subfolders: entry.subfolders.compactMap(makeFolder)
             )
         }
 
-        albums = cachedAlbums
-        albumFolders = snapshot.folders.compactMap(makeFolder)
+        return PhotoAlbumFetchResult(
+            albums: cachedAlbums,
+            folders: snapshot.folders.compactMap(makeFolder)
+        )
     }
 
     private func saveAlbumCache(
@@ -1193,6 +1415,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.indexGeneration == generation else { return }
+                self.removeFromRecycleBin(ids: deletedIDs)
                 self.indexStore.upsertAssets(
                     changedAssets,
                     deletedIDs: deletedIDs,

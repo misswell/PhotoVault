@@ -22,6 +22,7 @@
 | 图库页 | 侧栏选中“图库”后的全库网格 | `PhotoGridScreen` |
 | 相册网格页 | 点开某个普通/共享相册后的网格 | `PhotoGridScreen`（album 模式） |
 | 未整理页 | 未整理照片网格（SQLite 元数据分页） | `UnsortedPhotosScreen` |
+| 局域网相册页 | 侧栏“局域网相册”进入的网络共享浏览入口 | `LANAlbumHomeScreen` |
 | 详情页 | 全屏看图 + 左右翻页；统称叫“详情页”，需要区分时叫“普通详情页 / 未整理详情页” | `PhotoViewerView` / `IndexedPhotoViewerView` |
 | 幻灯片页 | 自动播放的全屏页，同样分普通/未整理两种 | `SlideshowView` / `IndexedSlideshowView` |
 | 设置面板 | 首页右上角入口弹出的设置 sheet | `PhotoVaultSettingsView` |
@@ -48,10 +49,14 @@
 - 普通图库用懒加载/可回收的 `UICollectionView` 和 `PHCachingImageManager`；只缓存可见范围及附近范围。
 - “未整理”照片不要在主线程遍历整个图库。使用后台 SQLite 索引和资产 ID 集合，详情页按页读取（当前实现的元数据页为 60 条）。
 - 索引更新必须走增量：`PHPersistentChangeToken` 的有效性由 PhotoKit 自己保证（token 过期时 `fetchPersistentChanges` 抛错 → 兜底全量重建），不得用库签名（count/首尾 ID）去否决 token——截图按时间倒序插到第 0 位必然改签名，签名否决会让每张新截图都触发 10 万条全量重建。
-- 索引库的读（`hasUsableIndex`/`unsortedIdentifiers`/`stats`）必须走专用只读连接（`readQueue`），写重建事务（可达几十秒）不能阻塞未整理页翻页和详情加载；WAL 模式下读连接看到的是最后一次提交的快照。
+- 索引库的读（`hasUsableIndex`/`unsortedIdentifiers`/`stats`）必须走专用读连接（`readQueue`），写重建事务（可达几十秒）不能阻塞未整理页翻页和详情加载；WAL 模式下读连接看到的是最后一次提交的快照。读连接必须以 READWRITE 打开——READONLY 连接无法执行 WAL 恢复（上个进程被杀时 `-shm` 需要恢复），会导致所有读失败、未整理永久 loading、并误触发全量重建；任何读失败还必须兜底重试写连接（`readWithFallback` 模式），读取不允许因第二条连接的问题而失败。
+- 详情分页器（`IndexedAssetPager`）在索引同步结束（`isIndexingUnsorted` true→false）时必须重新拉取当前窗口：页面加载可能被 store 的代次守卫丢弃，没有这次补拉详情会永远停在占位符。
 - 未整理的删除/加入相册必须乐观更新索引：PhotoKit 提交成功后立即调 `optimisticallyRemoveAssets`（`indexStore.removeAssets`，按 ID 删除）或 `optimisticallyAddMembership`（重算归属），直接发布重算后的 `unsortedCount` 驱动网格和详情即时刷新；不得等变更观察者 → 全量对账的慢回路。后续持久化变更对同一批 ID 的同步是幂等的，不会冲突。
 - 用户在系统删除确认弹窗点“取消”会以 `PHPhotosError.userCancelled`（3072）回调：必须静默当作无操作（不报错、不动索引、不乐观更新），只有真正确认删除才走乐观移除。
 - 库变更后的相册元数据重扫必须廉价：数量用 `estimatedAssetCount`（NSNotFound 才回退全量枚举），预览用 `fetchLimit = 1` 的单行请求；禁止对每个相册做完整成员枚举，否则每次截图/删除都是一次全库级别的元数据扫描。
+- 图片解码红线：`PhotoImageManager.requestImage` 的回调里统一 `preparingForDisplay()` 预解码（PhotoKit 回调线程），禁止把懒解码的 UIImage 直接抛给主线程首次渲染——那是快速滚动掉帧的元凶。
+- PhotoKit 缓存窗口只归预取代理管（`prefetchItemsAt`/`cancelPrefetchingForItemsAt`）：单元格里不得再逐个 `startCaching`/`stopCaching`，既多余又会踢掉预取刚建好的条目。
+- 释放缓存只认 `.background`，`.inactive`（控制中心/横幅/切换器路过）不清；后台释放走 `dropTransientCaches()`，保留 16MB 上限的 `albumThumbnailCache`，回前台时列表/卡片缩略图零请求。首页平铺卡片、侧栏行、选择器行统一走该缓存。
 - 索引进度指示只能是工具栏右上角的小号 `ProgressView`（未整理页 `isIndexingUnsorted`、网格页 `isLoadingAlbums`），禁止重新引入遮挡式进度条/浮层。
 - 胶片缩略图也必须回收，按可见范围和元数据页加载；不能为了底部缩略图重新物化完整结果集。
 - 图片请求必须区分查看器、幻灯片、可见网格和远端预取优先级。进入新页面、退出页面、切换相册或场景进入后台时取消不再需要的请求。
@@ -97,6 +102,13 @@
 - 详情展示期间要让底层相册网格进入 inactive 状态，暂停其交互和图片请求；确认退出后可立即恢复底层滚动交互，视觉转场仍由详情页完成，`onDismiss` 只做最终清理，避免用户退出后还要等待才能滑动。
 - 详情返回时不要因为 `isActive` 恢复就无条件对相册网格调用 `reloadData()`；这会清掉已经显示的缩略图并重新显示 loading，和全屏退出动画叠加成闪屏。未变化的数据应保留可见 cell，只恢复取消的请求；数据源变化时才整体刷新。
 - `NativePhotoPager` 销毁时先解除 `UIPageViewController` 的 delegate/dataSource；未整理详情的分页元数据请求必须用代次校验，页面消失后丢弃旧回调。
+
+## 局域网相册（文件夹）
+
+- “局域网相册”的实体是用户通过文件 App（含 SMB/NAS 共享）选中的文件夹：`LANFolderLibrary` 保存安全作用域书签（`PhotoVault.lanFolders.v1`），跨启动靠 `URL(resolvingBookmarkData:)` 恢复访问；书签失效（共享断开）时提示重新添加，不做静默失败。
+- 图片枚举递归全文件夹、按修改时间倒序，走 `FileManager.enumerator`（后台线程）；图片解码必须走 ImageIO 降采样（`CGImageSourceCreateThumbnailAtIndex` + `ThumbnailMaxPixelSize`，缩略图 512、查看 2048），禁止 `UIImage(data:)` 全尺寸解码进网格——50MP 文件全解码是主线程杀手。
+- 幻灯片与本地规则一致：单可见页单向推进（5 秒）、crossfade、点击暂停/继续，不用重建式 TabView。
+- 文件夹访问（`startAccessingSecurityScopedResource`）必须与 `stopAccessing` 成对出现；图片加载按文件各自包裹即可。
 
 ## 幻灯片和预读
 
