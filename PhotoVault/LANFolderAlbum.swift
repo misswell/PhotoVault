@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import ImageIO
 import UIKit
@@ -164,14 +165,16 @@ enum LANFolderImageLoader {
 }
 
 /// NSCache-backed image access for LAN folder screens. NSCache is thread
-/// safe, so cells can decode off the main actor.
+/// safe and evicts automatically under memory pressure; the cost limit keeps
+/// a few thousand decoded thumbnails from ever pinning hundreds of MB.
 final class LANFolderImageCache: @unchecked Sendable {
     static let shared = LANFolderImageCache()
 
     private let cache = NSCache<NSString, UIImage>()
 
     private init() {
-        cache.countLimit = 800
+        cache.countLimit = 400
+        cache.totalCostLimit = 64 * 1024 * 1024
     }
 
     func image(forKey key: NSString) -> UIImage? {
@@ -179,17 +182,122 @@ final class LANFolderImageCache: @unchecked Sendable {
     }
 
     func store(_ image: UIImage, forKey key: NSString) {
-        cache.setObject(image, forKey: key)
+        cache.setObject(image, forKey: key, cost: Self.decodedCost(image))
+    }
+
+    private static func decodedCost(_ image: UIImage) -> Int {
+        let width = max(1, Int(image.size.width * image.scale))
+        let height = max(1, Int(image.size.height * image.scale))
+        return min(Int.max / 4, width * height * 4)
     }
 }
 
-/// Bounded loader for LAN folder images. SMB reads are network round trips:
-/// unbounded concurrent decodes once starved Swift's cooperative thread pool
-/// and froze the entire app, and repeated screen visits queued duplicate
-/// work for the same files. Loads are therefore coalesced per file, capped
-/// at three concurrent decodes, and the gate wait times out so a poisoned
-/// slot can never back the queue up forever. All bookkeeping happens on a
-/// dedicated GCD queue, never on Swift concurrency threads.
+/// On-disk thumbnail cache under Caches, keyed by the file's path relative
+/// to its album root plus its modification date. A few thousand source
+/// images must not be re-decoded on every visit: the first pass pays one
+/// downscale per file, every later visit reads small JPEGs straight from
+/// disk. Caches is purgeable, so this never counts against user data.
+enum LANFolderThumbnailDiskCache {
+    private static func directory(for folderID: UUID) -> URL {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let directory = caches
+            .appendingPathComponent("PhotoVault", isDirectory: true)
+            .appendingPathComponent("lan-thumbnails", isDirectory: true)
+            .appendingPathComponent(folderID.uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        return directory
+    }
+
+    private static func fileURL(
+        for source: URL,
+        folderID: UUID,
+        rootURL: URL,
+        modificationDate: Date?,
+        maxPixelSize: CGFloat
+    ) -> URL {
+        let relativePath: String
+        if source.path.hasPrefix(rootURL.path) {
+            relativePath = String(source.path.dropFirst(rootURL.path.count))
+        } else {
+            relativePath = source.path
+        }
+        // Mount points of removable media can change between sessions, so
+        // the stable identity is the path inside the album plus mtime.
+        let digest = Insecure.MD5.hash(data: Data(relativePath.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let mtime = Int(modificationDate?.timeIntervalSince1970 ?? 0)
+        return directory(for: folderID)
+            .appendingPathComponent("\(digest)-\(mtime)-\(Int(maxPixelSize)).jpg")
+    }
+
+    static func image(
+        for source: URL,
+        folderID: UUID,
+        rootURL: URL,
+        maxPixelSize: CGFloat
+    ) -> UIImage? {
+        let modificationDate = try? source.resourceValues(
+            forKeys: [.contentModificationDateKey]
+        ).contentModificationDate
+        let diskURL = fileURL(
+            for: source,
+            folderID: folderID,
+            rootURL: rootURL,
+            modificationDate: modificationDate,
+            maxPixelSize: maxPixelSize
+        )
+        if let cached = UIImage(contentsOfFile: diskURL.path) {
+            return cached
+        }
+        guard let decoded = LANFolderImageLoader.image(
+            at: source,
+            maxPixelSize: maxPixelSize
+        ) else { return nil }
+        let payload = decoded.jpegData(compressionQuality: 0.72)
+        if let payload {
+            try? payload.write(to: diskURL, options: .atomic)
+        }
+        return decoded
+    }
+
+    /// Drops a removed album's thumbnails from Caches.
+    static func purge(folderID: UUID) {
+        let directory = directory(for: folderID)
+        try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+/// A cancellation flag a detached queue job can poll: scrolling cells cancel
+/// their tasks, and decode slots must not be spent on off-screen images.
+final class LANFolderCancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+}
+
+/// Bounded loader for LAN/local/USB folder images. Source files can be tens
+/// of MB and reads may be SMB network round trips: unbounded concurrent
+/// decodes once starved Swift's cooperative thread pool and froze the entire
+/// app, and repeated screen visits queued duplicate work for the same files.
+/// Loads are therefore coalesced per file, capped at three concurrent
+/// decodes, fronted by a disk thumbnail cache, and the gate wait times out
+/// so a poisoned slot can never back the queue up forever. Cancellation is
+/// polled by the queue job so off-screen cells release their slots.
 enum LANFolderImageLoaderQueue {
     private static let lock = NSLock()
     // Guarded by `lock`.
@@ -204,33 +312,69 @@ enum LANFolderImageLoaderQueue {
     private static let loadGate = DispatchSemaphore(value: 3)
     private static let gateTimeout: TimeInterval = 45
 
-    static func load(at url: URL, maxPixelSize: CGFloat) async -> UIImage? {
-        let key: NSString = "\(url.path)#\(Int(maxPixelSize))" as NSString
-        if let cached = LANFolderImageCache.shared.image(forKey: key) {
-            return cached
-        }
-        return await withCheckedContinuation { continuation in
-            lock.lock()
-            waiters[key, default: []].append { image in
-                continuation.resume(returning: image)
-            }
-            let shouldStart = inFlight.insert(key).inserted
-            lock.unlock()
+    static func load(
+        at url: URL,
+        folderID: UUID,
+        rootURL: URL,
+        maxPixelSize: CGFloat
+    ) async -> UIImage? {
+        let flag = LANFolderCancellationFlag()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<UIImage?, Never>) in
+                let key: NSString = "\(url.path)#\(Int(maxPixelSize))" as NSString
+                if let cached = LANFolderImageCache.shared.image(forKey: key) {
+                    continuation.resume(returning: cached)
+                    return
+                }
+                lock.lock()
+                waiters[key, default: []].append { image in
+                    continuation.resume(returning: image)
+                }
+                let shouldStart = inFlight.insert(key).inserted
+                lock.unlock()
 
-            guard shouldStart else { return }
-            queue.async {
-                process(key: key, url: url, maxPixelSize: maxPixelSize)
+                guard shouldStart else { return }
+                queue.async {
+                    process(
+                        key: key,
+                        url: url,
+                        folderID: folderID,
+                        rootURL: rootURL,
+                        maxPixelSize: maxPixelSize,
+                        flag: flag
+                    )
+                }
             }
+        } onCancel: {
+            flag.cancel()
         }
     }
 
-    private static func process(key: NSString, url: URL, maxPixelSize: CGFloat) {
+    private static func process(
+        key: NSString,
+        url: URL,
+        folderID: UUID,
+        rootURL: URL,
+        maxPixelSize: CGFloat,
+        flag: LANFolderCancellationFlag
+    ) {
         var image: UIImage?
-        if loadGate.wait(timeout: .now() + gateTimeout) == .success {
-            image = LANFolderImageLoader.image(at: url, maxPixelSize: maxPixelSize)
-            loadGate.signal()
-        } else {
-            photoVaultTrace("lan image gate timeout path=\(url.lastPathComponent)")
+        if !flag.isCancelled,
+           loadGate.wait(timeout: .now() + gateTimeout) == .success {
+            if flag.isCancelled {
+                loadGate.signal()
+            } else {
+                image = LANFolderThumbnailDiskCache.image(
+                    for: url,
+                    folderID: folderID,
+                    rootURL: rootURL,
+                    maxPixelSize: maxPixelSize
+                )
+                loadGate.signal()
+                if let image {
+                    LANFolderImageCache.shared.store(image, forKey: key)
+                }
+            }
         }
         finish(key: key, image: image)
     }

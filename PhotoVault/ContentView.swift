@@ -103,7 +103,7 @@ struct ContentView: View {
                     }
                     .tag(PhotoSection.unsorted)
 
-                    Label("局域网相册", systemImage: "wifi")
+                    Label("文件夹相册", systemImage: "folder")
                         .tag(PhotoSection.lan)
                 }
 

@@ -22,7 +22,7 @@
 | 图库页 | 侧栏选中“图库”后的全库网格 | `PhotoGridScreen` |
 | 相册网格页 | 点开某个普通/共享相册后的网格 | `PhotoGridScreen`（album 模式） |
 | 未整理页 | 未整理照片网格（SQLite 元数据分页） | `UnsortedPhotosScreen` |
-| 局域网相册页 | 侧栏“局域网相册”进入的网络共享浏览入口 | `LANAlbumHomeScreen` |
+| 文件夹相册页 | 侧栏“文件夹相册”进入的外部文件夹浏览入口（SMB/NAS、本机、U 盘） | `LANAlbumHomeScreen` |
 | 详情页 | 全屏看图 + 左右翻页；统称叫“详情页”，需要区分时叫“普通详情页 / 未整理详情页” | `PhotoViewerView` / `IndexedPhotoViewerView` |
 | 幻灯片页 | 自动播放的全屏页，同样分普通/未整理两种 | `SlideshowView` / `IndexedSlideshowView` |
 | 设置面板 | 首页右上角入口弹出的设置 sheet | `PhotoVaultSettingsView` |
@@ -103,12 +103,13 @@
 - 详情返回时不要因为 `isActive` 恢复就无条件对相册网格调用 `reloadData()`；这会清掉已经显示的缩略图并重新显示 loading，和全屏退出动画叠加成闪屏。未变化的数据应保留可见 cell，只恢复取消的请求；数据源变化时才整体刷新。
 - `NativePhotoPager` 销毁时先解除 `UIPageViewController` 的 delegate/dataSource；未整理详情的分页元数据请求必须用代次校验，页面消失后丢弃旧回调。
 
-## 局域网相册（文件夹）
+## 文件夹相册（局域网/本地/U 盘文件夹）
 
-- “局域网相册”的实体是用户通过文件 App（含 SMB/NAS 共享）选中的文件夹：`LANFolderLibrary` 保存安全作用域书签（`PhotoVault.lanFolders.v1`），跨启动靠 `URL(resolvingBookmarkData:)` 恢复访问；书签失效（共享断开）时提示重新添加，不做静默失败。
+- “文件夹相册”的实体是用户通过文件 App 选中的文件夹：`LANFolderLibrary` 保存安全作用域书签（`PhotoVault.lanFolders.v1`），跨启动靠 `URL(resolvingBookmarkData:)` 恢复访问；书签失效（共享断开、U 盘拔出）时提示重新添加，不做静默失败。来源不限（SMB/NAS 共享、本机“我的 iPhone”、外接 U 盘），文件 App 能到的文件夹都能加。
 - 图片枚举递归全文件夹、按修改时间倒序，走 `FileManager.enumerator`（后台线程）；图片解码必须走 ImageIO 降采样（`CGImageSourceCreateThumbnailAtIndex` + `ThumbnailMaxPixelSize`，缩略图 512、查看 2048），禁止 `UIImage(data:)` 全尺寸解码进网格——50MP 文件全解码是主线程杀手。
 - 安全作用域由 `LANFolderScopeManager` 会话期内持有（幂等激活，不随页面退出释放），反复启停 scope 会触发 SMB provider 往返、表现为相册卡死；图片加载一律走 `LANFolderImageLoaderQueue`：同 URL 请求必须合并（in-flight 去重），信号量限 3 并发且等待带超时（毒槽不放大队列），禁止每个 cell 直接 detached 任务做同步网络文件解码——SMB 读是网络往返，几十个并发阻塞任务会榨干 Swift 协作线程池，整个 App 冻结。文件夹解析/激活/枚举整链必须经 `LANFolderTimeout` 跑在 GCD 线程上并限时 20 秒，超时明确报错而不是无限转圈。
 - `LANFolderTimeout` 必须用 GCD 竞速（ResultBox + 信号量，先完成者胜出），禁止用任务组等待全部子任务——阻塞遍历不响应取消，等败者等于没有超时（曾导致二次进入相册必然卡死）。枚举结果存 `LANFolderSessionCache`，会话内再次进入同一文件夹直接回放缓存，禁止重复触发 SMB 全量遍历。
+- 大相册（成千上万张、单张几十 MB）的性能红线：缩略图必须落盘缓存（`LANFolderThumbnailDiskCache`，Caches 下按相册 ID 分目录，键 = 相对路径 + mtime + 尺寸，删除相册时同步清理）；内存缓存必须带 `totalCostLimit`（64MB），NSCache 会随内存压力自动驱逐；解码槽必须感知取消（`LANFolderCancellationFlag`），离屏 cell 不得占用限流槽位。
 - 幻灯片与本地规则一致：单可见页单向推进（5 秒）、crossfade、点击暂停/继续，不用重建式 TabView。
 - 文件夹访问（`startAccessingSecurityScopedResource`）必须与 `stopAccessing` 成对出现；图片加载按文件各自包裹即可。
 

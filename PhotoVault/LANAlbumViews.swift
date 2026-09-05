@@ -30,6 +30,9 @@ struct LANAlbumHomeScreen: View {
                         }
                     }
                     .onDelete { offsets in
+                        for index in offsets where folders.indices.contains(index) {
+                            LANFolderThumbnailDiskCache.purge(folderID: folders[index].id)
+                        }
                         folders.remove(atOffsets: offsets)
                         LANFolderLibrary.save(folders)
                     }
@@ -37,7 +40,7 @@ struct LANAlbumHomeScreen: View {
             } header: {
                 Text("已添加")
             } footer: {
-                Text("先在文件 App 里连接共享服务器（SMB/NAS），再选择文件夹当作相册；浏览内容为文件夹内的全部图片。")
+                Text("来源不限：局域网 SMB/NAS 共享、本机文件夹、外接 U 盘都可以。先在文件 App 里连接服务器或挂载设备，再选择文件夹即可当作相册。")
             }
 
             Section {
@@ -48,7 +51,7 @@ struct LANAlbumHomeScreen: View {
                 }
             }
         }
-        .navigationTitle("局域网相册")
+        .navigationTitle("文件夹相册")
         .sheet(isPresented: $isShowingPicker) {
             LANFolderPicker { pickedURL in
                 if let album = LANFolderLibrary.add(from: pickedURL) {
@@ -121,6 +124,7 @@ struct LANFolderGridScreen: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var files: [URL] = []
+    @State private var folderURL: URL?
     @State private var isEnumerating = true
     @State private var enumerateError: String?
     @State private var viewerIndex: Int?
@@ -162,7 +166,12 @@ struct LANFolderGridScreen: View {
                                 Color.clear
                                     .aspectRatio(1, contentMode: .fit)
                                     .overlay {
-                                        LANFolderImageView(url: fileURL, maxPixelSize: 512)
+                                        LANFolderImageView(
+                                            url: fileURL,
+                                            folderID: folder.id,
+                                            rootURL: folderURL ?? fileURL,
+                                            maxPixelSize: 512
+                                        )
                                     }
                                     .clipped()
                             }
@@ -194,12 +203,23 @@ struct LANFolderGridScreen: View {
                 set: { if !$0 { viewerIndex = nil } }
             )
         ) {
-            if let viewerBinding {
-                LANFolderViewerScreen(files: files, index: viewerBinding)
+            if let viewerBinding, let folderURL {
+                LANFolderViewerScreen(
+                    files: files,
+                    folderID: folder.id,
+                    rootURL: folderURL,
+                    index: viewerBinding
+                )
             }
         }
         .fullScreenCover(isPresented: $isShowingSlideshow) {
-            LANFolderSlideshowScreen(files: files)
+            if let folderURL {
+                LANFolderSlideshowScreen(
+                    files: files,
+                    folderID: folder.id,
+                    rootURL: folderURL
+                )
+            }
         }
     }
 
@@ -209,6 +229,11 @@ struct LANFolderGridScreen: View {
             get: { viewerIndex ?? 0 },
             set: { viewerIndex = $0 }
         )
+    }
+
+    private struct EnumerationResult: Sendable {
+        let url: URL?
+        let files: [URL]?
     }
 
     private func enumerate() async {
@@ -225,17 +250,22 @@ struct LANFolderGridScreen: View {
         let album = folder
         // Resolve + activate + enumerate can each block against a dead or
         // slow share; cap the whole pass so the screen never spins forever.
-        let result: [URL]?? = await LANFolderTimeout.run(seconds: 20) {
-            guard let url = LANFolderLibrary.resolve(album) else { return nil }
+        let outcome: EnumerationResult? = await LANFolderTimeout.run(seconds: 20) {
+            guard let url = LANFolderLibrary.resolve(album) else {
+                return EnumerationResult(url: nil, files: nil)
+            }
             // Hold the security scope for the whole session; re-acquiring it
             // on every visit stalled the album behind provider round trips.
             LANFolderScopeManager.shared.activate(id: album.id, url: url)
-            return LANFolderImageLoader.enumerateImageFiles(under: url)
+            return EnumerationResult(
+                url: url,
+                files: LANFolderImageLoader.enumerateImageFiles(under: url)
+            )
         }
-        let flattened: [URL]? = (result ?? nil)
-        files = flattened ?? []
-        if let flattened {
-            LANFolderSessionCache.store(files: flattened, for: album.id)
+        if let outcome, let url = outcome.url, let enumerated = outcome.files {
+            folderURL = url
+            files = enumerated
+            LANFolderSessionCache.store(files: enumerated, for: album.id)
         } else {
             enumerateError = "文件夹访问超时或已不可访问，请检查共享连接后重试，或删除后重新添加。"
         }
@@ -247,6 +277,8 @@ struct LANFolderGridScreen: View {
 
 private struct LANFolderImageView: View {
     let url: URL
+    let folderID: UUID
+    let rootURL: URL
     let maxPixelSize: CGFloat
 
     @State private var image: UIImage?
@@ -265,6 +297,8 @@ private struct LANFolderImageView: View {
         .task(id: "\(url.path)#\(Int(maxPixelSize))") {
             image = await LANFolderImageLoaderQueue.load(
                 at: url,
+                folderID: folderID,
+                rootURL: rootURL,
                 maxPixelSize: maxPixelSize
             )
         }
@@ -275,6 +309,8 @@ private struct LANFolderImageView: View {
 
 struct LANFolderViewerScreen: View {
     let files: [URL]
+    let folderID: UUID
+    let rootURL: URL
     @Binding var index: Int
 
     @Environment(\.dismiss) private var dismiss
@@ -291,8 +327,13 @@ struct LANFolderViewerScreen: View {
                 .opacity(1 - Double(dismissProgress) * 0.7)
                 .ignoresSafeArea()
 
-            LANFolderImageView(url: fileURL, maxPixelSize: 2048)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            LANFolderImageView(
+                url: fileURL,
+                folderID: folderID,
+                rootURL: rootURL,
+                maxPixelSize: 2048
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .offset(dragOffset)
                 .scaleEffect(1 - dismissProgress * 0.08)
                 .contentShape(Rectangle())
@@ -387,6 +428,8 @@ struct LANFolderViewerScreen: View {
 /// same architecture rule as the local slideshows, never a rebuilt TabView.
 struct LANFolderSlideshowScreen: View {
     let files: [URL]
+    let folderID: UUID
+    let rootURL: URL
 
     @Environment(\.dismiss) private var dismiss
     @State private var index = 0
@@ -399,7 +442,12 @@ struct LANFolderSlideshowScreen: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            LANFolderImageView(url: files[index], maxPixelSize: 2048)
+            LANFolderImageView(
+                url: files[index],
+                folderID: folderID,
+                rootURL: rootURL,
+                maxPixelSize: 2048
+            )
                 .id(index)
                 .transition(.opacity)
                 .animation(.easeInOut(duration: 0.6), value: index)
