@@ -1,15 +1,60 @@
 import CryptoKit
 import Foundation
 import ImageIO
+import os
 import UIKit
 import UniformTypeIdentifiers
+
+/// DEBUG breadcrumbs for the folder access chain (resolve → scope →
+/// enumerate): written to OSLog AND to a sandbox file
+/// (Library/Caches/PhotoVault/lan-folder.log, size-capped) so a device run
+/// can be pulled with devicectl and matched against the user's report.
+enum LANFolderDiagnostics {
+    #if DEBUG
+    private static let logger = Logger(subsystem: "com.misswell.PhotoVault", category: "LANFolder")
+    private static let lock = NSLock()
+    private static let maxBytes = 256 * 1024
+    private static let timestampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
+
+    static func log(_ message: String) {
+        logger.log("\(message, privacy: .public)")
+        appendToFile(message)
+    }
+
+    private static func appendToFile(_ message: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return
+        }
+        let directory = caches.appendingPathComponent("PhotoVault", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("lan-folder.log")
+        var data = (try? Data(contentsOf: fileURL)) ?? Data()
+        if data.count > maxBytes {
+            data = Data(data.suffix(maxBytes / 2))
+            if let newline = data.range(of: Data("\n".utf8)) {
+                data.removeSubrange(data.startIndex..<newline.lowerBound)
+            }
+        }
+        data.append(Data("\(timestampFormatter.string(from: Date())) \(message)\n".utf8))
+        try? data.write(to: fileURL, options: .atomic)
+    }
+    #else
+    static func log(_ message: String) {}
+    #endif
+}
 
 /// A folder the user picked through the Files app (an SMB/NAS share, a
 /// network drive, iCloud, anything Files can reach) and wants treated as one
 /// album. Access survives relaunches through a security-scoped bookmark; if
 /// the underlying share is gone the bookmark fails to resolve and the folder
 /// must be re-added.
-struct LANFolderAlbum: Codable, Identifiable, Equatable {
+struct LANFolderAlbum: Codable, Identifiable, Equatable, Hashable {
     let id: UUID
     var name: String
     var bookmark: Data
@@ -29,31 +74,179 @@ enum LANFolderLibrary {
         UserDefaults.standard.set(data, forKey: storageKey)
     }
 
+    /// Outcome of an add: one physical folder keeps exactly one entry, so a
+    /// re-pick of an already-registered folder refreshes that entry's
+    /// bookmark (a fresh pick carries a fresh access grant) and prunes older
+    /// duplicates instead of appending another row.
+    struct AddResult: Sendable {
+        enum Outcome: Sendable {
+            case added
+            case duplicate(LANFolderAlbum)
+        }
+
+        let outcome: Outcome
+        /// The authoritative list after the add — the caller's state must be
+        /// replaced with this, since pruning may have removed older rows.
+        let folders: [LANFolderAlbum]
+    }
+
     /// Creates a persisted security-scoped bookmark for the picked folder.
-    static func add(from pickedURL: URL) -> LANFolderAlbum? {
+    /// Resolving stored bookmarks is a provider round trip each, so the
+    /// matching runs off the main thread and a dead share cannot hang the
+    /// picker callback.
+    static func add(from pickedURL: URL) async -> AddResult? {
         guard let bookmark = try? pickedURL.bookmarkData(
             options: [],
             includingResourceValuesForKeys: nil,
             relativeTo: nil
         ) else { return nil }
-        return LANFolderAlbum(
+        let candidate = LANFolderAlbum(
             id: UUID(),
             name: pickedURL.lastPathComponent,
             bookmark: bookmark,
             addedAt: .now
         )
+        let pickedPath = pickedURL.standardizedFileURL.path
+
+        return await Task.detached(priority: .userInitiated) {
+            var kept: [LANFolderAlbum] = []
+            var seenPaths = Set<String>()
+            var duplicate: LANFolderAlbum?
+            for folder in load() {
+                guard let storedPath = resolve(folder)?.standardizedFileURL.path else {
+                    kept.append(folder)
+                    continue
+                }
+                if storedPath == pickedPath {
+                    // The entry matching the pick is the one being reused —
+                    // keep it; only later same-path rows get pruned below.
+                    if duplicate == nil { duplicate = folder }
+                    kept.append(folder)
+                    seenPaths.insert(storedPath)
+                    continue
+                }
+                // A stored entry resolving to an already-seen path is a
+                // historical duplicate of an earlier row — drop it.
+                guard seenPaths.insert(storedPath).inserted else { continue }
+                kept.append(folder)
+            }
+            if let duplicate {
+                // The fresh pick carries a fresh access grant: refresh the
+                // stored bookmark so a folder whose scope restoration went
+                // stale heals with one re-pick instead of delete + re-add.
+                var healed = duplicate
+                healed.bookmark = bookmark
+                healed.name = candidate.name
+                healed.addedAt = candidate.addedAt
+                kept = kept.map { $0.id == healed.id ? healed : $0 }
+                save(kept)
+                return AddResult(outcome: .duplicate(healed), folders: kept)
+            }
+            kept.append(candidate)
+            save(kept)
+            return AddResult(outcome: .added, folders: kept)
+        }.value
+    }
+
+    /// Launches the file-provider daemons for every registered folder in the
+    /// background. Grant restoration can fail while a provider daemon is
+    /// still coming up after a cold start, so touching them when the folder
+    /// list opens keeps the first folder tap from racing the mount. This is
+    /// fire-and-forget — a failed warm-up is silently retried by the next
+    /// entry, and the entry flow itself falls back to re-authorization.
+    static func warmScopes() async {
+        let folders = load()
+        guard !folders.isEmpty else { return }
+        await Task.detached(priority: .utility) {
+            for folder in folders {
+                guard let url = resolve(folder) else { continue }
+                LANFolderScopeManager.shared.activate(id: folder.id, url: url)
+            }
+        }.value
+    }
+
+
+    /// When the security scope is denied, this probes the remaining system
+    /// access paths for the folder — a coordinated read through
+    /// NSFileCoordinator is the provider-negotiation channel and can reach
+    /// content that `startAccessingSecurityScopedResource` refused. Inside a
+    /// successful coordinated read the scope is registered as held for the
+    /// session, so the caller can enumerate and display content normally.
+    /// Every step is logged for device-side diagnosis.
+    static func coordinatedEnumerate(id: UUID, url: URL) -> [URL]? {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        let intent = NSFileAccessIntent.readingIntent(with: url, options: [])
+        var result: [URL]?
+        let queue = OperationQueue()
+        let done = DispatchSemaphore(value: 0)
+
+        coordinator.coordinate(with: [intent], queue: queue) { error in
+            defer { done.signal() }
+            if let error {
+                LANFolderDiagnostics.log("coordinated read denied: \(error.localizedDescription)")
+                return
+            }
+            LANFolderDiagnostics.log("coordinated read granted")
+            // The coordination channel is what the provider honors here —
+            // enumerate inside it regardless of the startAccessing BOOL
+            // (this provider refuses startAccessing while granting
+            // coordinated access; observed on device).
+            let scope = url.startAccessingSecurityScopedResource()
+            if scope {
+                LANFolderScopeManager.shared.noteScopeHeld(id: id, url: url)
+            }
+            result = LANFolderImageLoader.enumerateImageFiles(under: url)
+            LANFolderDiagnostics.log(
+                "coordinated enumerated \(result?.count ?? 0) files (startAccessing=\(scope))"
+            )
+        }
+        done.wait()
+        return result
     }
 
     /// Resolves the bookmark back to a usable folder URL, or nil when the
     /// share is unreachable and the entry needs re-adding.
     static func resolve(_ album: LANFolderAlbum) -> URL? {
         var stale = false
-        return try? URL(
+        let url = try? URL(
             resolvingBookmarkData: album.bookmark,
             options: [],
             relativeTo: nil,
             bookmarkDataIsStale: &stale
         )
+        if url == nil {
+            LANFolderDiagnostics.log("resolve failed for \(album.name)")
+        } else if stale {
+            LANFolderDiagnostics.log("resolved \(album.name): bookmark STALE")
+        }
+        return url
+    }
+
+    /// A stale bookmark still resolves, but providers sometimes stop
+    /// serving that resolved path after a remount (share reconnect, USB
+    /// re-plug). Re-anchoring the persisted bookmark while the security
+    /// scope is held heals those entries; a refresh that fails leaves the
+    /// stored bookmark untouched.
+    static func refreshBookmarkIfStale(_ album: LANFolderAlbum, resolvedURL: URL) {
+        var stale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: album.bookmark,
+            options: [],
+            relativeTo: nil,
+            bookmarkDataIsStale: &stale
+        ), stale,
+        let refreshed = try? url.bookmarkData(
+            options: [],
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        ) else { return }
+
+        var folders = load()
+        guard let index = folders.firstIndex(where: { $0.id == album.id }) else { return }
+        var updated = album
+        updated.bookmark = refreshed
+        folders[index] = updated
+        save(folders)
     }
 }
 
@@ -72,18 +265,34 @@ final class LANFolderScopeManager: @unchecked Sendable {
     private var active: [UUID: ActiveScope] = [:]
     private let lock = NSLock()
 
-    /// Idempotent: activating an already-active folder is a no-op.
-    func activate(id: UUID, url: URL) {
+    /// Idempotent: activating an already-active folder is a no-op. Returns
+    /// whether the security scope is held — a `false` means file-provider
+    /// content is unreachable and the caller must not treat the folder as
+    /// (or cache it as) empty, nor refresh its bookmark from this URL: a
+    /// bookmark minted without a held scope carries no credentials and
+    /// permanently downgrades the stored one.
+    @discardableResult
+    func activate(id: UUID, url: URL) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         if let existing = active[id] {
-            guard existing.url != url || !existing.started else { return }
+            guard existing.url != url || !existing.started else { return existing.started }
             if existing.started {
                 existing.url.stopAccessingSecurityScopedResource()
             }
         }
         let started = url.startAccessingSecurityScopedResource()
         active[id] = ActiveScope(url: url, started: started)
+        return started
+    }
+
+    /// Records a scope that was started through another path (e.g. inside an
+    /// NSFileCoordinator accessor) so the session-held bookkeeping stays
+    /// accurate without a second startAccessing call.
+    func noteScopeHeld(id: UUID, url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        active[id] = ActiveScope(url: url, started: true)
     }
 }
 
@@ -131,7 +340,12 @@ enum LANFolderImageLoader {
                 .isRegularFileKey,
                 .contentModificationDateKey,
             ])
-            guard values?.isRegularFile == true else { continue }
+            // A failed per-file attribute fetch must not drop the file:
+            // file providers hand out the directory listing but fail the
+            // per-file queries while reconnecting, which used to enumerate
+            // a folder full of images down to zero files. Only a confirmed
+            // non-file (directory named "*.jpg") is skipped.
+            guard values?.isRegularFile != false else { continue }
             files.append((fileURL, values?.contentModificationDate))
         }
 
@@ -142,9 +356,29 @@ enum LANFolderImageLoader {
 
     /// Downscaled decode through ImageIO. A full-resolution decode of a 50MP
     /// file inside a grid cell is exactly the main-thread hitch we never
-    /// allow; callers run this off the main actor. Folder scope must already
-    /// be held via `LANFolderScopeManager`.
+    /// allow; callers run this off the main actor. The read is wrapped in an
+    /// NSFileCoordinator coordinated access — the channel file providers
+    /// honor even where startAccessing-based scope is refused.
     static func image(at url: URL, maxPixelSize: CGFloat) -> UIImage? {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        let intent = NSFileAccessIntent.readingIntent(with: url, options: [])
+        var decoded: UIImage?
+        let done = DispatchSemaphore(value: 0)
+        let queue = OperationQueue()
+
+        coordinator.coordinate(with: [intent], queue: queue) { error in
+            defer { done.signal() }
+            if let error {
+                LANFolderDiagnostics.log("image coordinated read denied: \(error.localizedDescription)")
+                return
+            }
+            decoded = decodeImage(at: url, maxPixelSize: maxPixelSize)
+        }
+        done.wait()
+        return decoded
+    }
+
+    private static func decodeImage(at url: URL, maxPixelSize: CGFloat) -> UIImage? {
         let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithURL(url as CFURL, sourceOptions) else {
             return nil

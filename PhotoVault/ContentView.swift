@@ -498,8 +498,17 @@ struct ContentView: View {
             UnsortedPhotosScreen(store: store)
                 .id("unsorted-detail")
         case .lan:
-            LANAlbumHomeScreen()
-                .id("lan-detail")
+            // The LAN home is the only detail screen that pushes a second
+            // level (NavigationLink into a folder grid). On compact width
+            // that push lands on the split view's own internal navigation
+            // stack; popping it corrupts the split view's detail-presentation
+            // state and every sidebar row silently stops navigating. Give the
+            // branch a dedicated NavigationStack so the folder push stays
+            // inside it.
+            NavigationStack {
+                LANAlbumHomeScreen()
+            }
+            .id("lan-detail")
         case .album(let id):
             if let album = store.album(withID: id) {
                 PhotoGridScreen(
