@@ -1024,8 +1024,11 @@ struct LANFolderSlideshowScreen: View {
     @State private var controlsVisible = true
     @State private var isPaused = false
     @State private var isShuffled = false
-    @State private var loops = true
-    @State private var interval: TimeInterval = 5
+    @AppStorage(SlideshowSettings.loopsStorageKey)
+    private var loops = SlideshowSettings.defaultLoops
+    @AppStorage(SlideshowSettings.intervalStorageKey)
+    private var interval: TimeInterval = SlideshowSettings.defaultInterval
+    @State private var stoppedAtEnd = false
     @State private var previousIdleTimerDisabled = false
     @AppStorage(SlideshowTransitionStyle.storageKey)
     private var transitionStyleRawValue = SlideshowTransitionStyle.fade.rawValue
@@ -1108,7 +1111,7 @@ struct LANFolderSlideshowScreen: View {
                             .accessibilityLabel(isShuffled ? "关闭随机播放" : "随机播放")
 
                             Menu {
-                                ForEach([3.0, 5.0, 8.0, 12.0], id: \.self) { value in
+                                ForEach(SlideshowSettings.intervalValues, id: \.self) { value in
                                     Button("每 \(Int(value)) 秒") {
                                         interval = value
                                     }
@@ -1118,7 +1121,7 @@ struct LANFolderSlideshowScreen: View {
                             }
 
                             Button {
-                                loops.toggle()
+                                toggleLooping()
                             } label: {
                                 Image(systemName: loops ? "repeat.circle.fill" : "repeat.circle")
                             }
@@ -1188,12 +1191,14 @@ struct LANFolderSlideshowScreen: View {
 
     private func showPrevious() {
         guard files.count > 1 else { return }
+        stoppedAtEnd = false
         currentIndex = currentIndex == 0 ? files.count - 1 : currentIndex - 1
     }
 
     private func showNext() {
         guard files.count > 1 else { return }
         if isShuffled {
+            stoppedAtEnd = false
             var nextIndex = currentIndex
             while nextIndex == currentIndex {
                 nextIndex = Int.random(in: 0..<files.count)
@@ -1201,12 +1206,24 @@ struct LANFolderSlideshowScreen: View {
             currentIndex = nextIndex
         } else if currentIndex == files.count - 1 {
             if loops {
+                stoppedAtEnd = false
+                isPaused = false
                 currentIndex = 0
             } else {
+                stoppedAtEnd = true
                 isPaused = true
             }
         } else {
+            stoppedAtEnd = false
             currentIndex += 1
+        }
+    }
+
+    private func toggleLooping() {
+        loops.toggle()
+        if loops && stoppedAtEnd {
+            stoppedAtEnd = false
+            isPaused = false
         }
     }
 

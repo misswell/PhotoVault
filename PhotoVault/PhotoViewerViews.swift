@@ -4117,9 +4117,12 @@ struct SlideshowView: View {
     @State private var currentIndex = 0
     @State private var controlsVisible = true
     @State private var isPaused = false
-    @State private var interval: TimeInterval = 5
+    @AppStorage(SlideshowSettings.intervalStorageKey)
+    private var interval: TimeInterval = SlideshowSettings.defaultInterval
     @State private var isShuffled = false
-    @State private var loops = true
+    @AppStorage(SlideshowSettings.loopsStorageKey)
+    private var loops = SlideshowSettings.defaultLoops
+    @State private var stoppedAtEnd = false
     @State private var mediaReady = false
     @State private var previousIdleTimerDisabled = false
     @State private var isFullScreen = false
@@ -4224,7 +4227,7 @@ struct SlideshowView: View {
                             .accessibilityLabel(isShuffled ? "关闭随机播放" : "随机播放")
 
                             Menu {
-                                ForEach([3.0, 5.0, 8.0, 12.0], id: \.self) { value in
+                                ForEach(SlideshowSettings.intervalValues, id: \.self) { value in
                                     Button("每 \(Int(value)) 秒") {
                                         interval = value
                                     }
@@ -4234,7 +4237,7 @@ struct SlideshowView: View {
                             }
 
                             Button {
-                                loops.toggle()
+                                toggleLooping()
                             } label: {
                                 Image(systemName: loops ? "repeat.circle.fill" : "repeat.circle")
                             }
@@ -4329,12 +4332,14 @@ struct SlideshowView: View {
 
     private func showPrevious() {
         guard assets.count > 1 else { return }
+        stoppedAtEnd = false
         currentIndex = currentIndex == 0 ? assets.count - 1 : currentIndex - 1
     }
 
     private func showNext() {
         guard assets.count > 1 else { return }
         if isShuffled {
+            stoppedAtEnd = false
             var nextIndex = currentIndex
             while nextIndex == currentIndex {
                 nextIndex = Int.random(in: 0..<assets.count)
@@ -4342,12 +4347,24 @@ struct SlideshowView: View {
             currentIndex = nextIndex
         } else if currentIndex == assets.count - 1 {
             if loops {
+                stoppedAtEnd = false
+                isPaused = false
                 currentIndex = 0
             } else {
+                stoppedAtEnd = true
                 isPaused = true
             }
         } else {
+            stoppedAtEnd = false
             currentIndex += 1
+        }
+    }
+
+    private func toggleLooping() {
+        loops.toggle()
+        if loops && stoppedAtEnd {
+            stoppedAtEnd = false
+            isPaused = false
         }
     }
 
@@ -4376,9 +4393,12 @@ struct IndexedSlideshowView: View {
     @State private var mediaReady = false
     @State private var controlsVisible = true
     @State private var isPaused = false
-    @State private var interval: TimeInterval = 5
+    @AppStorage(SlideshowSettings.intervalStorageKey)
+    private var interval: TimeInterval = SlideshowSettings.defaultInterval
     @State private var isShuffled = false
-    @State private var loops = true
+    @AppStorage(SlideshowSettings.loopsStorageKey)
+    private var loops = SlideshowSettings.defaultLoops
+    @State private var stoppedAtEnd = false
     @State private var previousIdleTimerDisabled = false
     @State private var isFullScreen = false
     @AppStorage(SlideshowTransitionStyle.storageKey)
@@ -4471,14 +4491,14 @@ struct IndexedSlideshowView: View {
                             }
 
                             Menu {
-                                ForEach([3.0, 5.0, 8.0, 12.0], id: \.self) { value in
+                                ForEach(SlideshowSettings.intervalValues, id: \.self) { value in
                                     Button("每 \(Int(value)) 秒") { interval = value }
                                 }
                             } label: {
                                 Label("\(Int(interval)) 秒", systemImage: "speedometer")
                             }
 
-                            Button { loops.toggle() } label: {
+                            Button { toggleLooping() } label: {
                                 Image(systemName: loops ? "repeat.circle.fill" : "repeat.circle")
                             }
 
@@ -4563,12 +4583,14 @@ struct IndexedSlideshowView: View {
 
     private func showPrevious() {
         guard totalCount > 1 else { return }
+        stoppedAtEnd = false
         currentIndex = currentIndex == 0 ? totalCount - 1 : currentIndex - 1
     }
 
     private func showNext() {
         guard totalCount > 1 else { return }
         if isShuffled {
+            stoppedAtEnd = false
             var nextIndex = currentIndex
             while nextIndex == currentIndex {
                 nextIndex = Int.random(in: 0..<totalCount)
@@ -4576,12 +4598,24 @@ struct IndexedSlideshowView: View {
             currentIndex = nextIndex
         } else if currentIndex == totalCount - 1 {
             if loops {
+                stoppedAtEnd = false
+                isPaused = false
                 currentIndex = 0
             } else {
+                stoppedAtEnd = true
                 isPaused = true
             }
         } else {
+            stoppedAtEnd = false
             currentIndex += 1
+        }
+    }
+
+    private func toggleLooping() {
+        loops.toggle()
+        if loops && stoppedAtEnd {
+            stoppedAtEnd = false
+            isPaused = false
         }
     }
 

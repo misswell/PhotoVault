@@ -263,6 +263,14 @@ enum SlideshowTransitionStyle: String, CaseIterable, Identifiable {
     }
 }
 
+enum SlideshowSettings {
+    static let intervalStorageKey = "PhotoVault.slideshow.interval"
+    static let loopsStorageKey = "PhotoVault.slideshow.loops"
+    static let defaultInterval: TimeInterval = 5
+    static let defaultLoops = true
+    static let intervalValues: [TimeInterval] = [3, 5, 8, 12]
+}
+
 struct PhotoViewerRequest: Identifiable {
     let id = UUID()
     let index: Int
