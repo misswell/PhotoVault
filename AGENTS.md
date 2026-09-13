@@ -64,6 +64,7 @@
 - iCloud 的低清/降级图片仍是可以显示的有效帧；不能把“还没拿到原图”当成空白页或阻塞分页。
 - 加载状态不能通过插入或移除大块 UI 改变布局，否则会导致页面跳动和点击错位。进度应放在不占布局的位置。
 - 网格刷新必须是缓存优先：`refresh()` 不得把已有的 `allPhotos` 置空，旧 fetch 结果（PHFetchResult 本身是活数据）在后台重新扫描期间继续显示，图库页/相册网格页不能出现整屏阻塞加载；后台扫描时在网格页右上角显示与首页同款的小号 `ProgressView`（`store.isLoadingAlbums && assets != nil` 时出现）。只有首次启动确实没有任何数据时才允许整屏“正在读取照片”。
+- 冷启动首帧只允许一个 PhotoKit 请求。启动窗口（`openLaunchWindow`：和整库同一个查询 + `fetchLimit`，取最新几百张）必须独占，解析完成后 `beginBulkRefresh` 才能发起整库 fetch、相册元数据扫描和变更观察者注册——实测把这几个一起打给 `photolibraryd`，会把几百条的启动窗口拖到 2.9s。`authorizationStatus` 不得在属性初始化式里同步读 `PHPhotoLibrary.authorizationStatus`（那会在 SwiftUI 第一次求值 body 时挡住首帧），要从 `UserDefaults` 种子起手、在 `start()` 里读真值纠正并落盘。整库结果一物化就要在主线程单独发布 `allPhotos`，不得和相册枚举合并在同一个回调里，否则 10 万张的网格要等 163 个相册查完才出现。启动耗时用 `photoVaultTraceLaunch` 记录，落在 `Library/Caches/PhotoVaultLaunch.log`（按 PID 分块追加，不随主诊断日志的 512 KB 滚动丢失）；查真机启动耗时就拉这个文件。注意 `xcrun devicectl device process terminate` 必须带 `--pid`，只给 bundle id 会报错退出、App 其实没被杀掉，测出来的都是「热启动」。
 - 列表滑动性能红线：索引扫描进度必须经 `publishIndexProgress` 节流（每秒最多 ~4 次，阶段切换和完成必发），禁止把每个扫描 tick 直接发布成 `@Published`——那会让首页、网格和弹出面板整树重建；`assets(in:)` 的 PHFetchResult 必须按相册 ID 缓存复用；相册行缩略图（首页/选择器/搜索结果）统一走 `albumThumbnailCache`（`cacheResult: true, cacheScope: .albumThumbnail, usesPhotoKitCaching: false`）；DEBUG 诊断日志只写 OSLog 和沙盒文件，不在主线程 `print`。
 
 ## 首页相册结构和布局
@@ -105,12 +106,16 @@
 
 ## 文件夹相册（局域网/本地/U 盘文件夹）
 
-- “文件夹相册”的实体是用户通过文件 App 选中的文件夹：`LANFolderLibrary` 保存安全作用域书签（`PhotoVault.lanFolders.v1`），跨启动靠 `URL(resolvingBookmarkData:)` 恢复访问；书签失效（共享断开、U 盘拔出）时提示重新添加，不做静默失败。来源不限（SMB/NAS 共享、本机“我的 iPhone”、外接 U 盘），文件 App 能到的文件夹都能加。
+- “文件夹相册”的实体是用户通过文件 App 选中的文件夹：`LANFolderLibrary` 保存安全作用域书签（`PhotoVault.lanFolders.v1`），跨启动靠 `URL(resolvingBookmarkData:)` 恢复访问；书签失效（共享断开、U 盘拔出）时提示重新添加，不做静默失败。来源不限（SMB/NAS 共享、本机“我的 iPhone”、外接 U 盘），文件 App 能到的文件夹都能加。同一物理文件夹只保留一个条目：`add(from:)` 用解析路径比对去重（书签字节每次生成不同，不能按字节比对），重复添加沿用现有条目并顺带剪掉历史重复行；匹配与剪枝有 provider 往返，必须在后台线程跑（防死共享挂住选择器回调），且**匹配到 pick 路径的既有条目必须保留**——那是被沿用的条目，剪掉的只能是后面同路径的重复行。
+- 文件夹相册是首页侧栏里唯一做二级 push 的 detail 页（LAN 主页里 `NavigationLink` 进文件夹网格）。compact 宽度下这个 push 绝不能落在 NavigationSplitView 自己的内部栈上——pop 回来会把 split view 的详情展示状态搞乱：一次返回直接跳回侧栏、之后侧栏所有行都点不进去（selection 绑定仍在更新、行保持选中态，但详情列不再展示，主线程并不卡）。因此 `.lan` 分支的 detail 内容必须包一层专属 `NavigationStack`（见 `ContentView.detailView`），让文件夹网格的 push/pop 收在这层栈里；改首页 detail 结构时不得去掉这层栈。
 - 图片枚举递归全文件夹、按修改时间倒序，走 `FileManager.enumerator`（后台线程）；图片解码必须走 ImageIO 降采样（`CGImageSourceCreateThumbnailAtIndex` + `ThumbnailMaxPixelSize`，缩略图 512、查看 2048），禁止 `UIImage(data:)` 全尺寸解码进网格——50MP 文件全解码是主线程杀手。
-- 安全作用域由 `LANFolderScopeManager` 会话期内持有（幂等激活，不随页面退出释放），反复启停 scope 会触发 SMB provider 往返、表现为相册卡死；图片加载一律走 `LANFolderImageLoaderQueue`：同 URL 请求必须合并（in-flight 去重），信号量限 3 并发且等待带超时（毒槽不放大队列），禁止每个 cell 直接 detached 任务做同步网络文件解码——SMB 读是网络往返，几十个并发阻塞任务会榨干 Swift 协作线程池，整个 App 冻结。文件夹解析/激活/枚举整链必须经 `LANFolderTimeout` 跑在 GCD 线程上并限时 20 秒，超时明确报错而不是无限转圈。
+- 安全作用域由 `LANFolderScopeManager` 会话期内持有（幂等激活，不随页面退出释放），反复启停 scope 会触发 SMB provider 往返、表现为相册卡死。`activate` 必须返回 `startAccessingSecurityScopedResource` 的结果：**拿到作用域失败 + 枚举 0 张 = 授权失效，不要阻塞重试，立即报错并自动弹出文件夹选择器重新授权**（选择器经 `directoryURL` 直接打开在目标文件夹父目录，用户选中该文件夹点"打开"即完成刷新并自动重新枚举；每次进入只自动弹一次）。**重复选择同一文件夹时 `add(from:)` 会用新书签刷新既有条目（重新选择=重新授权）**，这是失效文件夹的治疗路径。**冷启动后授权恢复有约 6~13 秒的概率性失败期（书签本身有效）**——靠进入文件夹列表时的后台预热（`warmScopes`，单次触碰唤醒 provider 守护进程，用户无感）来规避，入口流程本身不做阻塞重试。stale 书签只能在作用域真正拿到的前提下刷新（`refreshBookmarkIfStale` 已内置该前提）——拿着未授权的 URL 生成的新书签不含凭据，覆盖存储书签后文件夹会在每次重启后永久损坏、重试无效。图片加载一律走 `LANFolderImageLoaderQueue`：同 URL 请求必须合并（in-flight 去重），信号量限 3 并发且等待带超时（毒槽不放大队列），禁止每个 cell 直接 detached 任务做同步网络文件解码——SMB 读是网络往返，几十个并发阻塞任务会榨干 Swift 协作线程池，整个 App 冻结。文件夹解析/激活/枚举整链必须经 `LANFolderTimeout` 跑在 GCD 线程上并限时 20 秒，超时明确报错而不是无限转圈。诊断日志走 `LANFolderDiagnostics`（OSLog + 沙盒 `Library/Caches/PhotoVault/lan-folder.log`，devicectl 可拉取）。
 - `LANFolderTimeout` 必须用 GCD 竞速（ResultBox + 信号量，先完成者胜出），禁止用任务组等待全部子任务——阻塞遍历不响应取消，等败者等于没有超时（曾导致二次进入相册必然卡死）。枚举结果存 `LANFolderSessionCache`，会话内再次进入同一文件夹直接回放缓存，禁止重复触发 SMB 全量遍历。
-- 大相册（成千上万张、单张几十 MB）的性能红线：缩略图必须落盘缓存（`LANFolderThumbnailDiskCache`，Caches 下按相册 ID 分目录，键 = 相对路径 + mtime + 尺寸，删除相册时同步清理）；内存缓存必须带 `totalCostLimit`（64MB），NSCache 会随内存压力自动驱逐；解码槽必须感知取消（`LANFolderCancellationFlag`），离屏 cell 不得占用限流槽位。
-- 幻灯片与本地规则一致：单可见页单向推进（5 秒）、crossfade、点击暂停/继续，不用重建式 TabView。
+- 大相册（成千上万张、单张几十 MB）的性能红线：缩略图必须落盘缓存（`LANFolderThumbnailDiskCache`，Caches 下按相册 ID 分目录，键 = 相对路径 + mtime + 尺寸，删除相册时同步清理），枚举时顺手把已查到的 mtime 记进 `knownModificationDates`，避免为同一文件重复 `resourceValues`；内存缓存必须按用途分开并各带 `totalCostLimit`（缩略图 64MB / 全尺寸 72MB 且最多 6 张，见 `LANFolderImageCache`，`isFullSize` 以 1024pt 为界），NSCache 会随内存压力自动驱逐；解码槽必须感知取消——等待者用 `LANFolderLoadWaiter`（幂等 `resume`、取消时脱离并 resume nil），无等待者时直接跳过闸门，离屏 cell 不得占用限流槽位，也不得让已取消的请求白跑一遍 SMB 解码。
+- LAN 图片视图（`LANFolderImageView`）必须保持"上报尺寸 = 提案尺寸"：`Image.resizable().scaledToFill()` 会把溢出尺寸（如 810×810）上报给父布局，弹性 `.frame(maxWidth:.infinity)` 不截断它，ZStack 采纳后会把关闭按钮、计数器等兄弟控件排到屏幕外——表现为照片铺满全屏、无任何可点控件、无法退出。因此图片一律包在 `Color.clear.overlay { … }.clipped()` 里（网格 cell 早已如此）；查看器的下拉退出手势必须挂在全屏点击分区那一层（它盖在图片上方，挂在图片上的手势收不到触摸）。
+- 查看器/幻灯片两个 `fullScreenCover` 的内容绝不能用 `if let folderURL` 做条件：会话内二次进入文件夹走 `LANFolderSessionCache` 回放、不解析书签，`folderURL` 保持 nil，会呈现一个没有任何控件的空封面把用户困住。`rootURL` 传 `folderURL ?? URL(fileURLWithPath: "/")` 即可——磁盘缩略图缓存对不匹配的 root 会回退用绝对路径做键。
+- 枚举对 provider 瞬断必须有韧性：文件提供方（网盘/SMB/iCloud）断连或重连瞬间，目录列表可能照常返回但逐文件属性查询全部失败——扩展名命中的文件在 `resourceValues` 查询失败时不得丢弃（否则整个文件夹枚举成 0 张、显示"没有图片"）；空枚举结果不得写入 `LANFolderSessionCache`（否则整个会话被钉死在空列表），空状态提供"重试"按钮重新枚举。书签被标记 stale 时在持有 scope 期间刷新持久化书签（`LANFolderLibrary.refreshBookmarkIfStale`），枚举链路带 DEBUG OSLog 诊断（subsystem `com.misswell.PhotoVault`，category `LANFolder`）。
+- 文件夹的看图与幻灯片必须和相册同款体验（`LANFolderPager` + 重写后的 `LANFolderSlideshowScreen`）：查看器用 URL 版 `UIPageViewController` 分页器（左右连续滑动翻页、保当前页±邻页、程序化跳转带 pending 保护、下拉退出用手势仲裁 `require(toFail:)`），不要回退成点区域翻页；图片内容模式用 fit（整张显示，和相册一致），只有网格缩略图用 fill。幻灯片镜像相册 `SlideshowView`：单可见页 + `.task(id:)` 推进器（后台暂停、provider 交付不阻塞推进）、间隔/随机/循环控制、设置里的过渡样式（fade/slide/zoom/dissolve）、邻页预读走共享的 `LANFolderImageLoaderQueue`、播放时禁休眠。`LANFolderImageView` 必须保持"上报尺寸 = 提案尺寸"（`Color.clear.overlay { … }.clipped()`），`scaledToFill` 的溢出尺寸会把兄弟控件挤出屏幕。
 - 文件夹访问（`startAccessingSecurityScopedResource`）必须与 `stopAccessing` 成对出现；图片加载按文件各自包裹即可。
 
 ## 幻灯片和预读
@@ -142,6 +147,21 @@
 ## 构建、真机和发布验证
 
 - 应用图标有三套：主 `AppIcon`（含亮/暗外观变体，跟随系统自动切换）和备用 `AppIconLight` / `AppIconDark`（固定亮/暗）。备用图标靠 `ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES` 编译进包，手动切换走 `UIApplication.setAlternateIconName`（设置面板“应用图标”，`AppIconPreference.storageKey` 持久化用户选择；“跟随系统”传 nil 恢复主图标）。新增图标时必须同时建 appiconset、更新该编译设置；切换会触发系统确认弹窗，属正常行为。
+
+- TestFlight 上传使用 **App Store Connect API 密钥**（Xcode 的 Apple ID 会话几天就过期，"Failed to Use Accounts" 即此原因；API 密钥无有效期）：
+  - 本工作区直接用全局脚本：`~/.appstoreconnect/upload-testflight.sh build/PhotoVault-NN.xcarchive`（所有项目、所有 AI 工具通用；详见 `~/.appstoreconnect/README.md` 与 `~/.codex/AGENTS.md`）。
+  - 密钥：`photovault-cli`，Key ID `248D8U8C36`，Issuer ID `102e47ab-8e2a-4204-b82b-200d5287f267`，.p8 位于 `~/.appstoreconnect/private_keys/`（私有凭据，严禁提交进仓库或外发）；环境变量已配入 `~/.zshenv`。
+  - 本机分发证书：`Apple Distribution: Guofeng Liu (U8U443D7ZL)`（2026-09-06 经开发者门户 CSR 流程创建，私钥在登录钥匙串）。
+  - 也可直接调用命令（递增 build → archive 后）：
+    ```bash
+    xcodebuild -exportArchive -archivePath build/PhotoVault-NN.xcarchive \
+      -exportOptionsPlist build/ExportOptions-manual.plist \
+      -exportPath build/tf-export-NN \
+      -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_248D8U8C36.p8 \
+      -authenticationKeyID 248D8U8C36 \
+      -authenticationKeyIssuerID 102e47ab-8e2a-4204-b82b-200d5287f267
+    ```
+  - `build/ExportOptions-manual.plist` 用 **manual 签名**（显式 signingCertificate + 描述文件 "PhotoVault AppStore 17"）。API 密钥不能用 Xcode 的云端签名（"Cloud signing permission error"），账户会话过期时云端签名也不可用——所以之前"上午能传下午不能"。描述文件过期/失效时在开发者门户（浏览器登录 idmsa）重新生成一份包含该证书的 App Store 描述文件，安装到 `~/Library/Developer/Xcode/UserData/Provisioning Profiles/` 即可。
 
 - “推送到手机”指本地真机 build、install、launch，不等于只生成 `.app`。
 - 先检查 `xcrun devicectl list devices`。设备显示 paired 但 `unavailable` 时，通常是开发隧道断开；解锁手机、重新插拔数据线或恢复无线连接后再安装。

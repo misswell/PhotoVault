@@ -32,6 +32,7 @@ struct AssetImageView: View {
         cacheResult: Bool? = nil,
         cacheScope: PhotoImageCacheScope = .standard,
         usesPhotoKitCaching: Bool = true,
+        initialImage: UIImage? = nil,
         onLoadStateChange: ((Bool) -> Void)? = nil
     ) {
         self.asset = asset
@@ -42,6 +43,14 @@ struct AssetImageView: View {
         self.cacheScope = cacheScope
         self.usesPhotoKitCaching = usesPhotoKitCaching
         self.onLoadStateChange = onLoadStateChange
+        // Seed the first frame from an already-decoded thumbnail (typically
+        // the grid cell the viewer was opened from). Binding the displayed
+        // identifier at the same time keeps the "same asset" branch in
+        // `loadImage()` from clearing the frame we just seeded.
+        _image = State(initialValue: initialImage)
+        _displayedAssetIdentifier = State(
+            initialValue: initialImage == nil ? nil : asset.localIdentifier
+        )
     }
 
     var body: some View {
@@ -109,7 +118,11 @@ struct AssetImageView: View {
             }
         }
         .clipped()
-        .task(id: "\(requestKey)-\(loadAttempt)-\(requestPriority.rawValue)") {
+        // `requestPriority` is deliberately NOT part of the task identity.
+        // The viewer promotes a page from neighbour to current (and back)
+        // with every swipe; re-keying the task on that made each swipe cancel
+        // an in-flight full-size PhotoKit request and issue an identical one.
+        .task(id: "\(requestKey)-\(loadAttempt)") {
             loadImage()
         }
         .onDisappear {
@@ -131,7 +144,11 @@ struct AssetImageView: View {
         }
         loadProgress = nil
         loadError = nil
-        onLoadStateChange?(false)
+        // "Ready" means the viewer has a frame a user can look at, not that
+        // the final PhotoKit result has landed. A seeded preview (or a kept
+        // frame for the same asset) is already usable, so do not report the
+        // page as blank and flash a spinner over an image that is on screen.
+        onLoadStateChange?(image != nil)
 
         if usesPhotoKitCaching {
             PhotoImageManager.shared.startCaching(
@@ -168,7 +185,9 @@ struct AssetImageView: View {
                         for: hasError,
                         isCloudOnly: isCloudOnly
                     )
-                    self.onLoadStateChange?(false)
+                    // Keep reporting the frame that is still on screen: a
+                    // failed high-quality fetch must not blank a usable preview.
+                    self.onLoadStateChange?(self.image != nil)
                     return
                 }
                 guard let image else {
@@ -176,7 +195,7 @@ struct AssetImageView: View {
                         for: nil,
                         isCloudOnly: isCloudOnly
                     )
-                    self.onLoadStateChange?(false)
+                    self.onLoadStateChange?(self.image != nil)
                     return
                 }
                 self.loadError = nil
@@ -243,6 +262,7 @@ struct ZoomableAssetView: View {
     let targetSize: CGSize
     let contentMode: PHImageContentMode
     let requestPriority: PhotoRequestPriority
+    let initialImage: UIImage?
     let onLoadStateChange: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
 
@@ -251,6 +271,7 @@ struct ZoomableAssetView: View {
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFit,
         requestPriority: PhotoRequestPriority = .viewer,
+        initialImage: UIImage? = nil,
         onLoadStateChange: ((Bool) -> Void)? = nil,
         onZoomingChanged: ((Bool) -> Void)? = nil
     ) {
@@ -258,6 +279,7 @@ struct ZoomableAssetView: View {
         self.targetSize = targetSize
         self.contentMode = contentMode
         self.requestPriority = requestPriority
+        self.initialImage = initialImage
         self.onLoadStateChange = onLoadStateChange
         self.onZoomingChanged = onZoomingChanged
     }
@@ -276,6 +298,7 @@ struct ZoomableAssetView: View {
                 targetSize: targetSize,
                 contentMode: contentMode,
                 requestPriority: requestPriority,
+                initialImage: initialImage,
                 onLoadStateChange: onLoadStateChange
             )
             .frame(width: proxy.size.width, height: proxy.size.height)

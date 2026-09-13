@@ -320,7 +320,7 @@ struct PhotoGridView: UIViewRepresentable {
     let isActive: Bool
     let selectionMode: Bool
     let selectedIDs: Set<String>
-    let onOpen: (Int) -> Void
+    let onOpen: (PhotoOpenContext) -> Void
     let onToggleSelection: (PHAsset) -> Void
     let onFavorite: (PHAsset) -> Void
     let onShare: (PHAsset) -> Void
@@ -399,7 +399,7 @@ struct PhotoGridView: UIViewRepresentable {
         private var pinchDriver: PhotoGridPinchDriver?
         private weak var collectionView: UICollectionView?
 
-        private var onOpen: (Int) -> Void
+        private var onOpen: (PhotoOpenContext) -> Void
         private var onToggleSelection: (PHAsset) -> Void
         private var onFavorite: (PHAsset) -> Void
         private var onShare: (PHAsset) -> Void
@@ -415,7 +415,7 @@ struct PhotoGridView: UIViewRepresentable {
             isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
-            onOpen: @escaping (Int) -> Void,
+            onOpen: @escaping (PhotoOpenContext) -> Void,
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
             onShare: @escaping (PHAsset) -> Void,
@@ -534,7 +534,7 @@ struct PhotoGridView: UIViewRepresentable {
             isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
-            onOpen: @escaping (Int) -> Void,
+            onOpen: @escaping (PhotoOpenContext) -> Void,
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
             onShare: @escaping (PHAsset) -> Void,
@@ -642,7 +642,19 @@ struct PhotoGridView: UIViewRepresentable {
             if selectionMode {
                 onToggleSelection(asset)
             } else {
-                onOpen(indexPath.item)
+                // Hand the already-decoded frame to the viewer so it can paint
+                // its first frame without a PhotoKit round trip. This is a
+                // snapshot copy of the image, never a reference to the cell.
+                let previewImage = (
+                    collectionView.cellForItem(at: indexPath) as? PhotoGridCell
+                )?.previewImage
+                onOpen(
+                    PhotoOpenContext(
+                        index: indexPath.item,
+                        assetIdentifier: asset.localIdentifier,
+                        previewImage: previewImage
+                    )
+                )
             }
             collectionView.deselectItem(at: indexPath, animated: false)
         }
@@ -928,6 +940,12 @@ final class PhotoGridCell: UICollectionViewCell {
     private var representedIdentifier: String?
     private var representedTargetSize = CGSize.zero
 
+    /// The frame currently painted by this cell, if any. The viewer uses this
+    /// to render an instant first frame; it never retains the cell itself.
+    var previewImage: UIImage? {
+        imageView.image
+    }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
 
@@ -1018,8 +1036,22 @@ final class PhotoGridCell: UICollectionViewCell {
         representedAsset = asset
         representedIdentifier = asset.localIdentifier
         representedTargetSize = targetSize
-        imageView.image = nil
-        loadingIndicator.startAnimating()
+
+        // Serve an already-decoded thumbnail in the same frame. Without this
+        // probe every recycle blanked the cell and spun an indicator even for
+        // photos that had been on screen moments earlier.
+        if let cachedImage = PhotoImageManager.shared.cachedImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            scope: .gridThumbnail
+        ) {
+            imageView.image = cachedImage
+            loadingIndicator.stopAnimating()
+        } else {
+            imageView.image = nil
+            loadingIndicator.startAnimating()
+        }
 
         liveBadge.isHidden = !asset.mediaSubtypes.contains(.photoLive)
         videoDurationLabel.isHidden = asset.mediaType != .video
@@ -1037,7 +1069,8 @@ final class PhotoGridCell: UICollectionViewCell {
         // The prefetch data source owns the PHCachingImageManager window
         // (visible range plus the incoming edge). Caching here again per
         // cell recycle only adds PhotoKit churn and evicts entries the
-        // prefetcher just established.
+        // prefetcher just established. The decoded-result cache below is a
+        // separate, cost-bounded store owned by PhotoImageManager.
         requestHandle = PhotoImageManager.shared.requestImage(
             for: asset,
             targetSize: targetSize,
@@ -1046,6 +1079,8 @@ final class PhotoGridCell: UICollectionViewCell {
             resizeMode: .fast,
             priority: .photoGrid,
             isNetworkAccessAllowed: true,
+            cacheResult: true,
+            cacheScope: .gridThumbnail,
             progressHandler: { [weak self] progress, error, _, _ in
                 Task { @MainActor [weak self] in
                     guard let self,
@@ -1068,10 +1103,15 @@ final class PhotoGridCell: UICollectionViewCell {
             guard !cancelled else { return }
             Task { @MainActor [weak self] in
                 guard let self,
-                      self.representedIdentifier == asset.localIdentifier
+                      self.representedIdentifier == asset.localIdentifier,
+                      self.representedTargetSize == targetSize
                 else { return }
                 self.loadingIndicator.stopAnimating()
-                self.imageView.image = image
+                // A degraded frame is still a valid displayable image; never
+                // replace an already-shown thumbnail with nothing.
+                if let image {
+                    self.imageView.image = image
+                }
             }
         }
     }
@@ -1161,7 +1201,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
     let isActive: Bool
     let selectionMode: Bool
     let selectedIDs: Set<String>
-    let onOpen: (PHAsset, Int) -> Void
+    let onOpen: (PHAsset, Int, UIImage?) -> Void
     let onToggleSelection: (PHAsset) -> Void
     let onFavorite: (PHAsset) -> Void
     let onShare: (PHAsset) -> Void
@@ -1233,6 +1273,10 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         private var loadGeneration: UInt64 = 0
         private var pageOrder: [Int] = []
         private let maxCachedPages = 8
+        /// Indexes UIKit asked us to prepare, plus the assets whose PhotoKit
+        /// caching registration is currently live.
+        private var prefetchIndices = Set<Int>()
+        private var cachingWindow: [String: PHAsset] = [:]
         private var thumbnailSize = CGSize(width: 160, height: 160)
         private var preferredCellSide = PhotoGridMetrics.restoredPreferredCellSide()
         private var needsReloadOnActivation = false
@@ -1240,7 +1284,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         private var pinchDriver: PhotoGridPinchDriver?
         private weak var collectionView: UICollectionView?
 
-        private var onOpen: (PHAsset, Int) -> Void
+        private var onOpen: (PHAsset, Int, UIImage?) -> Void
         private var onToggleSelection: (PHAsset) -> Void
         private var onFavorite: (PHAsset) -> Void
         private var onShare: (PHAsset) -> Void
@@ -1257,7 +1301,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
-            onOpen: @escaping (PHAsset, Int) -> Void,
+            onOpen: @escaping (PHAsset, Int, UIImage?) -> Void,
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
             onShare: @escaping (PHAsset) -> Void,
@@ -1296,6 +1340,8 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             )
             isActive = false
             invalidatePageLoads()
+            resetCachingWindow()
+            prefetchIndices.removeAll(keepingCapacity: false)
             cancelVisibleRequests(in: collectionView)
             collectionView.isUserInteractionEnabled = false
             collectionView.dataSource = nil
@@ -1379,7 +1425,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
-            onOpen: @escaping (PHAsset, Int) -> Void,
+            onOpen: @escaping (PHAsset, Int, UIImage?) -> Void,
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
             onShare: @escaping (PHAsset) -> Void,
@@ -1420,9 +1466,12 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             }
             if wasActive, !isActive {
                 invalidatePageLoads()
+                resetCachingWindow()
             }
             if newCount != self.totalCount {
                 invalidatePageLoads()
+                resetCachingWindow()
+                prefetchIndices.removeAll(keepingCapacity: true)
                 cancelVisibleRequests(in: collectionView)
                 self.totalCount = newCount
                 assetsByIndex.removeAll(keepingCapacity: true)
@@ -1524,7 +1573,16 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             if selectionMode {
                 onToggleSelection(asset)
             } else {
-                onOpen(asset, indexPath.item)
+                // Same first-frame handoff as the full library grid: the
+                // thumbnail already painted by this cell travels with the tap.
+                let previewImage = (
+                    collectionView.cellForItem(at: indexPath) as? PhotoGridCell
+                )?.previewImage
+                onOpen(
+                    asset,
+                    indexPath.item,
+                    previewImage
+                )
             }
             collectionView.deselectItem(at: indexPath, animated: false)
         }
@@ -1535,9 +1593,66 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         ) {
             guard isActive else { return }
             for indexPath in indexPaths {
+                prefetchIndices.insert(indexPath.item)
                 touchPage(containing: indexPath.item)
                 loadPage(containing: indexPath.item, in: collectionView)
             }
+            updateCachingWindow(in: collectionView)
+        }
+
+        func collectionView(
+            _ collectionView: UICollectionView,
+            cancelPrefetchingForItemsAt indexPaths: [IndexPath]
+        ) {
+            for indexPath in indexPaths {
+                prefetchIndices.remove(indexPath.item)
+            }
+            updateCachingWindow(in: collectionView)
+        }
+
+        /// The library grid leans on UIKit's prefetch data source to keep a
+        /// PHCachingImageManager window warm. The unsorted grid resolves its
+        /// assets from SQLite pages, so the window has to be recomputed here
+        /// once a page lands and whenever prefetch hints change.
+        private func updateCachingWindow(in collectionView: UICollectionView?) {
+            guard let collectionView, isActive else { return }
+            var wantedIndices = prefetchIndices
+            for indexPath in collectionView.indexPathsForVisibleItems {
+                wantedIndices.insert(indexPath.item)
+            }
+
+            var wanted = [String: PHAsset](minimumCapacity: wantedIndices.count)
+            for index in wantedIndices {
+                guard let asset = assetsByIndex[index] else { continue }
+                wanted[asset.localIdentifier] = asset
+            }
+
+            let stale = cachingWindow.filter { wanted[$0.key] == nil }.map(\.value)
+            if !stale.isEmpty {
+                PhotoImageManager.shared.stopCaching(
+                    assets: stale,
+                    targetSize: thumbnailSize
+                )
+            }
+            let added = wanted.filter { cachingWindow[$0.key] == nil }.map(\.value)
+            if !added.isEmpty {
+                PhotoImageManager.shared.startCaching(
+                    assets: added,
+                    targetSize: thumbnailSize
+                )
+            }
+            cachingWindow = wanted
+        }
+
+        /// Releases the whole window using the size it was registered with, so
+        /// a layout change cannot leave a stale registration behind.
+        private func resetCachingWindow() {
+            guard !cachingWindow.isEmpty else { return }
+            PhotoImageManager.shared.stopCaching(
+                assets: Array(cachingWindow.values),
+                targetSize: thumbnailSize
+            )
+            cachingWindow.removeAll()
         }
 
         func collectionView(
@@ -1700,6 +1815,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                 self.pageOrder.removeAll { $0 == page }
                 self.pageOrder.append(page)
                 self.trimCachedPages(around: self.firstVisibleIndex(in: collectionView))
+                self.updateCachingWindow(in: collectionView)
 
                 let end = min(self.totalCount, offset + pageAssets.count)
                 let visiblePaths = (offset..<end).compactMap { item -> IndexPath? in
@@ -1770,8 +1886,10 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                 let end = min(totalCount, start + pageSize)
                 for index in start..<end {
                     assetsByIndex.removeValue(forKey: index)
+                    prefetchIndices.remove(index)
                 }
             }
+            updateCachingWindow(in: self.collectionView)
         }
 
         private func updateVisibleSelection(in collectionView: UICollectionView) {

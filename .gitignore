@@ -4,3 +4,20 @@ DerivedData/
 .asc/
 xcuserdata/
 *.xcuserstate
+
+# macOS
+.DS_Store
+
+# The marketing site is its own repository (remote `sites`), not part of this
+# one. Keeping it ignored stops `git add -A` from recording it as a gitlink.
+website/
+
+# AI search model toolchain (tools/models). The raw HF checkpoint is ~1.5 GB and
+# the converted mlpackages are ~0.4 GB: both are reproducible from
+# tools/models/requirements-lock.txt + convert_siglip2.py, so they stay out of
+# git. model_manifest.json IS committed (it is the app's contract).
+tools/models/.venv/
+tools/models/cache/
+tools/models/out/
+tools/models/build/
+tools/models/__pycache__/

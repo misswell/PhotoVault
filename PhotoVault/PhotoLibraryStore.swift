@@ -2,6 +2,18 @@ import Foundation
 import Photos
 import UIKit
 
+/// Carries the fast-changing index progress on its own observable object.
+///
+/// The index scanner publishes progress up to four times per second. While
+/// those writes lived on `PhotoLibraryStore` they invalidated every view that
+/// observes the store — the sidebar, both grids and the settings panel — even
+/// though only a small progress label reads the value. Splitting it out keeps
+/// a long 100k-item scan from re-rendering the whole UI several times a second.
+@MainActor
+final class PhotoIndexProgressReporter: ObservableObject {
+    @Published var progress: PhotoIndexProgress?
+}
+
 /// PhotoKit invokes change transactions and their completion handlers on
 /// implementation-defined queues. Keep this bridge outside the @MainActor
 /// store so Swift does not implicitly claim either callback as main-actor
@@ -91,24 +103,63 @@ private func isUserCancelledPhotoChange(_ error: Error) -> Bool {
         && nsError.code == PHPhotosError.userCancelled.rawValue
 }
 
+/// Carries the launch window's continuation into the `@Sendable` fetch
+/// closure. The continuation is invoked exactly once, on the main queue, so
+/// the unchecked conformance only has to cover that single hand-off.
+private struct LaunchWindowCompletion: @unchecked Sendable {
+    let run: () -> Void
+}
+
 @MainActor
 final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
-    @Published private(set) var authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+    /// Seeded from the last known value so the first render never has to wait
+    /// for PhotoKit. `PHPhotoLibrary.authorizationStatus(for:)` is a
+    /// synchronous XPC call, and this property is read during the first body
+    /// evaluation of the root view — on a cold `photolibraryd` that call was
+    /// sitting directly in front of the app's first frame.
+    @Published private(set) var authorizationStatus: PHAuthorizationStatus
     @Published private(set) var allPhotos: PHFetchResult<PHAsset>?
-    @Published private(set) var albums: [PhotoAlbum] = []
-    @Published private(set) var albumFolders: [PhotoAlbumFolder] = []
+    @Published private(set) var albums: [PhotoAlbum] = [] {
+        didSet { albumStructureRevision &+= 1 }
+    }
+    @Published private(set) var albumFolders: [PhotoAlbumFolder] = [] {
+        didSet {
+            // `topLevelAlbums` is read several times per ContentView body
+            // evaluation. Recomputing the flattened-ID set each time meant a
+            // fresh array + Set allocation per read; the folder tree only
+            // changes when this is assigned.
+            nestedAlbumIDs = Set(albumFolders.flatMap { $0.allAlbums }.map(\.id))
+            albumStructureRevision &+= 1
+        }
+    }
+    /// Cheap change token for derived value-model projections (flattened
+    /// folder rows, filtered album lists). Bumped whenever `albums` or
+    /// `albumFolders` is reassigned, so views can memoize against it instead
+    /// of re-deriving on every body evaluation.
+    @Published private(set) var albumStructureRevision = 0
     @Published private(set) var isIndexingUnsorted = false
     @Published private(set) var isLoadingAlbums = false
     @Published private(set) var lastIndexedAt: Date?
     @Published private(set) var unsortedCount = 0
-    @Published private(set) var indexProgress: PhotoIndexProgress?
+    /// Index progress ticks up to four times per second while a 100k-item scan
+    /// runs. It lives on its own observable object so those ticks invalidate
+    /// only the views that actually display progress, instead of every view
+    /// observing the library store (sidebar, grids, settings).
+    let indexProgressReporter = PhotoIndexProgressReporter()
+    var indexProgress: PhotoIndexProgress? { indexProgressReporter.progress }
     @Published private(set) var indexStats: PhotoIndexStats?
     @Published private(set) var indexErrorMessage: String?
     /// Album identifiers pinned by the user for the grid's quick-add menu.
     @Published private(set) var quickAlbumIDs: [String] = []
     /// Asset identifiers queued for deferred deletion. The assets remain in
-    /// PhotoKit until the user explicitly empties the recycle bin.
-    @Published private(set) var recycleBinIDs: [String] = []
+    /// PhotoKit until the user explicitly empties the recycle bin. The
+    /// parallel Set keeps `isInRecycleBin` O(1) for the viewer's per-render
+    /// membership checks.
+    @Published private(set) var recycleBinIDs: [String] = [] {
+        didSet {
+            recycleBinIDSet = Set(recycleBinIDs)
+        }
+    }
 
     private var hasStarted = false
     private var indexGeneration = 0
@@ -121,17 +172,64 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     private var albumFetchResults: [String: PHFetchResult<PHAsset>] = [:]
     private let indexStore = PhotoIndexStore()
     private let changeTokenDefaultsKey = "PhotoVault.photoLibrary.changeToken.v1"
-    private let changeTokenSignatureDefaultsKey = "PhotoVault.photoLibrary.changeTokenSignature.v1"
     private let albumCacheDefaultsKey = "PhotoVault.photoLibrary.albumSnapshot.v1"
-    private let launchPreviewDefaultsKey = "PhotoVault.photoLibrary.launchPreviewAssetIDs.v1"
     nonisolated private static let shareTemporaryFilePrefix = "PhotoVault-Share-"
-    nonisolated private static let launchPreviewAssetLimit = 512
+    /// How many of the newest assets the launch window resolves. Enough to
+    /// fill several screens at any grid density, cheap enough to fetch with a
+    /// `fetchLimit` instead of resolving identifiers one at a time.
+    nonisolated private static let launchWindowAssetLimit = 384
     private var hasLoadedAlbumCache = false
     private var hasPublishedFreshAlbums = false
+    /// Cached projection of `albumFolders`; see the `albumFolders` observer.
+    private var nestedAlbumIDs: Set<String> = []
+    /// O(1) membership for `isInRecycleBin`, which the viewer evaluates a few
+    /// times per body evaluation against a persisted, unbounded ID list.
+    private var recycleBinIDSet: Set<String> = []
+    /// A full-library fetch is already running; further change notifications
+    /// only mark it dirty instead of cancelling and restarting it.
+    private var isFullRefreshInFlight = false
+    private var pendingRefreshAfterFetch = false
+    /// Burst-coalescing for library change notifications.
+    private var pendingChanges: [PHChange] = []
+    private var albumRescanWorkItem: DispatchWorkItem?
+    nonisolated private static let changeCoalesceInterval: TimeInterval = 0.4
     /// Distinguishes the complete PhotoKit result from the bounded launch
     /// window. Index synchronization must never treat those 512 cached rows
     /// as the whole library if startup is interrupted by backgrounding.
     private var hasFreshLibraryFetch = false
+
+    override init() {
+        photoVaultTraceLaunch("store init begin")
+        // Seed from the persisted value so the first render never waits on
+        // PhotoKit: `PHPhotoLibrary.authorizationStatus(for:)` is a
+        // synchronous XPC call and `canReadPhotos` gates the whole root view.
+        // `start()` re-reads the real status and corrects this if it changed.
+        let cachedStatus = PhotoLibraryStore.cachedAuthorizationStatus()
+        authorizationStatus = cachedStatus ?? .notDetermined
+        super.init()
+        loadQuickAlbumIDs()
+        loadRecycleBinIDs()
+        photoVaultTraceLaunch(
+            "store init done seeded=\(cachedStatus != nil) "
+                + "status=\(authorizationStatus.rawValue)"
+        )
+    }
+
+    private static let authorizationDefaultsKey =
+        "PhotoVault.photoLibrary.authorizationStatus.v1"
+
+    private static func cachedAuthorizationStatus() -> PHAuthorizationStatus? {
+        guard UserDefaults.standard.object(forKey: authorizationDefaultsKey) != nil else {
+            return nil
+        }
+        return PHAuthorizationStatus(
+            rawValue: UserDefaults.standard.integer(forKey: authorizationDefaultsKey)
+        )
+    }
+
+    private func persistAuthorizationStatus(_ status: PHAuthorizationStatus) {
+        UserDefaults.standard.set(status.rawValue, forKey: Self.authorizationDefaultsKey)
+    }
 
     var canReadPhotos: Bool {
         authorizationStatus == .authorized || authorizationStatus == .limited
@@ -141,13 +239,8 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     /// albums are deliberately kept out of this projection so the sidebar
     /// can give them their own Photos-style section.
     var topLevelAlbums: [PhotoAlbum] {
-        let nestedIDs = Set(
-            albumFolders
-                .flatMap { $0.allAlbums }
-                .map(\.id)
-        )
-        return albums.filter {
-            $0.kind != .shared && !nestedIDs.contains($0.id)
+        albums.filter {
+            $0.kind != .shared && !nestedAlbumIDs.contains($0.id)
         }
     }
 
@@ -157,12 +250,6 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         albums.filter { $0.kind == .shared }
     }
 
-    override init() {
-        super.init()
-        loadQuickAlbumIDs()
-        loadRecycleBinIDs()
-    }
-
     deinit {
         PHPhotoLibrary.shared().unregisterChangeObserver(self)
     }
@@ -170,19 +257,31 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     func start() {
         guard !hasStarted else { return }
         hasStarted = true
+        photoVaultTraceLaunch("store start begin")
         DispatchQueue.global(qos: .utility).async {
             Self.removeAbandonedShareFiles(olderThan: nil)
         }
 
         authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        PHPhotoLibrary.shared().register(self)
+        persistAuthorizationStatus(authorizationStatus)
+        photoVaultTraceLaunch(
+            "store start authorization resolved reading=\(canReadPhotos) "
+                + "status=\(authorizationStatus.rawValue)"
+        )
 
-        if canReadPhotos {
-            loadCachedAlbumsIfNeeded()
-            refresh()
-        } else if authorizationStatus == .notDetermined {
-            requestAccess()
+        guard canReadPhotos else {
+            if authorizationStatus == .notDetermined {
+                requestAccess()
+            }
+            return
         }
+
+        // Only the bounded launch window is issued here. `refresh()` starts
+        // the full library fetch, album metadata scan and change-observer
+        // registration once that window has been resolved, so the first grid
+        // never queues behind work it does not need in order to draw.
+        refresh()
+        photoVaultTraceLaunch("store start refresh issued")
     }
 
     func suspendForBackground() {
@@ -194,7 +293,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             indexStore.setActiveGeneration(indexGeneration)
             isIndexingUnsorted = false
             isLoadingAlbums = false
-            indexProgress = nil
+            indexProgressReporter.progress = nil
         }
 
         indexStore.checkpointForBackground()
@@ -222,6 +321,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         requestPhotoLibraryAuthorization { [weak self] status in
                 guard let self else { return }
                 self.authorizationStatus = status
+                self.persistAuthorizationStatus(status)
                 if self.canReadPhotos {
                     self.refresh()
                 }
@@ -231,11 +331,6 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     func refresh() {
         guard canReadPhotos else { return }
 
-        loadCachedAlbumsIfNeeded()
-        if albums.isEmpty && albumFolders.isEmpty {
-            albums = []
-            albumFolders = []
-        }
         // Keep the previous asset fetch results on screen while refreshing.
         // The grids continue showing the cached content while the fresh
         // PhotoKit scan runs in the background; a small toolbar spinner
@@ -245,59 +340,109 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         let generation = indexGeneration
         indexStore.setActiveGeneration(generation)
 
-        photoVaultTrace(
+        photoVaultTraceLaunch(
             "store refresh generation=\(generation) cachedAlbums=\(albums.count)"
         )
 
         isLoadingAlbums = true
-        restoreCachedLibraryPreview(generation: generation)
+        isFullRefreshInFlight = true
+
+        // Time-to-first-pixels is the bounded launch window and nothing else.
+        // Nothing else may touch PhotoKit until it resolves: on a cold
+        // `photolibraryd` the requests queue behind each other, so starting
+        // the full sorted library fetch alongside the window delayed the
+        // first painted grid to ~2.9s when the window alone was far cheaper.
+        openLaunchWindow(generation: generation) { [weak self] in
+            guard let self else { return }
+            self.beginBulkRefresh(generation: generation)
+        }
+    }
+
+    private var hasRegisteredChangeObserver = false
+
+    /// Everything that is not needed for the first painted grid: the full
+    /// sorted library fetch, album metadata, and the change observer. Starts
+    /// only once the launch window has been resolved or skipped.
+    private func beginBulkRefresh(generation: Int) {
+        guard indexGeneration == generation else { return }
+        loadCachedAlbumsIfNeeded()
+        if !hasRegisteredChangeObserver {
+            hasRegisteredChangeObserver = true
+            PHPhotoLibrary.shared().register(self)
+            photoVaultTraceLaunch("store change observer registered")
+        }
+
+        photoVaultTraceLaunch("store bulk refresh begin generation=\(generation)")
         DispatchQueue.global(qos: .userInitiated).async {
+            photoVaultTraceLaunch("store full fetch begin")
             let fetchedPhotos = PHAsset.fetchAssets(with: Self.makeLibraryFetchOptions())
-            let launchPreviewIDs = Self.makeLaunchPreviewIdentifiers(from: fetchedPhotos)
+            // Force the sorted list to materialize exactly once, here, so the
+            // grid can be handed the real result before album metadata is
+            // enumerated. Publishing these together used to delay the full
+            // grid by however long 163 album lookups took (2.6s measured).
+            let fetchedCount = fetchedPhotos.count
+            photoVaultTraceLaunch("store full fetch done count=\(fetchedCount)")
 
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.indexGeneration == generation else { return }
-                photoVaultTrace(
-                    "store photos fetched generation=\(generation) count=\(fetchedPhotos.count)"
-                )
-                UserDefaults.standard.set(
-                    launchPreviewIDs,
-                    forKey: self.launchPreviewDefaultsKey
-                )
+                guard let self else { return }
+                guard self.indexGeneration == generation else { return }
                 self.hasFreshLibraryFetch = true
+                self.albumFetchResults.removeAll(keepingCapacity: true)
                 self.allPhotos = fetchedPhotos
+                photoVaultTraceLaunch(
+                    "store photos published generation=\(generation) count=\(fetchedCount)"
+                )
+            }
 
-                // Album enumeration also fetches collection membership and
-                // can be expensive for a large iCloud library. Keep both
-                // metadata passes away from the main actor and expose the
-                // library fetch result as soon as it is available.
-                DispatchQueue.global(qos: .userInitiated).async {
-                    let fetchedAlbums = Self.fetchAlbums()
+            // Encoding the snapshot is proportional to the album/folder count;
+            // do it here rather than on the main actor.
+            let fetchedAlbums = Self.fetchAlbums()
+            photoVaultTraceLaunch(
+                "store albums fetched albums=\(fetchedAlbums.albums.count) "
+                    + "folders=\(fetchedAlbums.folders.count)"
+            )
+            let snapshotData = Self.encodeAlbumCache(
+                albums: fetchedAlbums.albums,
+                folders: fetchedAlbums.folders
+            )
 
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self, self.indexGeneration == generation else { return }
-                        photoVaultTrace(
-                            "store albums fetched generation=\(generation) "
-                                + "albums=\(fetchedAlbums.albums.count) "
-                                + "folders=\(fetchedAlbums.folders.count)"
-                        )
-                        self.hasPublishedFreshAlbums = true
-                        self.albumFetchResults.removeAll(keepingCapacity: true)
-                        self.albums = fetchedAlbums.albums
-                        self.albumFolders = fetchedAlbums.folders
-                        self.saveAlbumCache(
-                            albums: fetchedAlbums.albums,
-                            folders: fetchedAlbums.folders
-                        )
-                        self.isLoadingAlbums = false
-                        self.synchronizeIndex(
-                            allPhotos: fetchedPhotos,
-                            userAlbums: fetchedAlbums.albums
-                                .filter { $0.kind == .user }
-                                .map(\.collection),
-                            generation: generation
-                        )
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isFullRefreshInFlight = false
+                // A change arrived while this fetch was running. Run one more
+                // pass instead of having cancelled this one.
+                let shouldRefreshAgain = self.pendingRefreshAfterFetch
+                self.pendingRefreshAfterFetch = false
+
+                guard self.indexGeneration == generation else {
+                    if shouldRefreshAgain, !self.isFullRefreshInFlight {
+                        self.refresh()
                     }
+                    return
+                }
+                photoVaultTrace(
+                    "store photos fetched generation=\(generation) count=\(fetchedCount)"
+                )
+                if let snapshotData {
+                    UserDefaults.standard.set(
+                        snapshotData,
+                        forKey: self.albumCacheDefaultsKey
+                    )
+                }
+                self.hasPublishedFreshAlbums = true
+                self.albums = fetchedAlbums.albums
+                self.albumFolders = fetchedAlbums.folders
+                self.allPhotos = fetchedPhotos
+                self.isLoadingAlbums = false
+                self.synchronizeIndex(
+                    allPhotos: fetchedPhotos,
+                    userAlbums: fetchedAlbums.albums
+                        .filter { $0.kind == .user }
+                        .map(\.collection),
+                    generation: generation
+                )
+                if shouldRefreshAgain {
+                    self.refresh()
                 }
             }
         }
@@ -500,7 +645,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     }
 
     func isInRecycleBin(_ asset: PHAsset) -> Bool {
-        recycleBinIDs.contains(asset.localIdentifier)
+        recycleBinIDSet.contains(asset.localIdentifier)
     }
 
     func addToRecycleBin(_ asset: PHAsset) {
@@ -787,27 +932,55 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
     nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
         Task { @MainActor [weak self] in
-            self?.applyPhotoLibraryChange(changeInstance)
+            self?.enqueuePhotoLibraryChange(changeInstance)
         }
+    }
+
+    /// Coalesces change notifications. `photoLibraryDidChange` can fire in a
+    /// burst — iCloud sync, a multi-select import, a screenshot landing while
+    /// the index scans — and every notification used to trigger a full album
+    /// metadata pass plus an index sync. Applying the cheap asset delta is
+    /// immediate; the expensive metadata pass waits out the burst.
+    private func enqueuePhotoLibraryChange(_ change: PHChange) {
+        pendingChanges.append(change)
+        albumRescanWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.drainPendingChanges()
+        }
+        albumRescanWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.changeCoalesceInterval,
+            execute: work
+        )
+    }
+
+    private func drainPendingChanges() {
+        let changes = pendingChanges
+        pendingChanges.removeAll(keepingCapacity: true)
+        guard let last = changes.last else { return }
+        // The asset delta has to be applied against the fetch result as it was
+        // before the change, so only the newest instance is read; the album
+        // metadata pass below re-reads the truth from PhotoKit anyway.
+        applyPhotoLibraryChange(last)
     }
 
     /// Apply the fetch-result delta that PhotoKit already computed instead of
     /// fetching the complete 100k+ library again. Album metadata is refreshed
-    /// separately because this store keeps the album list as value models,
-    /// while the asset result itself remains incremental.
+    /// by a coalesced pass, because this store keeps the album list as value
+    /// models while the asset result itself remains incremental.
     private func applyPhotoLibraryChange(_ change: PHChange) {
         guard hasFreshLibraryFetch, let currentPhotos = allPhotos else {
             // A missing/non-incremental change detail means PhotoKit cannot
             // safely describe the delta. This is the exceptional full-refresh
             // path, not the normal change-observer path.
-            refresh()
+            scheduleFullRefresh()
             return
         }
 
         let details = change.changeDetails(for: currentPhotos)
         if let details,
            !details.hasIncrementalChanges {
-            refresh()
+            scheduleFullRefresh()
             return
         }
 
@@ -818,26 +991,67 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         allPhotos = updatedPhotos
         needsUnsortedIndex = true
         indexGeneration &+= 1
-        let generation = indexGeneration
-        indexStore.setActiveGeneration(generation)
+        indexStore.setActiveGeneration(indexGeneration)
 
         isLoadingAlbums = true
-        DispatchQueue.global(qos: .userInitiated).async {
-            let fetchedAlbums = Self.fetchAlbums()
+        scheduleAlbumRescan()
+    }
 
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.indexGeneration == generation else { return }
+    /// A full library fetch is already running. Restarting it on every
+    /// notification during the post-launch iCloud sync window repeatedly
+    /// cancelled the single most expensive startup task, so later requests
+    /// only raise a dirty flag that the running fetch drains.
+    private func scheduleFullRefresh() {
+        guard !isFullRefreshInFlight else {
+            pendingRefreshAfterFetch = true
+            return
+        }
+        refresh()
+    }
+
+    private func scheduleAlbumRescan() {
+        albumRescanWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.performAlbumRescan()
+        }
+        albumRescanWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.changeCoalesceInterval,
+            execute: work
+        )
+    }
+
+    /// The single album metadata + index sync pass. Runs once per burst of
+    /// library changes instead of once per notification.
+    private func performAlbumRescan() {
+        guard let photos = allPhotos else { return }
+        let generation = indexGeneration
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let fetchedAlbums = Self.fetchAlbums()
+            // Encoding the snapshot is proportional to the album/folder count
+            // and used to run on the main actor on this hot path. It is pure
+            // value work, so it belongs here.
+            let snapshotData = Self.encodeAlbumCache(
+                albums: fetchedAlbums.albums,
+                folders: fetchedAlbums.folders
+            )
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if let snapshotData {
+                    UserDefaults.standard.set(
+                        snapshotData,
+                        forKey: self.albumCacheDefaultsKey
+                    )
+                }
+                guard self.indexGeneration == generation else { return }
                 self.hasPublishedFreshAlbums = true
                 self.albumFetchResults.removeAll(keepingCapacity: true)
                 self.albums = fetchedAlbums.albums
                 self.albumFolders = fetchedAlbums.folders
-                self.saveAlbumCache(
-                    albums: fetchedAlbums.albums,
-                    folders: fetchedAlbums.folders
-                )
                 self.isLoadingAlbums = false
                 self.synchronizeIndex(
-                    allPhotos: updatedPhotos,
+                    allPhotos: photos,
                     userAlbums: fetchedAlbums.albums
                         .filter { $0.kind == .user }
                         .map(\.collection),
@@ -859,12 +1073,17 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            photoVaultTraceLaunch("store album-cache restore begin")
             guard let cached = Self.restoreAlbumCache(from: data) else { return }
+            photoVaultTraceLaunch(
+                "store album-cache restore done albums=\(cached.albums.count) "
+                    + "folders=\(cached.folders.count)"
+            )
             DispatchQueue.main.async { [weak self] in
                 guard let self, !self.hasPublishedFreshAlbums else { return }
                 self.albums = cached.albums
                 self.albumFolders = cached.folders
-                photoVaultTrace(
+                photoVaultTraceLaunch(
                     "store album cache restored albums=\(cached.albums.count) "
                         + "folders=\(cached.folders.count)"
                 )
@@ -872,23 +1091,55 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         }
     }
 
-    /// Resolve only enough indexed assets to fill several screens. The full
-    /// PHFetchResult is still fetched concurrently and atomically replaces
-    /// this launch window when ready, so a newly captured screenshot appears
-    /// without blocking the first visible grid.
-    private func restoreCachedLibraryPreview(generation: Int) {
-        guard allPhotos == nil else { return }
+    /// Opens the bounded launch window: the newest few hundred assets, which
+    /// is all the first screenfuls of the grid need.
+    ///
+    /// This runs the *same* query as the full refresh with `fetchLimit` set,
+    /// so it is one indexed range scan. The previous implementation resolved
+    /// a persisted list of 512 local identifiers one by one instead, which
+    /// measured 2.9-3.5s on a cold `photolibraryd` — and, while the library
+    /// was still opening, could come back empty, leaving the grid on its
+    /// spinner until the full fetch landed. PhotoKit serves a limited sorted
+    /// query from the ordering index it already maintains.
+    private func openLaunchWindow(
+        generation: Int,
+        then completion: @escaping () -> Void
+    ) {
+        // A previous refresh already has a result on screen. There is no
+        // launch window to resolve, so the bulk pass may start immediately.
+        guard allPhotos == nil else {
+            completion()
+            return
+        }
 
-        if let identifiers = UserDefaults.standard.array(
-            forKey: launchPreviewDefaultsKey
-        ) as? [String], !identifiers.isEmpty {
-            publishCachedLibraryPreview(
-                identifiers: identifiers,
-                generation: generation,
-                source: "snapshot"
+        let completionBox = LaunchWindowCompletion(run: completion)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let options = Self.makeLibraryFetchOptions()
+            options.fetchLimit = Self.launchWindowAssetLimit
+            photoVaultTraceLaunch(
+                "store launch-window fetch begin limit=\(Self.launchWindowAssetLimit)"
             )
-        } else {
-            restoreLibraryPreviewFromIndex(generation: generation)
+            let preview = PHAsset.fetchAssets(with: options)
+            // `count` forces the limited range scan to materialize here rather
+            // than on whichever thread first reads the result.
+            let count = preview.count
+            photoVaultTraceLaunch("store launch-window fetch done count=\(count)")
+
+            DispatchQueue.main.async { [weak self] in
+                if let self,
+                   self.indexGeneration == generation,
+                   self.allPhotos == nil,
+                   count > 0 {
+                    self.allPhotos = preview
+                    photoVaultTraceLaunch(
+                        "store launch window published generation=\(generation) "
+                            + "count=\(count)"
+                    )
+                }
+                // The bulk pass starts even when the launch window was
+                // discarded; this result only ever gates the first paint.
+                completionBox.run()
+            }
         }
 
         // The cached count is presentation data too. Restoring it early keeps
@@ -902,66 +1153,6 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             self.indexStats = stats
             self.unsortedCount = stats.unsortedCount
         }
-    }
-
-    /// Existing installs do not have the lightweight defaults snapshot until
-    /// their first refresh on this version. Fall back to the committed SQLite
-    /// index once, then persist that bounded window for later launches.
-    private func restoreLibraryPreviewFromIndex(generation: Int) {
-        guard allPhotos == nil else { return }
-
-        indexStore.recentAssetIdentifiers(
-            limit: Self.launchPreviewAssetLimit
-        ) { [weak self] result in
-            guard let self,
-                  self.indexGeneration == generation,
-                  self.allPhotos == nil,
-                  case .success(let identifiers) = result,
-                  !identifiers.isEmpty
-            else { return }
-            UserDefaults.standard.set(
-                identifiers,
-                forKey: self.launchPreviewDefaultsKey
-            )
-            self.publishCachedLibraryPreview(
-                identifiers: identifiers,
-                generation: generation,
-                source: "index"
-            )
-        }
-    }
-
-    private func publishCachedLibraryPreview(
-        identifiers: [String],
-        generation: Int,
-        source: String
-    ) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let cachedPhotos = PHAsset.fetchAssets(
-                withLocalIdentifiers: identifiers,
-                options: Self.makeLibraryFetchOptions()
-            )
-            DispatchQueue.main.async { [weak self] in
-                guard let self,
-                      self.indexGeneration == generation,
-                      self.allPhotos == nil,
-                      cachedPhotos.count > 0
-                else { return }
-                self.allPhotos = cachedPhotos
-                photoVaultTrace(
-                    "store launch cache published generation=\(generation) "
-                        + "source=\(source) count=\(cachedPhotos.count)"
-                )
-            }
-        }
-    }
-
-    nonisolated private static func makeLaunchPreviewIdentifiers(
-        from assets: PHFetchResult<PHAsset>
-    ) -> [String] {
-        let count = min(launchPreviewAssetLimit, assets.count)
-        guard count > 0 else { return [] }
-        return (0..<count).map { assets.object(at: $0).localIdentifier }
     }
 
     nonisolated private static func restoreAlbumCache(
@@ -1038,10 +1229,13 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         )
     }
 
-    private func saveAlbumCache(
+    /// Encodes the persisted album snapshot. Pure value work, so it runs on
+    /// the background pass instead of the main actor; the previous version
+    /// JSON-encoded every album and folder on the change hot path.
+    nonisolated private static func encodeAlbumCache(
         albums: [PhotoAlbum],
         folders: [PhotoAlbumFolder]
-    ) {
+    ) -> Data? {
         func makeFolderEntry(
             _ folder: PhotoAlbumFolder
         ) -> PhotoAlbumFolderCacheEntry {
@@ -1066,8 +1260,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             },
             folders: folders.map(makeFolderEntry)
         )
-        guard let data = try? JSONEncoder().encode(snapshot) else { return }
-        UserDefaults.standard.set(data, forKey: albumCacheDefaultsKey)
+        return try? JSONEncoder().encode(snapshot)
     }
 
     nonisolated private static func makeLibraryFetchOptions() -> PHFetchOptions {
@@ -1160,13 +1353,20 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         }
 
         var childFolderIDs = Set<String>()
+        // Each folder's children used to be fetched twice: once here to
+        // identify subfolders and again inside `makeFolder`. On a foldered
+        // library that doubled the PhotoKit round trips of every rescan.
+        var childrenByFolderID = [String: [PHCollection]]()
         for folder in foldersByID.values {
             let children = PHCollection.fetchCollections(in: folder, options: nil)
+            var collected = [PHCollection]()
             children.enumerateObjects { collection, _, _ in
+                collected.append(collection)
                 if let childFolder = collection as? PHCollectionList {
                     childFolderIDs.insert(childFolder.localIdentifier)
                 }
             }
+            childrenByFolderID[folder.localIdentifier] = collected
         }
 
         var visitedFolderIDs = Set<String>()
@@ -1178,8 +1378,8 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
             var albums = [PhotoAlbum]()
             var subfolders = [PhotoAlbumFolder]()
-            let children = PHCollection.fetchCollections(in: folder, options: nil)
-            children.enumerateObjects { collection, _, _ in
+            let children = childrenByFolderID[folder.localIdentifier] ?? []
+            for collection in children {
                 if let albumCollection = collection as? PHAssetCollection,
                    albumCollection.assetCollectionType == .album,
                    let album = makeAlbum(
@@ -1275,7 +1475,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         indexErrorMessage = nil
         needsUnsortedIndex = false
         lastProgressPublishAt = .distantPast
-        indexProgress = PhotoIndexProgress(
+        indexProgressReporter.progress = PhotoIndexProgress(
             phase: .scanningAssets,
             completed: 0,
             total: allPhotos.count
@@ -1351,7 +1551,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 || now.timeIntervalSince(lastProgressPublishAt) >= 0.25
         else { return }
         lastProgressPublishAt = now
-        indexProgress = progress
+        indexProgressReporter.progress = progress
     }
 
     private func applyPersistentChanges(
@@ -1502,21 +1702,20 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         unsortedCount = stats.unsortedCount
         isIndexingUnsorted = false
         lastIndexedAt = Date()
-        indexProgress = PhotoIndexProgress(
+        indexProgressReporter.progress = PhotoIndexProgress(
             phase: .finished,
             completed: stats.assetCount,
             total: stats.assetCount
         )
-        persistChangeToken(token, for: librarySignature)
+        persistChangeToken(token)
         loadUnsortedPhotosIfRequested(generation: generation)
     }
 
     private func failIndexing(_ error: Error) {
         photoVaultTrace("store index failed error=\(error.localizedDescription)")
         isIndexingUnsorted = false
-        indexProgress = nil
+        indexProgressReporter.progress = nil
         indexErrorMessage = error.localizedDescription
-        print("PhotoVault index error: \(error.localizedDescription)")
     }
 
     private func loadUnsortedPhotosIfRequested(generation: Int) {
@@ -1550,16 +1749,15 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         )
     }
 
-    private func persistChangeToken(
-        _ token: PHPersistentChangeToken,
-        for librarySignature: String
-    ) {
+    private func persistChangeToken(_ token: PHPersistentChangeToken) {
         guard let data = try? NSKeyedArchiver.archivedData(
             withRootObject: token,
             requiringSecureCoding: true
         ) else { return }
+        // Only the token is persisted. The library signature the index keeps
+        // in its own `meta` table was also being written to UserDefaults on
+        // every sync and never read back — a dead main-thread write.
         UserDefaults.standard.set(data, forKey: changeTokenDefaultsKey)
-        UserDefaults.standard.set(librarySignature, forKey: changeTokenSignatureDefaultsKey)
     }
 
     private func makeLibrarySignature(for assets: PHFetchResult<PHAsset>) -> String {

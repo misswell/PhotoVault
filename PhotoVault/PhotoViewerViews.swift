@@ -19,7 +19,9 @@ enum PagerDiagnostics {
     private static let sessionLock = NSLock()
     nonisolated(unsafe) private static var hasStartedSession = false
 
-    private static var logURL: URL {
+    /// Resolved once. This used to hit `FileManager` for the caches directory
+    /// on every log call, which happens per scrub frame.
+    private static let logURL: URL = {
         let cachesDirectory = FileManager.default.urls(
             for: .cachesDirectory,
             in: .userDomainMask
@@ -27,7 +29,7 @@ enum PagerDiagnostics {
         return cachesDirectory
             .appendingPathComponent("PhotoVault", isDirectory: true)
             .appendingPathComponent("PagerDiagnostics.log")
-    }
+    }()
 
     static func beginSession() {
         sessionLock.lock()
@@ -48,7 +50,11 @@ enum PagerDiagnostics {
         log("session started")
     }
 
-    static func log(_ message: String) {
+    /// `@autoclosure` matters here: the call sites interpolate indices and
+    /// sizes on every scrub frame, and the release build's no-op stub used to
+    /// still build every one of those strings before throwing them away.
+    static func log(_ message: @autoclosure () -> String) {
+        let message = message()
         logger.log(level: .debug, "\(message, privacy: .public)")
 
         let line = "\(Date()) \(message)\n"
@@ -83,7 +89,7 @@ enum PagerDiagnostics {
 #else
 enum PagerDiagnostics {
     static func beginSession() {}
-    static func log(_ message: String) {}
+    static func log(_ message: @autoclosure () -> String) {}
 }
 #endif
 
@@ -336,6 +342,10 @@ private struct ViewerMediaView: View {
     let targetSize: CGSize
     let contentMode: PHImageContentMode
     let requestPriority: PhotoRequestPriority
+    /// An already-decoded frame (normally the grid thumbnail that was tapped).
+    /// Only the page the viewer was opened on receives one; every other page
+    /// loads through the normal PhotoKit path.
+    let initialImage: UIImage?
     let onReady: (Bool) -> Void
     let onZoomingChanged: ((Bool) -> Void)?
 
@@ -344,6 +354,7 @@ private struct ViewerMediaView: View {
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFit,
         requestPriority: PhotoRequestPriority = .viewer,
+        initialImage: UIImage? = nil,
         onReady: @escaping (Bool) -> Void = { _ in },
         onZoomingChanged: ((Bool) -> Void)? = nil
     ) {
@@ -351,6 +362,7 @@ private struct ViewerMediaView: View {
         self.targetSize = targetSize
         self.contentMode = contentMode
         self.requestPriority = requestPriority
+        self.initialImage = initialImage
         self.onReady = onReady
         self.onZoomingChanged = onZoomingChanged
     }
@@ -378,6 +390,7 @@ private struct ViewerMediaView: View {
                 targetSize: targetSize,
                 contentMode: contentMode,
                 requestPriority: requestPriority,
+                initialImage: initialImage,
                 onLoadStateChange: onReady,
                 onZoomingChanged: onZoomingChanged
             )
@@ -398,6 +411,9 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
     let targetSize: CGSize
     let contentMode: PHImageContentMode
     let neighborPriority: PhotoRequestPriority
+    /// First-frame seed for exactly one page: the asset the viewer opened on.
+    let initialPreviewImage: UIImage?
+    let initialAssetIdentifier: String?
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
     let onPagingChanged: ((Bool) -> Void)?
@@ -428,6 +444,8 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             targetSize: targetSize,
             contentMode: contentMode,
             neighborPriority: neighborPriority,
+            initialPreviewImage: initialPreviewImage,
+            initialAssetIdentifier: initialAssetIdentifier,
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
             onPagingChanged: onPagingChanged,
@@ -449,6 +467,8 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             targetSize: targetSize,
             contentMode: contentMode,
             neighborPriority: neighborPriority,
+            initialPreviewImage: initialPreviewImage,
+            initialAssetIdentifier: initialAssetIdentifier,
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
             onPagingChanged: onPagingChanged,
@@ -474,6 +494,8 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         private var targetSize = CGSize.zero
         private var contentMode: PHImageContentMode = .aspectFit
         private var neighborPriority: PhotoRequestPriority = .slideshow
+        private var initialPreviewImage: UIImage?
+        private var initialAssetIdentifier: String?
         private var onMediaReady: ((Bool) -> Void)?
         private var onZoomingChanged: ((Bool) -> Void)?
         private var onPagingChanged: ((Bool) -> Void)?
@@ -482,6 +504,9 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         private var dismissPanGesture: UIPanGestureRecognizer?
         private var isZooming = false
         private var pages: [Int: PhotoPagerPageController] = [:]
+        /// The content identity currently rendered by each page's hosting
+        /// controller, so an unchanged page is never rebuilt.
+        private var pageIdentities: [Int: String] = [:]
         private var currentIndexBinding: Binding<Int>
         private var pendingProgrammaticIndex: Int?
         private var isScrubbing = false
@@ -562,6 +587,8 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             targetSize: CGSize,
             contentMode: PHImageContentMode,
             neighborPriority: PhotoRequestPriority,
+            initialPreviewImage: UIImage?,
+            initialAssetIdentifier: String?,
             onMediaReady: ((Bool) -> Void)?,
             onZoomingChanged: ((Bool) -> Void)?,
             onPagingChanged: ((Bool) -> Void)?,
@@ -573,6 +600,14 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             self.targetSize = targetSize
             self.contentMode = contentMode
             self.neighborPriority = neighborPriority
+            // Set once, from the opening request. Never refreshed afterwards:
+            // the seed belongs to the asset the viewer was opened on, and a
+            // later update carrying a different preview must not re-seed an
+            // unrelated page.
+            if self.initialAssetIdentifier == nil {
+                self.initialPreviewImage = initialPreviewImage
+                self.initialAssetIdentifier = initialAssetIdentifier
+            }
             self.onMediaReady = onMediaReady
             self.onZoomingChanged = onZoomingChanged
             self.onPagingChanged = onPagingChanged
@@ -636,7 +671,9 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                             isZooming = false
                             onZoomingChanged?(false)
                         }
-                        refreshPages(around: clampedIndex)
+                        // `refreshPages(around:)` already ran above with this
+                        // same `clampedIndex`; the second call only rebuilt
+                        // three full-screen pages per scrub frame.
                     }
                     return
                 }
@@ -894,7 +931,9 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                     requestPriority: displayedIndex == index
                         ? .viewer
                         : neighborPriority,
-                    onReady: { [weak self] ready in
+                    initialImage: asset.localIdentifier == initialAssetIdentifier
+                        ? initialPreviewImage
+                        : nil,                    onReady: { [weak self] ready in
                         guard let self,
                               self.displayedIndex == index
                         else { return }
@@ -926,14 +965,40 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             )
 
             for nearbyIndex in nearbyIndexes {
+                let identity = makePageIdentity(for: nearbyIndex)
                 if let existing = pages[nearbyIndex] {
+                    // Reassigning `rootView` replaces the hosting controller's
+                    // whole SwiftUI tree and drops the decoded image state.
+                    // Only do it when the page's actual content changed.
+                    guard pageIdentities[nearbyIndex] != identity else { continue }
+                    pageIdentities[nearbyIndex] = identity
                     existing.rootView = makePageView(for: nearbyIndex)
                 } else {
+                    pageIdentities[nearbyIndex] = identity
                     _ = page(at: nearbyIndex)
                 }
             }
 
-            pages = pages.filter { nearbyIndexes.contains($0.key) }
+            // Remove evicted keys individually; rebuilding the whole dictionary
+            // with `filter` on every filmstrip scrub step was pure churn.
+            for key in pages.keys where !nearbyIndexes.contains(key) {
+                pages.removeValue(forKey: key)
+                pageIdentities.removeValue(forKey: key)
+            }
+        }
+
+        /// Everything that must change a page's rendered content *except* the
+        /// request priority. Priority flips on every swipe and is applied to
+        /// new requests through the view struct; it is not worth rebuilding
+        /// three full-screen pages for.
+        private func makePageIdentity(for index: Int) -> String {
+            let assetID = assetProvider(index)?.localIdentifier ?? "pending"
+            return [
+                assetID,
+                String(Int(targetSize.width.rounded())),
+                String(Int(targetSize.height.rounded())),
+                String(contentMode.rawValue)
+            ].joined(separator: "|")
         }
     }
 }
@@ -1164,6 +1229,9 @@ private struct AssetPager: View {
     let targetSize: CGSize
     let contentMode: PHImageContentMode
     let neighborPriority: PhotoRequestPriority
+    /// First-frame seed, applied only to the asset the viewer opened on.
+    let initialPreviewImage: UIImage?
+    let initialAssetIdentifier: String?
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
     let onPagingChanged: ((Bool) -> Void)?
@@ -1185,6 +1253,8 @@ private struct AssetPager: View {
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFit,
         neighborPriority: PhotoRequestPriority = .slideshow,
+        initialPreviewImage: UIImage? = nil,
+        initialAssetIdentifier: String? = nil,
         onMediaReady: ((Bool) -> Void)? = nil,
         onZoomingChanged: ((Bool) -> Void)? = nil,
         onPagingChanged: ((Bool) -> Void)? = nil,
@@ -1197,6 +1267,8 @@ private struct AssetPager: View {
         self.targetSize = targetSize
         self.contentMode = contentMode
         self.neighborPriority = neighborPriority
+        self.initialPreviewImage = initialPreviewImage
+        self.initialAssetIdentifier = initialAssetIdentifier
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
         self.onPagingChanged = onPagingChanged
@@ -1253,6 +1325,8 @@ private struct AssetPager: View {
             targetSize: targetSize,
             contentMode: contentMode,
             neighborPriority: neighborPriority,
+            initialPreviewImage: initialPreviewImage,
+            initialAssetIdentifier: initialAssetIdentifier,
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
             onPagingChanged: onPagingChanged,
@@ -1268,6 +1342,10 @@ private struct AssetPager: View {
                 targetSize: targetSize,
                 contentMode: contentMode,
                 requestPriority: .viewer,
+                initialImage: assets.object(at: currentIndex).localIdentifier
+                    == initialAssetIdentifier
+                    ? initialPreviewImage
+                    : nil,
                 onReady: { ready in
                     onMediaReady?(ready)
                 },
@@ -1366,6 +1444,10 @@ private struct AssetPager: View {
 struct PhotoViewerView: View {
     let assets: PHFetchResult<PHAsset>
     let initialIndex: Int
+    /// First-frame seed handed over by the grid cell that was tapped. Used
+    /// only for the opening asset; every other page loads through PhotoKit.
+    let initialPreviewImage: UIImage?
+    let initialAssetIdentifier: String?
     @ObservedObject var store: PhotoLibraryStore
     let album: PhotoAlbum?
     let onDismissRequested: (() -> Void)?
@@ -1396,12 +1478,16 @@ struct PhotoViewerView: View {
         initialIndex: Int,
         store: PhotoLibraryStore,
         album: PhotoAlbum? = nil,
+        initialPreviewImage: UIImage? = nil,
+        initialAssetIdentifier: String? = nil,
         onDismissRequested: (() -> Void)? = nil
     ) {
         self.assets = assets
         self.initialIndex = min(max(0, initialIndex), max(0, assets.count - 1))
         self.store = store
         self.album = album
+        self.initialPreviewImage = initialPreviewImage
+        self.initialAssetIdentifier = initialAssetIdentifier
         self.onDismissRequested = onDismissRequested
         _currentIndex = State(initialValue: self.initialIndex)
         _isFavorite = State(
@@ -1427,6 +1513,8 @@ struct PhotoViewerView: View {
                             currentIndex: $currentIndex,
                             targetSize: mediaTargetSize(for: proxy.size),
                             contentMode: viewerContentMode,
+                            initialPreviewImage: initialPreviewImage,
+                            initialAssetIdentifier: initialAssetIdentifier,
                             onZoomingChanged: { zooming in
                                 isZooming = zooming
                             },
@@ -2326,9 +2414,22 @@ private final class ViewerFilmstripCell: UICollectionViewCell {
         representedIdentifier = asset.localIdentifier
         representedAsset = asset
         representedTargetSize = targetSize
-        imageView.image = nil
-        // The strip's prefetch data source owns the cache window; per-cell
-        // caching would only add PhotoKit churn.
+
+        // Filmstrip cells recycle constantly while scrubbing. Reuse a decoded
+        // thumbnail instead of blanking the cell and waiting on PhotoKit.
+        if let cachedImage = PhotoImageManager.shared.cachedImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            scope: .gridThumbnail
+        ) {
+            imageView.image = cachedImage
+        } else {
+            imageView.image = nil
+        }
+
+        // The strip's prefetch data source owns the PHCachingImageManager
+        // cache window; per-cell caching would only add PhotoKit churn.
         requestHandle = PhotoImageManager.shared.requestImage(
             for: asset,
             targetSize: targetSize,
@@ -2336,13 +2437,16 @@ private final class ViewerFilmstripCell: UICollectionViewCell {
             deliveryMode: .opportunistic,
             resizeMode: .fast,
             priority: .nearGrid,
-            isNetworkAccessAllowed: true
+            isNetworkAccessAllowed: true,
+            cacheResult: true,
+            cacheScope: .gridThumbnail
         ) { [weak self] image, info in
             let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
-            guard !cancelled else { return }
+            guard !cancelled, let image else { return }
             Task { @MainActor [weak self] in
                 guard let self,
-                      self.representedIdentifier == asset.localIdentifier
+                      self.representedIdentifier == asset.localIdentifier,
+                      self.representedTargetSize == targetSize
                 else { return }
                 self.imageView.image = image
             }
@@ -2405,6 +2509,12 @@ private struct IndexedAssetPager: View {
     let targetSize: CGSize
     let contentMode: PHImageContentMode
     let neighborPriority: PhotoRequestPriority
+    /// First-frame seed for the opening asset only.
+    let initialPreviewImage: UIImage?
+    let initialAssetIdentifier: String?
+    /// Index of the page the seed belongs to. The pager may jump elsewhere
+    /// while the opening metadata page loads, and the seed must not follow.
+    private let initialPreviewIndex: Int?
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
     let onPagingChanged: ((Bool) -> Void)?
@@ -2424,7 +2534,7 @@ private struct IndexedAssetPager: View {
     @State private var loadError: String?
     @State private var isZooming = false
     @State private var customDirection = 1
-    @State private var customDragAxis = ViewerDragAxis.undecided
+    @State private var customDragAxis: ViewerDragAxis = .undecided
     @AppStorage(PhotoSwipeStyle.storageKey)
     private var swipeStyleRawValue = PhotoSwipeStyle.system.rawValue
 
@@ -2438,6 +2548,8 @@ private struct IndexedAssetPager: View {
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFit,
         neighborPriority: PhotoRequestPriority = .slideshow,
+        initialPreviewImage: UIImage? = nil,
+        initialAssetIdentifier: String? = nil,
         onMediaReady: ((Bool) -> Void)? = nil,
         onZoomingChanged: ((Bool) -> Void)? = nil,
         onPagingChanged: ((Bool) -> Void)? = nil,
@@ -2453,6 +2565,8 @@ private struct IndexedAssetPager: View {
         self.targetSize = targetSize
         self.contentMode = contentMode
         self.neighborPriority = neighborPriority
+        self.initialPreviewImage = initialPreviewImage
+        self.initialAssetIdentifier = initialAssetIdentifier
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
         self.onPagingChanged = onPagingChanged
@@ -2568,6 +2682,8 @@ private struct IndexedAssetPager: View {
             targetSize: targetSize,
             contentMode: contentMode,
             neighborPriority: neighborPriority,
+            initialPreviewImage: initialPreviewImage,
+            initialAssetIdentifier: initialAssetIdentifier,
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
             onPagingChanged: onPagingChanged,
@@ -2585,6 +2701,9 @@ private struct IndexedAssetPager: View {
                     targetSize: targetSize,
                     contentMode: contentMode,
                     requestPriority: .viewer,
+                    initialImage: asset.localIdentifier == initialAssetIdentifier
+                        ? initialPreviewImage
+                        : nil,
                     onReady: { ready in
                         onMediaReady?(ready)
                     },
@@ -2602,6 +2721,20 @@ private struct IndexedAssetPager: View {
             .contentShape(Rectangle())
             .simultaneousGesture(customSwipeGesture)
             .animation(isScrubbing ? nil : .easeInOut(duration: 0.32), value: currentIndex)
+        } else if currentIndex == initialIndexForPreview,
+                  let initialPreviewImage {
+            // The unsorted pager loads metadata page by page, so the opening
+            // asset may not have arrived yet. Show the tapped thumbnail
+            // instead of a spinner while the page resolves.
+            Color.black
+                .overlay {
+                    Image(uiImage: initialPreviewImage)
+                        .resizable()
+                        .scaledToFit()
+                }
+                .clipped()
+                .contentShape(Rectangle())
+                .simultaneousGesture(customSwipeGesture)
         } else {
             ProgressView("正在读取照片…")
                 .tint(.white)
@@ -2609,6 +2742,13 @@ private struct IndexedAssetPager: View {
                 .contentShape(Rectangle())
                 .simultaneousGesture(customSwipeGesture)
         }
+    }
+
+    /// Index the seeded preview belongs to. The pager may jump to other
+    /// indexes while the opening page loads, and the seed must not follow it.
+    private var initialIndexForPreview: Int? {
+        guard initialPreviewImage != nil else { return nil }
+        return initialPreviewIndex
     }
 
     private var customSwipeGesture: some Gesture {
@@ -3678,7 +3818,6 @@ private struct SlideshowAssetPager: View {
     let onMediaReady: (Bool) -> Void
     let transitionStyle: SlideshowTransitionStyle
 
-    @State private var cachedNeighbors: [String: PHAsset] = [:]
     @State private var prefetchHandles: [String: PhotoRequestHandle] = [:]
     @State private var isZooming = false
     @State private var transitionDirection = 1
@@ -3791,21 +3930,6 @@ private struct SlideshowAssetPager: View {
         let neighborIndexes = [safeIndex - 1, safeIndex + 1]
             .filter { $0 >= 0 && $0 < assets.count }
         let neighbors = neighborIndexes.map { assets.object(at: $0) }
-        let next = Dictionary(uniqueKeysWithValues: neighbors.map {
-            ($0.localIdentifier, $0)
-        })
-
-        let stale = cachedNeighbors.values.filter {
-            next[$0.localIdentifier] == nil
-        }
-        if !stale.isEmpty {
-            PhotoImageManager.shared.stopCaching(
-                assets: Array(stale),
-                targetSize: prefetchTargetSize,
-                contentMode: contentMode,
-                isNetworkAccessAllowed: true
-            )
-        }
 
         let desiredPrefetchKeys = Set(
             neighbors.map { prefetchKey(for: $0) }
@@ -3830,7 +3954,6 @@ private struct SlideshowAssetPager: View {
                 )
             }
         }
-        cachedNeighbors = next
     }
 
     private func stopPrefetch() {
@@ -3838,14 +3961,6 @@ private struct SlideshowAssetPager: View {
             PhotoImageManager.shared.cancel(handle)
         }
         prefetchHandles.removeAll()
-        guard !cachedNeighbors.isEmpty else { return }
-        PhotoImageManager.shared.stopCaching(
-            assets: Array(cachedNeighbors.values),
-            targetSize: prefetchTargetSize,
-            contentMode: contentMode,
-            isNetworkAccessAllowed: true
-        )
-        cachedNeighbors.removeAll()
     }
 }
 
@@ -3867,10 +3982,15 @@ private struct IndexedSlideshowAssetPager: View {
     @State private var loadingOffsets = Set<Int>()
     @State private var loadedOffsets = Set<Int>()
     @State private var loadError: String?
-    @State private var cachedNeighbors: [String: PHAsset] = [:]
     @State private var prefetchHandles: [String: PhotoRequestHandle] = [:]
     @State private var isZooming = false
     @State private var transitionDirection = 1
+    /// Page loads are asynchronous. Without a visibility + generation guard a
+    /// completion that lands after the slideshow was dismissed still ran
+    /// `updatePrefetch()`, which started brand-new network-allowed full-size
+    /// requests that nothing would ever cancel.
+    @State private var isVisible = false
+    @State private var loadGeneration: UInt64 = 0
 
     private let pageSize = 60
 
@@ -3945,6 +4065,8 @@ private struct IndexedSlideshowAssetPager: View {
             }
         }
         .onAppear {
+            isVisible = true
+            loadGeneration &+= 1
             loadWindow(around: currentIndex)
             updatePrefetch()
         }
@@ -3960,7 +4082,13 @@ private struct IndexedSlideshowAssetPager: View {
         .onChange(of: contentMode.rawValue) { _, _ in
             updatePrefetch()
         }
-        .onDisappear(perform: stopPrefetch)
+        .onDisappear {
+            // Invalidate in-flight page loads before tearing the prefetch
+            // window down, so a late completion cannot restart it.
+            isVisible = false
+            loadGeneration &+= 1
+            stopPrefetch()
+        }
     }
 
     private var swipeGesture: some Gesture {
@@ -4014,17 +4142,24 @@ private struct IndexedSlideshowAssetPager: View {
         else { return }
 
         let limit = min(pageSize, totalCount - offset)
+        let generation = loadGeneration
         store.fetchUnsortedAssets(offset: offset, limit: limit) { result in
             loadingOffsets.remove(offset)
+            guard isVisible, loadGeneration == generation else { return }
             switch result {
             case .failure(let error):
                 loadError = error.localizedDescription
             case .success(let pageAssets):
                 loadError = nil
                 loadedOffsets.insert(offset)
+                // Batch the binding write: assigning 60 dictionary entries
+                // one at a time fired the parent's `@State` 60 times, which
+                // re-rendered the whole slideshow per element.
+                var updated = assetsByIndex
                 for (localIndex, asset) in pageAssets.enumerated() {
-                    assetsByIndex[offset + localIndex] = asset
+                    updated[offset + localIndex] = asset
                 }
+                assetsByIndex = updated
                 trimAssetCache(around: currentIndex)
                 updatePrefetch()
             }
@@ -4051,20 +4186,6 @@ private struct IndexedSlideshowAssetPager: View {
     private func updatePrefetch() {
         let neighborAssets = [safeIndex - 1, safeIndex + 1]
             .compactMap { assetsByIndex[$0] }
-        let next = Dictionary(uniqueKeysWithValues: neighborAssets.map {
-            ($0.localIdentifier, $0)
-        })
-        let stale = cachedNeighbors.values.filter {
-            next[$0.localIdentifier] == nil
-        }
-        if !stale.isEmpty {
-            PhotoImageManager.shared.stopCaching(
-                assets: Array(stale),
-                targetSize: prefetchTargetSize,
-                contentMode: contentMode,
-                isNetworkAccessAllowed: true
-            )
-        }
         let desiredPrefetchKeys = Set(
             neighborAssets.map { prefetchKey(for: $0) }
         )
@@ -4088,7 +4209,6 @@ private struct IndexedSlideshowAssetPager: View {
                 )
             }
         }
-        cachedNeighbors = next
     }
 
     private func stopPrefetch() {
@@ -4096,14 +4216,6 @@ private struct IndexedSlideshowAssetPager: View {
             PhotoImageManager.shared.cancel(handle)
         }
         prefetchHandles.removeAll()
-        guard !cachedNeighbors.isEmpty else { return }
-        PhotoImageManager.shared.stopCaching(
-            assets: Array(cachedNeighbors.values),
-            targetSize: prefetchTargetSize,
-            contentMode: contentMode,
-            isNetworkAccessAllowed: true
-        )
-        cachedNeighbors.removeAll()
     }
 }
 

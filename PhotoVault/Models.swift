@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import UIKit
 
 enum PhotoAlbumKind: String, Codable, Equatable {
     case user
@@ -182,6 +183,7 @@ enum AppIconPreference: String, CaseIterable, Identifiable {
 }
 
 enum PhotoSection: Hashable {
+    case home
     case library
     case unsorted
     case lan
@@ -271,9 +273,49 @@ enum SlideshowSettings {
     static let intervalValues: [TimeInterval] = [3, 5, 8, 12]
 }
 
+/// The page that should be selected when the app creates its root view.
+/// Album destinations store the PhotoKit local identifier rather than the
+/// localized title so renaming an album does not invalidate the preference.
+enum PhotoVaultStartupDestination {
+    static let storageKey = "PhotoVault.startup.destination"
+    static let homeRawValue = "home"
+    static let libraryRawValue = "library"
+    static let unsortedRawValue = "unsorted"
+    static let lanRawValue = "lan"
+    static let organizerRawValue = "organizer"
+    private static let albumPrefix = "album:"
+
+    static func albumRawValue(for id: String) -> String {
+        albumPrefix + id
+    }
+
+    static func albumID(from rawValue: String) -> String? {
+        guard rawValue.hasPrefix(albumPrefix) else { return nil }
+        let id = String(rawValue.dropFirst(albumPrefix.count))
+        return id.isEmpty ? nil : id
+    }
+}
+
+/// UI-only description of "the user tapped this grid cell". It carries the
+/// already-decoded thumbnail so the viewer can paint a first frame without
+/// waiting for PhotoKit; it is deliberately not a PhotoKit domain model.
+struct PhotoOpenContext {
+    let index: Int
+    let assetIdentifier: String
+    let previewImage: UIImage?
+}
+
 struct PhotoViewerRequest: Identifiable {
     let id = UUID()
     let index: Int
+    let assetIdentifier: String
+    let previewImage: UIImage?
+
+    init(index: Int, assetIdentifier: String, previewImage: UIImage?) {
+        self.index = index
+        self.assetIdentifier = assetIdentifier
+        self.previewImage = previewImage
+    }
 }
 
 struct PhotoVaultAlert: Identifiable {

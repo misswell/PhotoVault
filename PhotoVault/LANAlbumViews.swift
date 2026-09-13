@@ -202,7 +202,10 @@ struct LANFolderGridScreen: View {
             } else {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 2) {
-                        ForEach(Array(files.enumerated()), id: \.element) { index, fileURL in
+                        // Index-keyed so a swipe that rewrites `viewerIndex`
+                        // does not rebuild an n-element `(offset, element)`
+                        // array for a folder that can hold thousands of files.
+                        ForEach(files.indices, id: \.self) { index in
                             Button {
                                 viewerIndex = index
                             } label: {
@@ -210,9 +213,10 @@ struct LANFolderGridScreen: View {
                                     .aspectRatio(1, contentMode: .fit)
                                     .overlay {
                                         LANFolderImageView(
-                                            url: fileURL,
+                                            url: files[index],
                                             folderID: folder.id,
-                                            rootURL: folderURL ?? fileURL,
+                                            rootURL: folderURL
+                                                ?? URL(fileURLWithPath: "/"),
                                             maxPixelSize: 512
                                         )
                                     }
@@ -310,11 +314,19 @@ struct LANFolderGridScreen: View {
         let scopeStarted: Bool
     }
 
+    /// Main-actor bound on purpose: a nonisolated `async` function would hop
+    /// to the global executor (SE-0338) and then write `@State` from there,
+    /// racing the main-thread reads in `body`. All blocking work already runs
+    /// on GCD inside `LANFolderTimeout.run`.
+    @MainActor
     private func enumerate() async {
         // Re-entry replays the session cache: hitting the share again was
-        // stacking a second full traversal on top of the first one.
-        if let cached = LANFolderSessionCache.files(for: folder.id) {
-            files = cached
+        // stacking a second full traversal on top of the first one. Restore
+        // the resolved root as well, or every thumbnail cache key in the
+        // folder collapses and the whole grid re-decodes over SMB.
+        if let cached = LANFolderSessionCache.entry(for: folder.id) {
+            folderURL = cached.rootURL
+            files = cached.files
             isEnumerating = false
             return
         }
@@ -403,7 +415,11 @@ struct LANFolderGridScreen: View {
                 // session and hide recoverable content. Leave it uncached so
                 // the next visit (or 重试) enumerates again.
                 if !enumerated.isEmpty {
-                    LANFolderSessionCache.store(files: enumerated, for: album.id)
+                    LANFolderSessionCache.store(
+                        rootURL: url,
+                        files: enumerated,
+                        for: album.id
+                    )
                 }
             }
         } else {

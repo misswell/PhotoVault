@@ -19,33 +19,78 @@ enum LANFolderDiagnostics {
         formatter.dateFormat = "HH:mm:ss.SSS"
         return formatter
     }()
+    private static let fileURL: URL = {
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return caches
+            .appendingPathComponent("PhotoVault", isDirectory: true)
+            .appendingPathComponent("lan-folder.log")
+    }()
+    /// Held open for append. The previous implementation read the whole file
+    /// (up to 256 KB) and rewrote it atomically under the lock on *every* log
+    /// line, which could stall whichever thread happened to log — including
+    /// the main thread.
+    nonisolated(unsafe) private static var handle: FileHandle?
+    nonisolated(unsafe) private static var currentSize = 0
 
-    static func log(_ message: String) {
+    static func log(_ message: @autoclosure () -> String) {
+        let message = message()
         logger.log("\(message, privacy: .public)")
         appendToFile(message)
+    }
+
+    private static func openHandle() {
+        let fileManager = FileManager.default
+        try? fileManager.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        if !fileManager.fileExists(atPath: fileURL.path) {
+            fileManager.createFile(atPath: fileURL.path, contents: nil)
+        }
+        handle = try? FileHandle(forWritingTo: fileURL)
+        currentSize = (try? fileManager.attributesOfItem(atPath: fileURL.path)[.size])
+            .flatMap { $0 as? NSNumber }?
+            .intValue ?? 0
+        _ = try? handle?.seekToEnd()
     }
 
     private static func appendToFile(_ message: String) {
         lock.lock()
         defer { lock.unlock() }
-        guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
-            return
+        if handle == nil {
+            openHandle()
         }
-        let directory = caches.appendingPathComponent("PhotoVault", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let fileURL = directory.appendingPathComponent("lan-folder.log")
-        var data = (try? Data(contentsOf: fileURL)) ?? Data()
-        if data.count > maxBytes {
-            data = Data(data.suffix(maxBytes / 2))
-            if let newline = data.range(of: Data("\n".utf8)) {
-                data.removeSubrange(data.startIndex..<newline.lowerBound)
+
+        let line = Data("\(timestampFormatter.string(from: Date())) \(message)\n".utf8)
+        if currentSize + line.count > maxBytes {
+            // Trim once per cap crossing (keeping the tail) instead of on
+            // every line.
+            try? handle?.close()
+            handle = nil
+            if let existing = try? Data(contentsOf: fileURL) {
+                var trimmed = Data(existing.suffix(maxBytes / 2))
+                if let newline = trimmed.range(of: Data("\n".utf8)) {
+                    trimmed.removeSubrange(trimmed.startIndex..<newline.lowerBound)
+                }
+                try? trimmed.write(to: fileURL, options: .atomic)
+            } else {
+                try? FileManager.default.removeItem(at: fileURL)
             }
+            openHandle()
         }
-        data.append(Data("\(timestampFormatter.string(from: Date())) \(message)\n".utf8))
-        try? data.write(to: fileURL, options: .atomic)
+
+        guard let handle else { return }
+        do {
+            try handle.write(contentsOf: line)
+            currentSize += line.count
+        } catch {
+            try? handle.close()
+            self.handle = nil
+        }
     }
     #else
-    static func log(_ message: String) {}
+    static func log(_ message: @autoclosure () -> String) {}
     #endif
 }
 
@@ -176,7 +221,7 @@ enum LANFolderLibrary {
     static func coordinatedEnumerate(id: UUID, url: URL) -> [URL]? {
         let coordinator = NSFileCoordinator(filePresenter: nil)
         let intent = NSFileAccessIntent.readingIntent(with: url, options: [])
-        var result: [URL]?
+        let result = LANFolderImageLoader.CoordinatedResult<[URL]>()
         let queue = OperationQueue()
         let done = DispatchSemaphore(value: 0)
 
@@ -195,13 +240,14 @@ enum LANFolderLibrary {
             if scope {
                 LANFolderScopeManager.shared.noteScopeHeld(id: id, url: url)
             }
-            result = LANFolderImageLoader.enumerateImageFiles(under: url)
+            let enumerated = LANFolderImageLoader.enumerateImageFiles(under: url)
             LANFolderDiagnostics.log(
-                "coordinated enumerated \(result?.count ?? 0) files (startAccessing=\(scope))"
+                "coordinated enumerated \(enumerated.count) files (startAccessing=\(scope))"
             )
+            result.store(enumerated)
         }
-        done.wait()
-        return result
+        _ = done.wait(timeout: .now() + LANFolderImageLoader.coordinatedReadTimeout)
+        return result.load()
     }
 
     /// Resolves the bookmark back to a usable folder URL, or nil when the
@@ -271,18 +317,34 @@ final class LANFolderScopeManager: @unchecked Sendable {
     /// (or cache it as) empty, nor refresh its bookmark from this URL: a
     /// bookmark minted without a held scope carries no credentials and
     /// permanently downgrades the stored one.
+    ///
+    /// `startAccessingSecurityScopedResource` is a provider round trip, so it
+    /// deliberately runs outside the lock: holding it made a folder tap while
+    /// `warmScopes` was running block until the whole warm-up finished, and
+    /// that wait sat inside the enumeration timeout.
     @discardableResult
     func activate(id: UUID, url: URL) -> Bool {
         lock.lock()
-        defer { lock.unlock() }
         if let existing = active[id] {
-            guard existing.url != url || !existing.started else { return existing.started }
-            if existing.started {
-                existing.url.stopAccessingSecurityScopedResource()
+            if existing.url == url, existing.started {
+                lock.unlock()
+                return true
             }
         }
+        lock.unlock()
+
         let started = url.startAccessingSecurityScopedResource()
+
+        lock.lock()
+        if let existing = active[id],
+           existing.started,
+           existing.url != url {
+            // A different URL replaced this entry while we were starting;
+            // release the previous grant (it belongs to the same folder).
+            existing.url.stopAccessingSecurityScopedResource()
+        }
         active[id] = ActiveScope(url: url, started: started)
+        lock.unlock()
         return started
     }
 
@@ -297,10 +359,36 @@ final class LANFolderScopeManager: @unchecked Sendable {
 }
 
 enum LANFolderImageLoader {
+    /// Carries a value out of an `NSFileCoordinator` accessor. The accessor
+    /// runs on the coordinator's own queue while the caller waits on a
+    /// semaphore; a plain captured `var` there is a data race as far as the
+    /// compiler is concerned, so the hand-off goes through this box.
+    final class CoordinatedResult<Value>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Value?
+
+        func store(_ newValue: Value?) {
+            lock.lock()
+            value = newValue
+            lock.unlock()
+        }
+
+        func load() -> Value? {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     static let imageExtensions: Set<String> = [
         "jpg", "jpeg", "png", "heic", "heif", "gif", "webp",
         "bmp", "tif", "tiff", "dng",
     ]
+
+    /// A coordinated read that has not handed back its block in this long is
+    /// treated as a wedged provider. Waiting forever used to burn one of the
+    /// three decode slots for the lifetime of the process.
+    static let coordinatedReadTimeout: TimeInterval = 20
 
     /// Lists image files under the folder recursively, newest modification
     /// first. Runs off the main thread at the call site; the caller must
@@ -333,6 +421,10 @@ enum LANFolderImageLoader {
                 guard values?.isRegularFile == true,
                       values?.contentType?.conforms(to: .image) == true
                 else { continue }
+                LANFolderThumbnailDiskCache.recordModificationDate(
+                    values?.contentModificationDate,
+                    for: fileURL
+                )
                 files.append((fileURL, values?.contentModificationDate))
                 continue
             }
@@ -346,6 +438,12 @@ enum LANFolderImageLoader {
             // a folder full of images down to zero files. Only a confirmed
             // non-file (directory named "*.jpg") is skipped.
             guard values?.isRegularFile != false else { continue }
+            // Hand the mtime we already paid for to the thumbnail cache, so a
+            // disk-cache lookup never has to ask the provider again.
+            LANFolderThumbnailDiskCache.recordModificationDate(
+                values?.contentModificationDate,
+                for: fileURL
+            )
             files.append((fileURL, values?.contentModificationDate))
         }
 
@@ -358,11 +456,13 @@ enum LANFolderImageLoader {
     /// file inside a grid cell is exactly the main-thread hitch we never
     /// allow; callers run this off the main actor. The read is wrapped in an
     /// NSFileCoordinator coordinated access — the channel file providers
-    /// honor even where startAccessing-based scope is refused.
+    /// honor even where startAccessing-based scope is refused. The wait is
+    /// bounded: a wedged provider must not pin a decode slot for the rest of
+    /// the process, which used to starve every later image load.
     static func image(at url: URL, maxPixelSize: CGFloat) -> UIImage? {
         let coordinator = NSFileCoordinator(filePresenter: nil)
         let intent = NSFileAccessIntent.readingIntent(with: url, options: [])
-        var decoded: UIImage?
+        let decoded = CoordinatedResult<UIImage>()
         let done = DispatchSemaphore(value: 0)
         let queue = OperationQueue()
 
@@ -372,10 +472,12 @@ enum LANFolderImageLoader {
                 LANFolderDiagnostics.log("image coordinated read denied: \(error.localizedDescription)")
                 return
             }
-            decoded = decodeImage(at: url, maxPixelSize: maxPixelSize)
+            decoded.store(decodeImage(at: url, maxPixelSize: maxPixelSize))
         }
-        done.wait()
-        return decoded
+        // NSFileCoordinator guarantees the block eventually runs; if the
+        // provider is wedged it may take much longer than a user will wait.
+        _ = done.wait(timeout: .now() + coordinatedReadTimeout)
+        return decoded.load()
     }
 
     private static func decodeImage(at url: URL, maxPixelSize: CGFloat) -> UIImage? {
@@ -401,22 +503,44 @@ enum LANFolderImageLoader {
 /// NSCache-backed image access for LAN folder screens. NSCache is thread
 /// safe and evicts automatically under memory pressure; the cost limit keeps
 /// a few thousand decoded thumbnails from ever pinning hundreds of MB.
+///
+/// Grid thumbnails (512px, ~1 MB) and viewer/slideshow frames (2048px,
+/// ~12 MB) live in separate caches. Sharing one budget let a viewer's
+/// current+2 prefetch evict the entire grid working set, so returning from
+/// the viewer re-decoded every visible thumbnail over SMB.
 final class LANFolderImageCache: @unchecked Sendable {
     static let shared = LANFolderImageCache()
 
-    private let cache = NSCache<NSString, UIImage>()
+    private let thumbnailCache = NSCache<NSString, UIImage>()
+    private let fullSizeCache = NSCache<NSString, UIImage>()
 
     private init() {
-        cache.countLimit = 400
-        cache.totalCostLimit = 64 * 1024 * 1024
+        thumbnailCache.countLimit = 400
+        thumbnailCache.totalCostLimit = 64 * 1024 * 1024
+        // Room for the viewer's current page and its two neighbours, plus a
+        // little slack; full-screen frames are the expensive ones.
+        fullSizeCache.countLimit = 6
+        fullSizeCache.totalCostLimit = 72 * 1024 * 1024
     }
 
-    func image(forKey key: NSString) -> UIImage? {
-        cache.object(forKey: key)
+    func image(forKey key: NSString, isFullSize: Bool = false) -> UIImage? {
+        (isFullSize ? fullSizeCache : thumbnailCache).object(forKey: key)
     }
 
-    func store(_ image: UIImage, forKey key: NSString) {
-        cache.setObject(image, forKey: key, cost: Self.decodedCost(image))
+    func store(_ image: UIImage, forKey key: NSString, isFullSize: Bool = false) {
+        (isFullSize ? fullSizeCache : thumbnailCache).setObject(
+            image,
+            forKey: key,
+            cost: Self.decodedCost(image)
+        )
+    }
+
+    /// Drops decoded LAN images. Called when the app backgrounds: unlike the
+    /// PhotoKit caches there is no PHCachingImageManager backing this, and
+    /// the budget is large enough to matter under memory pressure.
+    func removeAll() {
+        thumbnailCache.removeAllObjects()
+        fullSizeCache.removeAllObjects()
     }
 
     private static func decodedCost(_ image: UIImage) -> Int {
@@ -432,6 +556,30 @@ final class LANFolderImageCache: @unchecked Sendable {
 /// downscale per file, every later visit reads small JPEGs straight from
 /// disk. Caches is purgeable, so this never counts against user data.
 enum LANFolderThumbnailDiskCache {
+    /// Modification dates observed during enumeration. Enumeration already
+    /// pays one provider round trip per file for these values; re-asking on
+    /// every thumbnail lookup made even a fully disk-cached folder wait on
+    /// three concurrent SMB stat calls.
+    private static let mtimeLock = NSLock()
+    nonisolated(unsafe) private static var knownModificationDates: [String: Date] = [:]
+    private static let knownModificationDateLimit = 32_768
+
+    static func recordModificationDate(_ date: Date?, for source: URL) {
+        guard let date else { return }
+        mtimeLock.lock()
+        if knownModificationDates.count >= knownModificationDateLimit {
+            knownModificationDates.removeAll(keepingCapacity: true)
+        }
+        knownModificationDates[source.path] = date
+        mtimeLock.unlock()
+    }
+
+    private static func knownModificationDate(for source: URL) -> Date? {
+        mtimeLock.lock()
+        defer { mtimeLock.unlock() }
+        return knownModificationDates[source.path]
+    }
+
     private static func directory(for folderID: UUID) -> URL {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         let directory = caches
@@ -474,9 +622,11 @@ enum LANFolderThumbnailDiskCache {
         rootURL: URL,
         maxPixelSize: CGFloat
     ) -> UIImage? {
-        let modificationDate = try? source.resourceValues(
+        // Prefer the mtime enumeration already resolved; fall back to one
+        // provider query only when this file was never enumerated.
+        let modificationDate = knownModificationDate(for: source) ?? (try? source.resourceValues(
             forKeys: [.contentModificationDateKey]
-        ).contentModificationDate
+        ).contentModificationDate)
         let diskURL = fileURL(
             for: source,
             folderID: folderID,
@@ -485,7 +635,9 @@ enum LANFolderThumbnailDiskCache {
             maxPixelSize: maxPixelSize
         )
         if let cached = UIImage(contentsOfFile: diskURL.path) {
-            return cached
+            // UIImage(contentsOfFile:) is lazy; decode here, on the loader's
+            // queue, instead of at first draw on the main thread.
+            return cached.preparingForDisplay() ?? cached
         }
         guard let decoded = LANFolderImageLoader.image(
             at: source,
@@ -505,22 +657,23 @@ enum LANFolderThumbnailDiskCache {
     }
 }
 
-/// A cancellation flag a detached queue job can poll: scrolling cells cancel
-/// their tasks, and decode slots must not be spent on off-screen images.
-final class LANFolderCancellationFlag: @unchecked Sendable {
+/// One `load` call's slot in the coalesced job. Resuming is idempotent, so a
+/// cancelled task and the finishing job can never resume the continuation
+/// twice.
+private final class LANFolderLoadWaiter: @unchecked Sendable {
     private let lock = NSLock()
-    private var cancelled = false
+    private var continuation: CheckedContinuation<UIImage?, Never>?
 
-    func cancel() {
-        lock.lock()
-        cancelled = true
-        lock.unlock()
+    init(_ continuation: CheckedContinuation<UIImage?, Never>) {
+        self.continuation = continuation
     }
 
-    var isCancelled: Bool {
+    func resume(with image: UIImage?) {
         lock.lock()
-        defer { lock.unlock() }
-        return cancelled
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: image)
     }
 }
 
@@ -530,12 +683,14 @@ final class LANFolderCancellationFlag: @unchecked Sendable {
 /// app, and repeated screen visits queued duplicate work for the same files.
 /// Loads are therefore coalesced per file, capped at three concurrent
 /// decodes, fronted by a disk thumbnail cache, and the gate wait times out
-/// so a poisoned slot can never back the queue up forever. Cancellation is
-/// polled by the queue job so off-screen cells release their slots.
+/// so a poisoned slot can never back the queue up forever.
+///
+/// Cancelling one cell only detaches that cell's waiter; it must never abort
+/// the job the other waiters are still attached to.
 enum LANFolderImageLoaderQueue {
     private static let lock = NSLock()
     // Guarded by `lock`.
-    nonisolated(unsafe) private static var waiters: [NSString: [(UIImage?) -> Void]] = [:]
+    nonisolated(unsafe) private static var waiters: [NSString: [LANFolderLoadWaiter]] = [:]
     nonisolated(unsafe) private static var inFlight: Set<NSString> = []
 
     private static let queue = DispatchQueue(
@@ -546,41 +701,95 @@ enum LANFolderImageLoaderQueue {
     private static let loadGate = DispatchSemaphore(value: 3)
     private static let gateTimeout: TimeInterval = 45
 
+    /// Bridges a cancelled Swift task to the waiter it registered inside the
+    /// continuation body, which is not otherwise reachable from `onCancel`.
+    private final class WaiterBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var waiter: LANFolderLoadWaiter?
+        private var key: NSString?
+
+        func set(waiter: LANFolderLoadWaiter, key: NSString) {
+            lock.lock()
+            self.waiter = waiter
+            self.key = key
+            lock.unlock()
+        }
+
+        func cancel() {
+            lock.lock()
+            let waiter = self.waiter
+            let key = self.key
+            lock.unlock()
+            guard let waiter, let key else { return }
+            LANFolderImageLoaderQueue.detach(waiter, key: key)
+            waiter.resume(with: nil)
+        }
+    }
+
+    private static func detach(_ waiter: LANFolderLoadWaiter, key: NSString) {
+        lock.lock()
+        if var remaining = waiters[key] {
+            remaining.removeAll { $0 === waiter }
+            if remaining.isEmpty {
+                waiters.removeValue(forKey: key)
+            } else {
+                waiters[key] = remaining
+            }
+        }
+        lock.unlock()
+    }
+
+    private static func hasWaiters(for key: NSString) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return waiters[key]?.isEmpty == false
+    }
+
+    /// Display-sized frames (viewer, slideshow) are an order of magnitude
+    /// larger than grid thumbnails and get their own cache budget.
+    static let fullSizeThreshold: CGFloat = 1_024
+
     static func load(
         at url: URL,
         folderID: UUID,
         rootURL: URL,
         maxPixelSize: CGFloat
     ) async -> UIImage? {
-        let flag = LANFolderCancellationFlag()
+        let isFullSize = maxPixelSize > fullSizeThreshold
+        let box = WaiterBox()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<UIImage?, Never>) in
                 let key: NSString = "\(url.path)#\(Int(maxPixelSize))" as NSString
-                if let cached = LANFolderImageCache.shared.image(forKey: key) {
+                if let cached = LANFolderImageCache.shared.image(
+                    forKey: key,
+                    isFullSize: isFullSize
+                ) {
                     continuation.resume(returning: cached)
                     return
                 }
+                let waiter = LANFolderLoadWaiter(continuation)
+                box.set(waiter: waiter, key: key)
                 lock.lock()
-                waiters[key, default: []].append { image in
-                    continuation.resume(returning: image)
-                }
+                waiters[key, default: []].append(waiter)
                 let shouldStart = inFlight.insert(key).inserted
                 lock.unlock()
 
                 guard shouldStart else { return }
+                // Capture the value type, not the NSString reference: the
+                // queue hop is a @Sendable closure.
+                let keyValue = key as String
                 queue.async {
                     process(
-                        key: key,
+                        key: keyValue as NSString,
                         url: url,
                         folderID: folderID,
                         rootURL: rootURL,
-                        maxPixelSize: maxPixelSize,
-                        flag: flag
+                        maxPixelSize: maxPixelSize
                     )
                 }
             }
         } onCancel: {
-            flag.cancel()
+            box.cancel()
         }
     }
 
@@ -589,39 +798,40 @@ enum LANFolderImageLoaderQueue {
         url: URL,
         folderID: UUID,
         rootURL: URL,
-        maxPixelSize: CGFloat,
-        flag: LANFolderCancellationFlag
+        maxPixelSize: CGFloat
     ) {
+        let isFullSize = maxPixelSize > fullSizeThreshold
+        // Every waiter went away while this job was queued: keep the gate for
+        // work someone is still waiting on.
+        guard hasWaiters(for: key) else {
+            finish(key: key, image: nil, isFullSize: isFullSize)
+            return
+        }
+
         var image: UIImage?
-        if !flag.isCancelled,
-           loadGate.wait(timeout: .now() + gateTimeout) == .success {
-            if flag.isCancelled {
-                loadGate.signal()
-            } else {
+        if loadGate.wait(timeout: .now() + gateTimeout) == .success {
+            if hasWaiters(for: key) {
                 image = LANFolderThumbnailDiskCache.image(
                     for: url,
                     folderID: folderID,
                     rootURL: rootURL,
                     maxPixelSize: maxPixelSize
                 )
-                loadGate.signal()
-                if let image {
-                    LANFolderImageCache.shared.store(image, forKey: key)
-                }
             }
+            loadGate.signal()
         }
-        finish(key: key, image: image)
+        finish(key: key, image: image, isFullSize: isFullSize)
     }
 
-    private static func finish(key: NSString, image: UIImage?) {
+    private static func finish(key: NSString, image: UIImage?, isFullSize: Bool) {
         lock.lock()
         let callbacks = waiters.removeValue(forKey: key) ?? []
         inFlight.remove(key)
         lock.unlock()
         if let image {
-            LANFolderImageCache.shared.store(image, forKey: key)
+            LANFolderImageCache.shared.store(image, forKey: key, isFullSize: isFullSize)
         }
-        callbacks.forEach { $0(image) }
+        callbacks.forEach { $0.resume(with: image) }
     }
 }
 
@@ -693,19 +903,35 @@ enum LANFolderTimeout {
 /// cached list instead of traversing the SMB share again — the repeat-visit
 /// freeze was overlapping full traversals stacked on a timeout that never
 /// actually fired.
+///
+/// The resolved root URL travels with the file list: thumbnail cache keys are
+/// relative to that root, and a replay that lost it fell back to each file's
+/// own absolute path, which collapsed every key in the folder to one digest
+/// and made every revisit a full re-decode over SMB.
 enum LANFolderSessionCache {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var filesByFolder: [UUID: [URL]] = [:]
-
-    static func files(for id: UUID) -> [URL]? {
-        lock.lock()
-        defer { lock.unlock() }
-        return filesByFolder[id]
+    struct Entry: Sendable {
+        let rootURL: URL
+        let files: [URL]
     }
 
-    static func store(files: [URL], for id: UUID) {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var entriesByFolder: [UUID: Entry] = [:]
+
+    static func entry(for id: UUID) -> Entry? {
         lock.lock()
         defer { lock.unlock() }
-        filesByFolder[id] = files
+        return entriesByFolder[id]
+    }
+
+    static func store(rootURL: URL, files: [URL], for id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        entriesByFolder[id] = Entry(rootURL: rootURL, files: files)
+    }
+
+    static func removeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        entriesByFolder.removeAll()
     }
 }

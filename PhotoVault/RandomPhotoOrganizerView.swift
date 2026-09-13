@@ -208,7 +208,13 @@ struct RandomPhotoOrganizerView: View {
         .onChange(of: store.recycleBinIDs) { _, _ in
             guard !isSessionActive else { return }
             updatePendingTrash(store.recycleBinAssets())
-            choosePreviewAsset()
+            // Only replace a hero that the recycle bin just took away; every
+            // other change used to pick a new random full-screen photo and
+            // re-download it at viewer priority.
+            if let previewAsset,
+               pendingTrashIDs.contains(previewAsset.localIdentifier) {
+                choosePreviewAsset()
+            }
         }
     }
 
@@ -269,7 +275,7 @@ struct RandomPhotoOrganizerView: View {
                         asset: previewAsset,
                         targetSize: targetSize(for: proxy.size),
                         contentMode: .aspectFill,
-                        requestPriority: .viewer,
+                        requestPriority: .photoGrid,
                         cacheResult: true
                     )
                     .frame(width: proxy.size.width, height: proxy.size.height)
@@ -727,7 +733,8 @@ struct RandomPhotoOrganizerView: View {
         currentAsset = nil
         nextAsset = nil
         resetCardStateWithoutAnimation()
-        choosePreviewAsset()
+        // A finished session is a deliberate moment to show a different hero.
+        choosePreviewAsset(force: true)
     }
 
     private func drawNextAsset() -> PHAsset? {
@@ -952,10 +959,21 @@ struct RandomPhotoOrganizerView: View {
         pendingTrashIDs = seen
     }
 
-    private func choosePreviewAsset() {
+    /// Picks the decorative hero photo. Deliberately stable: it keeps the
+    /// current selection while that asset is still valid, so switching tabs or
+    /// re-entering the organizer does not request another full-screen iCloud
+    /// image, and it is requested at grid priority rather than viewer
+    /// priority so it never preempts a real detail-page request.
+    private func choosePreviewAsset(force: Bool = false) {
         guard let assets = store.allPhotos, assets.count > 0 else {
             previewAsset = nil
             previewAssetIndex = nil
+            return
+        }
+
+        if !force,
+           let previewAsset,
+           !pendingTrashIDs.contains(previewAsset.localIdentifier) {
             return
         }
 

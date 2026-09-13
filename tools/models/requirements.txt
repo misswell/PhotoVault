@@ -1,0 +1,49 @@
+# PhotoVault AI Search — SigLIP2 reference / Core ML conversion toolchain
+#
+# Pinned on purpose: Core ML conversion parity is version sensitive. Do not
+# float these. `requirements-lock.txt` holds the complete resolved set.
+#
+# Verified target environment (2026-09-13):
+#   macOS 15.7.7 (24G720), Apple M1, 16 GiB, Xcode 26.3, Python 3.12.2
+#
+# Setup:
+#   /opt/homebrew/bin/python3.12 -m venv .venv
+#   ./.venv/bin/python -m pip install -r requirements.txt
+#
+# NOTE: this machine's network needs the macOS system proxy for huggingface.co
+# (curl does not use it). See README.md "Network".
+
+# --- reference model -------------------------------------------------------
+# torch 2.5.0, not 2.5.1: coremltools warns that 2.5.1 "has not been tested",
+# and 2.5.0 is the most recent version it has. Conversion parity is the one
+# thing we cannot debug away later, so use the tested pair.
+torch==2.5.0
+torchvision==0.20.0
+
+# 4.53.3, not 4.49: transformers 4.49 has NO siglip2 module (the `siglip2`
+# package landed later), and verify_siglip2.py needs Siglip2Model to prove the
+# "siglip"-typed checkpoint loads the same tower as the v1 class.
+transformers==4.53.3
+huggingface-hub==0.36.2
+tokenizers==0.21.4
+safetensors==0.5.2
+
+# SentencePiece is the canonical tokenizer for the Swift port (tokenizer.model)
+# and is also needed by the slow GemmaTokenizer. tiktoken only exists to let
+# GemmaTokenizerFast convert; the fast tokenizer is not our reference.
+sentencepiece==0.2.2
+tiktoken==0.14.0
+
+# --- Core ML ---------------------------------------------------------------
+# 9.0 is the first release that knows the iOS 26 deployment target, which
+# matches this project's minimum (iOS/iPadOS 26.0). It also renamed the
+# quantization entry points (op_linear_quantizer -> linear_quantize_weights);
+# convert_siglip2.py accepts both spellings.
+coremltools==9.0
+
+# Pinned below 2.0: validated against the numpy 1.26 ABI.
+numpy==1.26.4
+pillow==11.1.0
+
+# Benchmark metrics (nDCG / Recall / MRR) and parity statistics
+scipy==1.15.1

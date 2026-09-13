@@ -2,6 +2,26 @@ import Photos
 import SwiftUI
 import UIKit
 
+/// A one-entry memo for a derived value read repeatedly during a single
+/// `body` evaluation. It is a reference type stored in `@State` so updating it
+/// does not trigger a SwiftUI update — it only avoids recomputing the same
+/// projection several times per render.
+@MainActor
+private final class SidebarDerivationMemo<Value> {
+    private var key: String?
+    private var stored: Value?
+
+    func value(for newKey: String, build: () -> Value) -> Value {
+        if key == newKey, let stored {
+            return stored
+        }
+        let built = build()
+        key = newKey
+        stored = built
+        return built
+    }
+}
+
 struct ContentView: View {
     private enum RootTab: Hashable {
         case library
@@ -16,6 +36,8 @@ struct ContentView: View {
     @State private var searchText = ""
     @State private var isShowingLimitedPicker = false
     @State private var isShowingSettings = false
+    @AppStorage(PhotoVaultStartupDestination.storageKey)
+    private var startupDestinationRawValue = PhotoVaultStartupDestination.libraryRawValue
     @AppStorage("PhotoVault.home.regularAlbumsExpanded") private var regularAlbumsExpanded = true
     @AppStorage("PhotoVault.home.sharedAlbumsExpanded") private var sharedAlbumsExpanded = true
     @AppStorage("PhotoVault.home.folderPresentation") private var folderPresentationRawValue = FolderPresentation.list.rawValue
@@ -23,9 +45,46 @@ struct ContentView: View {
     @AppStorage(AlbumTileColumnCount.storageKey) private var albumTileColumnCountRawValue = AlbumTileColumnCount.automatic.rawValue
     @GestureState private var albumMagnification: CGFloat = 1
     @State private var expandedFolderIDs: Set<String> = []
+    /// Derivations of the store's album tree that the sidebar reads several
+    /// times per body evaluation. Pinching a tile grid re-evaluates the whole
+    /// body on every frame, and rebuilding these arrays each time was pure
+    /// churn, so each projection is memoized against a cheap change key.
+    @State private var folderListMemo = SidebarDerivationMemo<[FolderListItem]>()
+    @State private var albumMatchesMemo = SidebarDerivationMemo<[PhotoAlbum]>()
 #if DEBUG
     @State private var isShowingPerformance = false
 #endif
+
+    init() {
+        let rawValue = UserDefaults.standard.string(
+            forKey: PhotoVaultStartupDestination.storageKey
+        ) ?? PhotoVaultStartupDestination.libraryRawValue
+
+        switch rawValue {
+        case PhotoVaultStartupDestination.homeRawValue:
+            _selectedRootTab = State(initialValue: .library)
+            _selection = State(initialValue: .home)
+        case PhotoVaultStartupDestination.unsortedRawValue:
+            _selectedRootTab = State(initialValue: .library)
+            _selection = State(initialValue: .unsorted)
+        case PhotoVaultStartupDestination.lanRawValue:
+            _selectedRootTab = State(initialValue: .library)
+            _selection = State(initialValue: .lan)
+        case PhotoVaultStartupDestination.organizerRawValue:
+            _selectedRootTab = State(initialValue: .organizer)
+            _selection = State(initialValue: .home)
+        case PhotoVaultStartupDestination.libraryRawValue:
+            _selectedRootTab = State(initialValue: .library)
+            _selection = State(initialValue: .library)
+        default:
+            _selectedRootTab = State(initialValue: .library)
+            _selection = State(
+                initialValue: PhotoVaultStartupDestination
+                    .albumID(from: rawValue)
+                    .map(PhotoSection.album) ?? .home
+            )
+        }
+    }
 
     private enum FolderListItem: Identifiable {
         case folder(PhotoAlbumFolder, depth: Int)
@@ -53,7 +112,9 @@ struct ContentView: View {
             }
         }
         .task {
+            photoVaultTraceLaunch("content task begin")
             store.start()
+            photoVaultTraceLaunch("content task returned")
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -64,6 +125,18 @@ struct ContentView: View {
             default:
                 break
             }
+        }
+        .onChange(of: store.isLoadingAlbums) { _, isLoading in
+            guard !isLoading else { return }
+            guard case .album(let id) = selection,
+                  PhotoVaultStartupDestination.albumID(
+                      from: startupDestinationRawValue
+                  ) == id,
+                  store.album(withID: id) == nil
+            else {
+                return
+            }
+            selection = .home
         }
     }
 
@@ -88,6 +161,9 @@ struct ContentView: View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             List(selection: $selection) {
                 Section {
+                    Label("首页", systemImage: "house")
+                        .tag(PhotoSection.home)
+
                     Label("图库", systemImage: "photo.on.rectangle.angled")
                         .tag(PhotoSection.library)
 
@@ -234,9 +310,15 @@ struct ContentView: View {
     }
 
     private var visibleAlbums: [PhotoAlbum] {
-        let query = searchQuery
-        return store.albums.filter { album in
-            album.title.localizedCaseInsensitiveContains(query)
+        // One filtered pass per (structure revision, query) pair. The sidebar
+        // asks for the matched, regular and shared lists in the same body, and
+        // each access used to re-run the locale-aware scan over every album.
+        albumMatchesMemo.value(for: "\(store.albumStructureRevision)|\(searchQuery)") {
+            let query = searchQuery
+            guard !query.isEmpty else { return [] }
+            return store.albums.filter { album in
+                album.title.localizedCaseInsensitiveContains(query)
+            }
         }
     }
 
@@ -257,8 +339,16 @@ struct ContentView: View {
     }
 
     private var visibleFolderListItems: [FolderListItem] {
-        store.albumFolders.flatMap {
-            folderListItems(for: $0, albumPresentation: folderPresentation)
+        // Keyed on the store's album-structure revision, the list/grid
+        // presentation and the expanded set — the only inputs that change the
+        // flattened result.
+        let expandedKey = expandedFolderIDs.sorted().joined(separator: ",")
+        return folderListMemo.value(
+            for: "\(store.albumStructureRevision)|\(folderPresentationRawValue)|\(expandedKey)"
+        ) {
+            store.albumFolders.flatMap {
+                folderListItems(for: $0, albumPresentation: folderPresentation)
+            }
         }
     }
 
@@ -487,6 +577,17 @@ struct ContentView: View {
     @ViewBuilder
     private var detailView: some View {
         switch selection ?? .library {
+        case .home:
+            PhotoVaultHomeScreen(
+                store: store,
+                onSelectSection: { destination in
+                    selection = destination
+                },
+                onSelectOrganizer: {
+                    selectedRootTab = .organizer
+                }
+            )
+            .id("home-detail")
         case .library:
             PhotoGridScreen(
                 title: "图库",
@@ -535,6 +636,122 @@ struct ContentView: View {
                 }
             )
         }
+    }
+}
+
+private struct PhotoVaultHomeScreen: View {
+    @ObservedObject var store: PhotoLibraryStore
+    let onSelectSection: (PhotoSection) -> Void
+    let onSelectOrganizer: () -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("照片")
+                        .font(.largeTitle.weight(.bold))
+                    Text("从这里开始浏览和整理你的照片。")
+                        .foregroundStyle(.secondary)
+                }
+
+                LazyVGrid(
+                    columns: [
+                        GridItem(.flexible(), spacing: 12),
+                        GridItem(.flexible(), spacing: 12)
+                    ],
+                    spacing: 12
+                ) {
+                    PhotoVaultHomeActionCard(
+                        title: "图库",
+                        detail: store.allPhotos?.count.formatted() ?? "读取中",
+                        systemImage: "photo.on.rectangle.angled"
+                    ) {
+                        onSelectSection(.library)
+                    }
+
+                    PhotoVaultHomeActionCard(
+                        title: "未整理",
+                        detail: store.unsortedCount.formatted() + " 张",
+                        systemImage: "tray.full"
+                    ) {
+                        onSelectSection(.unsorted)
+                    }
+
+                    PhotoVaultHomeActionCard(
+                        title: "文件夹相册",
+                        detail: "SMB、本机或 U 盘",
+                        systemImage: "folder"
+                    ) {
+                        onSelectSection(.lan)
+                    }
+
+                    PhotoVaultHomeActionCard(
+                        title: "整理",
+                        detail: "随机整理照片",
+                        systemImage: "rectangle.stack.badge.play"
+                    ) {
+                        onSelectOrganizer()
+                    }
+                }
+
+                if !store.albums.isEmpty {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("相册")
+                            .font(.headline)
+
+                        ForEach(store.albums.prefix(6)) { album in
+                            Button {
+                                onSelectSection(.album(album.id))
+                            } label: {
+                                AlbumSidebarRow(album: album)
+                                    .padding(.vertical, 2)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .navigationTitle("首页")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct PhotoVaultHomeActionCard: View {
+    let title: String
+    let detail: String
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.blue)
+                    .frame(width: 28, height: 28)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
+            .padding(.horizontal, 12)
+            .background(
+                Color(uiColor: .secondarySystemGroupedBackground),
+                in: RoundedRectangle(cornerRadius: 14, style: .continuous)
+            )
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -1247,8 +1464,16 @@ private struct LimitedLibraryPickerTrigger: UIViewControllerRepresentable {
 /// without adding diagnostics to the release Photos experience.
 private struct DebugPerformanceView: View {
     @ObservedObject var store: PhotoLibraryStore
+    @ObservedObject private var indexProgressReporter: PhotoIndexProgressReporter
     @Environment(\.dismiss) private var dismiss
     @State private var activeRequests = 0
+
+    init(store: PhotoLibraryStore) {
+        self.store = store
+        self._indexProgressReporter = ObservedObject(
+            wrappedValue: store.indexProgressReporter
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -1261,7 +1486,7 @@ private struct DebugPerformanceView: View {
 
                 Section("索引") {
                     LabeledContent("状态", value: indexState)
-                    if let progress = store.indexProgress {
+                    if let progress = indexProgressReporter.progress {
                         LabeledContent(
                             "进度",
                             value: "\(progress.completed.formatted()) / \(progress.total.formatted())"
@@ -1316,6 +1541,8 @@ private struct DebugPerformanceView: View {
 struct PhotoVaultSettingsView: View {
     @ObservedObject var store: PhotoLibraryStore
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(PhotoVaultStartupDestination.storageKey)
+    private var startupDestinationRawValue = PhotoVaultStartupDestination.libraryRawValue
     @AppStorage(AlbumTileColumnCount.storageKey)
     private var albumTileColumnCountRawValue = AlbumTileColumnCount.automatic.rawValue
     @AppStorage(PhotoSwipeStyle.storageKey)
@@ -1343,9 +1570,81 @@ struct PhotoVaultSettingsView: View {
         AppIconPreference(rawValue: appIconPreferenceRawValue) ?? .system
     }
 
+    private var savedStartupAlbumID: String? {
+        PhotoVaultStartupDestination.albumID(from: startupDestinationRawValue)
+    }
+
+    private var selectedStartupDestinationDetail: String {
+        switch startupDestinationRawValue {
+        case PhotoVaultStartupDestination.homeRawValue:
+            return "下次启动时打开首页。"
+        case PhotoVaultStartupDestination.libraryRawValue:
+            return "下次启动时打开图库。"
+        case PhotoVaultStartupDestination.unsortedRawValue:
+            return "下次启动时打开未整理。"
+        case PhotoVaultStartupDestination.lanRawValue:
+            return "下次启动时打开文件夹相册。"
+        case PhotoVaultStartupDestination.organizerRawValue:
+            return "下次启动时打开整理。"
+        default:
+            guard let albumID = savedStartupAlbumID else {
+                return "下次启动时打开首页。"
+            }
+            if let album = store.album(withID: albumID) {
+                return "下次启动时直接打开「\(album.title)」。"
+            }
+            return store.isLoadingAlbums
+                ? "正在读取相册列表。"
+                : "已保存的相册不可用，下次启动时将打开首页。"
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
+                Section("启动时打开") {
+                    Picker("启动页面", selection: $startupDestinationRawValue) {
+                        Text("首页")
+                            .tag(PhotoVaultStartupDestination.homeRawValue)
+                        Text("图库")
+                            .tag(PhotoVaultStartupDestination.libraryRawValue)
+                        Text("未整理")
+                            .tag(PhotoVaultStartupDestination.unsortedRawValue)
+                        Text("文件夹相册")
+                            .tag(PhotoVaultStartupDestination.lanRawValue)
+                        Text("整理")
+                            .tag(PhotoVaultStartupDestination.organizerRawValue)
+
+                        Section("相册") {
+                            ForEach(store.albums) { album in
+                                Text(album.title)
+                                    .tag(
+                                        PhotoVaultStartupDestination
+                                            .albumRawValue(for: album.id)
+                                    )
+                            }
+
+                            if let savedStartupAlbumID,
+                               store.album(withID: savedStartupAlbumID) == nil {
+                                Text(
+                                    store.isLoadingAlbums
+                                        ? "正在读取相册…"
+                                        : "已保存的相册不可用"
+                                )
+                                .tag(startupDestinationRawValue)
+                            }
+                        }
+                    }
+
+                    Text(selectedStartupDestinationDetail)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    Text("修改后会在下次启动时生效。")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("相册平铺") {
                     Picker("每行列数", selection: $albumTileColumnCountRawValue) {
                         ForEach(AlbumTileColumnCount.allCases) { columnCount in

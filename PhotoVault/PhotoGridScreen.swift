@@ -48,8 +48,8 @@ struct PhotoGridScreen: View {
                             && !isShowingSlideshow,
                         selectionMode: selectionMode,
                         selectedIDs: Set(selectedAssets.keys),
-                        onOpen: { index in
-                            presentViewer(at: index)
+                        onOpen: { context in
+                            presentViewer(with: context)
                         },
                         onToggleSelection: toggleSelection(for:),
                         onFavorite: toggleFavorite(for:),
@@ -179,6 +179,8 @@ struct PhotoGridScreen: View {
                     initialIndex: request.index,
                     store: store,
                     album: album,
+                    initialPreviewImage: request.previewImage,
+                    initialAssetIdentifier: request.assetIdentifier,
                     onDismissRequested: dismissViewer
                 )
             }
@@ -336,12 +338,21 @@ struct PhotoGridScreen: View {
         }
     }
 
-    private func presentViewer(at index: Int) {
+    private func presentViewer(with context: PhotoOpenContext) {
+        photoVaultTrace(
+            "grid_tap index=\(context.index) "
+                + "asset=\(photoVaultShortAssetID(context.assetIdentifier)) "
+                + "preview=\(context.previewImage != nil)"
+        )
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             isViewerTransitioning = true
-            viewerRequest = PhotoViewerRequest(index: index)
+            viewerRequest = PhotoViewerRequest(
+                index: context.index,
+                assetIdentifier: context.assetIdentifier,
+                previewImage: context.previewImage
+            )
         }
     }
 
@@ -358,6 +369,16 @@ struct PhotoGridScreen: View {
 
 struct UnsortedPhotosScreen: View {
     @ObservedObject var store: PhotoLibraryStore
+    /// Observed separately: index progress ticks several times a second and
+    /// must invalidate only the progress label, not the whole screen.
+    @ObservedObject private var indexProgressReporter: PhotoIndexProgressReporter
+
+    init(store: PhotoLibraryStore) {
+        self.store = store
+        self._indexProgressReporter = ObservedObject(
+            wrappedValue: store.indexProgressReporter
+        )
+    }
 
     @State private var selectionMode = false
     @State private var selectedAssets: [String: PHAsset] = [:]
@@ -672,7 +693,7 @@ struct UnsortedPhotosScreen: View {
     }
 
     private var indexProgressTitle: String {
-        switch store.indexProgress?.phase {
+        switch indexProgressReporter.progress?.phase {
         case .scanningAlbums:
             return "正在分析相册归属…"
         case .finalizing:

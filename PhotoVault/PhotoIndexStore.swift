@@ -54,7 +54,9 @@ final class PhotoIndexStore: @unchecked Sendable {
             PHAssetMediaType.image.rawValue,
             PHAssetMediaType.video.rawValue
         )
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        // No sort descriptor: membership enumeration only inserts IDs, and an
+        // ORDER BY here made PhotoKit sort the whole album (for a smart album,
+        // the entire library) on every membership pass for no benefit.
         return options
     }
 
@@ -117,6 +119,15 @@ final class PhotoIndexStore: @unchecked Sendable {
         }
     }
 
+    /// Transports a non-Sendable closure onto one of this store's serial
+    /// queues. Every callback handed to the store is invoked from those
+    /// queues, so the transfer is intentional; the box states that once here
+    /// instead of leaving a Swift 6 concurrency warning at every dispatch.
+    private struct Callback<Value>: @unchecked Sendable {
+        let value: Value
+    }
+
+
     /// Close the snapshot reader and truncate an already-checkpointed WAL
     /// after foreground work has stopped. Running this behind both serial
     /// queues avoids racing a page read and keeps crash/rebuild history from
@@ -150,6 +161,7 @@ final class PhotoIndexStore: @unchecked Sendable {
     /// applies that delta incrementally. The fallback for a stale or expired
     /// token remains the full rebuild in the caller.
     func hasUsableIndex(completion: @escaping (Bool) -> Void) {
+        let completionBox = Callback(value: completion)
         readQueue.async { [weak self] in
             guard let self else { return }
             let usable = (try? self.withReadDatabase {
@@ -157,7 +169,7 @@ final class PhotoIndexStore: @unchecked Sendable {
                     && self.readMetaOnReadConnection("index_ready") == "1"
             }) ?? false
             if usable {
-                DispatchQueue.main.async { completion(true) }
+                DispatchQueue.main.async { completionBox.value(true) }
                 return
             }
             // A reader connection cannot run WAL recovery when the previous
@@ -171,7 +183,7 @@ final class PhotoIndexStore: @unchecked Sendable {
                     try self.readMeta("schema_version") == Self.schemaVersion
                         && self.readMeta("index_ready") == "1"
                 }) ?? false
-                DispatchQueue.main.async { completion(usable) }
+                DispatchQueue.main.async { completionBox.value(usable) }
             }
         }
     }
@@ -184,6 +196,8 @@ final class PhotoIndexStore: @unchecked Sendable {
         progress: @escaping (PhotoIndexProgress) -> Void,
         completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
     ) {
+        let completionBox = Callback(value: completion)
+        let progressBox = Callback(value: progress)
         queue.async { [weak self] in
             guard let self else { return }
 
@@ -194,14 +208,14 @@ final class PhotoIndexStore: @unchecked Sendable {
                     userAlbums: userAlbums,
                     librarySignature: librarySignature,
                     generation: generation,
-                    progress: progress
+                    progress: progressBox.value
                 )
                 DispatchQueue.main.async {
-                    completion(.success(stats))
+                    completionBox.value(.success(stats))
                 }
             } catch {
                 DispatchQueue.main.async {
-                    completion(.failure(error))
+                    completionBox.value(.failure(error))
                 }
             }
         }
@@ -214,6 +228,8 @@ final class PhotoIndexStore: @unchecked Sendable {
         progress: @escaping (PhotoIndexProgress) -> Void,
         completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
     ) {
+        let completionBox = Callback(value: completion)
+        let progressBox = Callback(value: progress)
         queue.async { [weak self] in
             guard let self else { return }
 
@@ -223,14 +239,14 @@ final class PhotoIndexStore: @unchecked Sendable {
                     userAlbums: userAlbums,
                     librarySignature: librarySignature,
                     generation: generation,
-                    progress: progress
+                    progress: progressBox.value
                 )
                 DispatchQueue.main.async {
-                    completion(.success(stats))
+                    completionBox.value(.success(stats))
                 }
             } catch {
                 DispatchQueue.main.async {
-                    completion(.failure(error))
+                    completionBox.value(.failure(error))
                 }
             }
         }
@@ -243,6 +259,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         generation: Int,
         completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
     ) {
+        let completionBox = Callback(value: completion)
         queue.async { [weak self] in
             guard let self else { return }
 
@@ -255,11 +272,11 @@ final class PhotoIndexStore: @unchecked Sendable {
                     generation: generation
                 )
                 DispatchQueue.main.async {
-                    completion(.success(stats))
+                    completionBox.value(.success(stats))
                 }
             } catch {
                 DispatchQueue.main.async {
-                    completion(.failure(error))
+                    completionBox.value(.failure(error))
                 }
             }
         }
@@ -276,6 +293,8 @@ final class PhotoIndexStore: @unchecked Sendable {
         progress: @escaping (PhotoIndexProgress) -> Void,
         completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
     ) {
+        let completionBox = Callback(value: completion)
+        let progressBox = Callback(value: progress)
         queue.async { [weak self] in
             guard let self else { return }
             do {
@@ -285,11 +304,11 @@ final class PhotoIndexStore: @unchecked Sendable {
                     deletedAlbumIDs: deletedAlbumIDs,
                     librarySignature: librarySignature,
                     generation: generation,
-                    progress: progress
+                    progress: progressBox.value
                 )
-                DispatchQueue.main.async { completion(.success(stats)) }
+                DispatchQueue.main.async { completionBox.value(.success(stats)) }
             } catch {
-                DispatchQueue.main.async { completion(.failure(error)) }
+                DispatchQueue.main.async { completionBox.value(.failure(error)) }
             }
         }
     }
@@ -303,17 +322,18 @@ final class PhotoIndexStore: @unchecked Sendable {
         assetIDs: [String],
         completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
     ) {
+        let completionBox = Callback(value: completion)
         queue.async { [weak self] in
             guard let self else { return }
 
             do {
                 let stats = try self.removeAssetsSynchronously(assetIDs: assetIDs)
                 DispatchQueue.main.async {
-                    completion(.success(stats))
+                    completionBox.value(.success(stats))
                 }
             } catch {
                 DispatchQueue.main.async {
-                    completion(.failure(error))
+                    completionBox.value(.failure(error))
                 }
             }
         }
@@ -347,6 +367,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         librarySignature: String,
         completion: @escaping (Result<PhotoIndexStats, Error>) -> Void
     ) {
+        let completionBox = Callback(value: completion)
         queue.async { [weak self] in
             guard let self else { return }
 
@@ -358,17 +379,18 @@ final class PhotoIndexStore: @unchecked Sendable {
                     librarySignature: librarySignature
                 )
                 DispatchQueue.main.async {
-                    completion(.success(stats))
+                    completionBox.value(.success(stats))
                 }
             } catch {
                 DispatchQueue.main.async {
-                    completion(.failure(error))
+                    completionBox.value(.failure(error))
                 }
             }
         }
     }
 
     func stats(completion: @escaping (Result<PhotoIndexStats, Error>) -> Void) {
+        let completionBox = Callback(value: completion)
         readQueue.async { [weak self] in
             guard let self else { return }
 
@@ -377,7 +399,7 @@ final class PhotoIndexStore: @unchecked Sendable {
                     try self.readStatsOnReadConnection()
                 }
                 DispatchQueue.main.async {
-                    completion(.success(stats))
+                    completionBox.value(.success(stats))
                 }
             } catch {
                 photoVaultTrace(
@@ -389,11 +411,11 @@ final class PhotoIndexStore: @unchecked Sendable {
                     do {
                         let stats = try self.withDatabase { try self.readStats() }
                         DispatchQueue.main.async {
-                            completion(.success(stats))
+                            completionBox.value(.success(stats))
                         }
                     } catch {
                         DispatchQueue.main.async {
-                            completion(.failure(error))
+                            completionBox.value(.failure(error))
                         }
                     }
                 }
@@ -410,6 +432,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         limit: Int,
         completion: @escaping @MainActor (Result<[String], Error>) -> Void
     ) {
+        let completionBox = Callback(value: completion)
         readQueue.async { [weak self] in
             guard let self else { return }
 
@@ -418,7 +441,7 @@ final class PhotoIndexStore: @unchecked Sendable {
                     try self.readRecentAssetIdentifiersOnReadConnection(limit: limit)
                 }
                 DispatchQueue.main.async {
-                    completion(.success(identifiers))
+                    completionBox.value(.success(identifiers))
                 }
             } catch {
                 // Match the paging read path: the writer connection can
@@ -435,11 +458,11 @@ final class PhotoIndexStore: @unchecked Sendable {
                             try self.readRecentAssetIdentifiers(limit: limit)
                         }
                         DispatchQueue.main.async {
-                            completion(.success(identifiers))
+                            completionBox.value(.success(identifiers))
                         }
                     } catch {
                         DispatchQueue.main.async {
-                            completion(.failure(error))
+                            completionBox.value(.failure(error))
                         }
                     }
                 }
@@ -452,6 +475,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         offset: Int = 0,
         completion: @escaping (Result<[String], Error>) -> Void
     ) {
+        let completionBox = Callback(value: completion)
         readQueue.async { [weak self] in
             guard let self else { return }
 
@@ -463,7 +487,7 @@ final class PhotoIndexStore: @unchecked Sendable {
                     )
                 }
                 DispatchQueue.main.async {
-                    completion(.success(identifiers))
+                    completionBox.value(.success(identifiers))
                 }
             } catch {
                 // WAL recovery edge case (previous process killed mid-write):
@@ -480,11 +504,11 @@ final class PhotoIndexStore: @unchecked Sendable {
                             try self.readUnsortedIdentifiers(limit: limit, offset: offset)
                         }
                         DispatchQueue.main.async {
-                            completion(.success(identifiers))
+                            completionBox.value(.success(identifiers))
                         }
                     } catch {
                         DispatchQueue.main.async {
-                            completion(.failure(error))
+                            completionBox.value(.failure(error))
                         }
                     }
                 }
@@ -499,6 +523,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         generation: Int,
         progress: @escaping (PhotoIndexProgress) -> Void
     ) throws -> PhotoIndexStats {
+        let progressBox = Callback(value: progress)
         try checkGeneration(generation)
         return try withDatabase {
             try execute("BEGIN IMMEDIATE TRANSACTION")
@@ -524,7 +549,7 @@ final class PhotoIndexStore: @unchecked Sendable {
 
                 var indexError: Error?
                 let totalAssets = assets.count
-                progress(PhotoIndexProgress(
+                progressBox.value(PhotoIndexProgress(
                     phase: .scanningAssets,
                     completed: 0,
                     total: totalAssets
@@ -544,7 +569,7 @@ final class PhotoIndexStore: @unchecked Sendable {
                     }
 
                     if index == 0 || index == totalAssets - 1 || index % 500 == 0 {
-                        progress(PhotoIndexProgress(
+                        progressBox.value(PhotoIndexProgress(
                             phase: .scanningAssets,
                             completed: index + 1,
                             total: totalAssets
@@ -556,10 +581,10 @@ final class PhotoIndexStore: @unchecked Sendable {
                 try insertAlbumsAndMemberships(
                     userAlbums,
                     generation: generation,
-                    progress: progress
+                    progress: progressBox.value
                 )
                 try checkGeneration(generation)
-                progress(PhotoIndexProgress(
+                progressBox.value(PhotoIndexProgress(
                     phase: .finalizing,
                     completed: totalAssets,
                     total: totalAssets
@@ -589,6 +614,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         generation: Int,
         progress: @escaping (PhotoIndexProgress) -> Void
     ) throws -> PhotoIndexStats {
+        let progressBox = Callback(value: progress)
         try checkGeneration(generation)
         return try withDatabase {
             try execute("BEGIN IMMEDIATE TRANSACTION")
@@ -599,7 +625,7 @@ final class PhotoIndexStore: @unchecked Sendable {
                 try insertAlbumsAndMemberships(
                     userAlbums,
                     generation: generation,
-                    progress: progress
+                    progress: progressBox.value
                 )
                 try checkGeneration(generation)
                 try execute("""
@@ -626,6 +652,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         generation: Int,
         progress: @escaping (PhotoIndexProgress) -> Void
     ) throws {
+        let progressBox = Callback(value: progress)
         let albumStatement = try prepare("""
             INSERT INTO album_index (album_id, title, type)
             VALUES (?, ?, 0)
@@ -674,7 +701,7 @@ final class PhotoIndexStore: @unchecked Sendable {
             }
             if let membershipError { throw membershipError }
 
-            progress(PhotoIndexProgress(
+            progressBox.value(PhotoIndexProgress(
                 phase: .scanningAlbums,
                 completed: albumIndex + 1,
                 total: totalAlbums
@@ -689,6 +716,7 @@ final class PhotoIndexStore: @unchecked Sendable {
         generation: Int,
         progress: @escaping (PhotoIndexProgress) -> Void
     ) throws -> PhotoIndexStats {
+        let progressBox = Callback(value: progress)
         try checkGeneration(generation)
         return try withDatabase {
             try execute("BEGIN IMMEDIATE TRANSACTION")
@@ -726,7 +754,7 @@ final class PhotoIndexStore: @unchecked Sendable {
                 try insertAlbumsAndMemberships(
                     userAlbums,
                     generation: generation,
-                    progress: progress
+                    progress: progressBox.value
                 )
 
                 for albumID in userAlbums.map(\.localIdentifier) {
@@ -947,6 +975,10 @@ final class PhotoIndexStore: @unchecked Sendable {
             throw PhotoIndexError.databaseUnavailable
         }
         readDatabase = handle
+        // Without a busy timeout any transient SQLITE_BUSY (e.g. the writer is
+        // mid-checkpoint) surfaced as a read failure and forced the slower
+        // writer-connection fallback.
+        sqlite3_busy_timeout(handle, 2_000)
     }
 
     private func prepareRead(_ sql: String) throws -> OpaquePointer {
@@ -1057,11 +1089,31 @@ final class PhotoIndexStore: @unchecked Sendable {
             throw PhotoIndexError.databaseUnavailable
         }
         database = handle
+        sqlite3_busy_timeout(handle, 2_000)
         try execute("PRAGMA journal_mode = WAL")
         try execute("PRAGMA synchronous = NORMAL")
         try execute("PRAGMA foreign_keys = ON")
         try execute("PRAGMA auto_vacuum = INCREMENTAL")
-        try repairIfNeeded()
+        // `quick_check` scans the whole index file. Running it on every open
+        // added a full-file read to every launch; a leftover non-empty WAL is
+        // the only signal that the previous process died mid-write, which is
+        // the case where the scan earns its cost.
+        if needsIntegrityCheck() {
+            try repairIfNeeded()
+        }
+        do {
+            try prepareSchema()
+        } catch {
+            // A statement failing here is the other signal of a damaged file
+            // (the scan above is skipped after a clean shutdown). The index
+            // holds only rebuildable metadata, so drop it and start over once
+            // instead of leaving the app with a permanently broken index.
+            try repairIfNeeded()
+            try prepareSchema()
+        }
+    }
+
+    private func prepareSchema() throws {
         try execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY NOT NULL,
@@ -1114,6 +1166,11 @@ final class PhotoIndexStore: @unchecked Sendable {
         try execute("DROP INDEX IF EXISTS asset_index_unassigned")
         try execute("CREATE INDEX IF NOT EXISTS asset_index_unassigned_ordered ON asset_index(album_count, creation_date DESC, asset_id DESC)")
         try execute("CREATE INDEX IF NOT EXISTS album_asset_asset ON album_asset(asset_id)")
+        // The unassigned index leads with `album_count`, so the launch-preview
+        // query ("newest N assets overall") could not use it and fell back to
+        // a full covering scan plus a temporary B-tree sort. This index serves
+        // that ORDER BY directly.
+        try execute("CREATE INDEX IF NOT EXISTS asset_index_creation ON asset_index(creation_date DESC, asset_id DESC)")
     }
 
     private func readMeta(_ key: String) throws -> String? {
@@ -1135,6 +1192,17 @@ final class PhotoIndexStore: @unchecked Sendable {
         try bindText(key, at: 1, to: statement)
         try bindText(value, at: 2, to: statement)
         try stepAndReset(statement)
+    }
+
+    /// True when the previous process did not shut down cleanly. Backgrounding
+    /// runs `wal_checkpoint(TRUNCATE)`, so a non-empty `-wal` at open means
+    /// the database was interrupted mid-write.
+    private func needsIntegrityCheck() -> Bool {
+        let walPath = databaseURL.path + "-wal"
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: walPath),
+              let size = attributes[.size] as? NSNumber
+        else { return false }
+        return size.intValue > 0
     }
 
     private func repairIfNeeded() throws {

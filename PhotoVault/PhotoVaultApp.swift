@@ -23,6 +23,10 @@ struct PhotoVaultApp: App {
             // on return.
             guard phase == .background else { return }
             PhotoImageManager.shared.dropTransientCaches()
+            // LAN folder screens have no PHCachingImageManager behind them;
+            // their decoded thumbnails and viewer frames are ours to release,
+            // and the grid ones are re-read from the on-disk cache on return.
+            LANFolderImageCache.shared.removeAll()
         }
     }
 }
