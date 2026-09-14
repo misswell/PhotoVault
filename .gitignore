@@ -21,3 +21,9 @@ tools/models/cache/
 tools/models/out/
 tools/models/build/
 tools/models/__pycache__/
+
+# The app's copy of the converted model, populated by
+# tools/models/install_models.py. 364 MB for the W8 build; ignored for the same
+# reason as tools/models/out/. A clean clone must run the install step before
+# search has a model to load (see the script's docstring).
+PhotoVault/Models/

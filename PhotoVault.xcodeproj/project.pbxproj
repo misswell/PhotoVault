@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A20000000000000000000001 /* PhotoVaultUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* PhotoVaultUITests.swift */; };
+		A20000000000000000000002 /* AIPhotoAccessGrantUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000003 /* AIPhotoAccessGrantUITests.swift */; };
 		A10000000000000000000001 /* PhotoVaultApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000001 /* PhotoVaultApp.swift */; };
 		A10000000000000000000002 /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000002 /* Models.swift */; };
 		A10000000000000000000003 /* PhotoImageManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000003 /* PhotoImageManager.swift */; };
@@ -21,7 +23,46 @@
 		A10000000000000000000014 /* RandomPhotoOrganizerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000014 /* RandomPhotoOrganizerView.swift */; };
 		A10000000000000000000015 /* LANFolderAlbum.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000015 /* LANFolderAlbum.swift */; };
 		A10000000000000000000017 /* LANAlbumViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000017 /* LANAlbumViews.swift */; };
+		A10000000000000000000018 /* AppMotion.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000018 /* AppMotion.swift */; };
+		A10000000000000000000019 /* AppLoadingPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000019 /* AppLoadingPolicy.swift */; };
+		A10000000000000000000020 /* PhotoViewerPresentationBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000020 /* PhotoViewerPresentationBridge.swift */; };
+		A10000000000000000000021 /* ViewerPerformanceTrace.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000021 /* ViewerPerformanceTrace.swift */; };
+		A10000000000000000000022 /* ViewerNeighborPrefetch.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000022 /* ViewerNeighborPrefetch.swift */; };
+		A10000000000000000000023 /* PhotoGridPlaceholder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000023 /* PhotoGridPlaceholder.swift */; };
+		A10000000000000000000040 /* AIPhotoSearchStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000040 /* AIPhotoSearchStore.swift */; };
+		A10000000000000000000041 /* EmbeddingSimilarity.metal in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000041 /* EmbeddingSimilarity.metal */; };
+		A10000000000000000000042 /* EmbeddingStoreFile.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000042 /* EmbeddingStoreFile.swift */; };
+		A10000000000000000000043 /* GazetteerData.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000043 /* GazetteerData.swift */; };
+		A10000000000000000000044 /* MetalSimilaritySearch.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000044 /* MetalSimilaritySearch.swift */; };
+		A10000000000000000000045 /* OfflineGazetteer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000045 /* OfflineGazetteer.swift */; };
+		A10000000000000000000046 /* PhotoIndexPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000046 /* PhotoIndexPipeline.swift */; };
+		A10000000000000000000047 /* PhotoKitIndexSource.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000047 /* PhotoKitIndexSource.swift */; };
+		A10000000000000000000048 /* PhotoSearchEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000048 /* PhotoSearchEngine.swift */; };
+		A10000000000000000000049 /* PhotoTextRecognizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000049 /* PhotoTextRecognizer.swift */; };
+		A10000000000000000000050 /* QueryAnalyzer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000050 /* QueryAnalyzer.swift */; };
+		A10000000000000000000051 /* SearchModelResources.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000051 /* SearchModelResources.swift */; };
+		A10000000000000000000052 /* SearchTextNormalization.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000052 /* SearchTextNormalization.swift */; };
+		A10000000000000000000053 /* SigLIP2TextEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000053 /* SigLIP2TextEncoder.swift */; };
+		A10000000000000000000054 /* SigLIP2Tokenizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000054 /* SigLIP2Tokenizer.swift */; };
+		A10000000000000000000055 /* SigLIP2VisionEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000055 /* SigLIP2VisionEncoder.swift */; };
+		A10000000000000000000056 /* SmartSearchModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000056 /* SmartSearchModel.swift */; };
+		A10000000000000000000057 /* SmartSearchScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000057 /* SmartSearchScreen.swift */; };
+		A10000000000000000000058 /* AISearchSelfCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000058 /* AISearchSelfCheck.swift */; };
+		A10000000000000000000059 /* SearchModelManifest.json in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000059 /* SearchModelManifest.json */; };
+		A10000000000000000000060 /* SigLIP2Text.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000060 /* SigLIP2Text.mlpackage */; };
+		A10000000000000000000061 /* SigLIP2Vision.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000061 /* SigLIP2Vision.mlpackage */; };
+		A10000000000000000000062 /* tokenizer-v1.bin in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000062 /* tokenizer-v1.bin */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		E20000000000000000000003 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = E10000000000000000000002 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = E10000000000000000000001;
+			remoteInfo = PhotoVault;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		B10000000000000000000001 /* PhotoVaultApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoVaultApp.swift; sourceTree = "<group>"; };
@@ -40,10 +81,49 @@
 		B10000000000000000000014 /* RandomPhotoOrganizerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RandomPhotoOrganizerView.swift; sourceTree = "<group>"; };
 		B10000000000000000000015 /* LANFolderAlbum.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LANFolderAlbum.swift; sourceTree = "<group>"; };
 		B10000000000000000000017 /* LANAlbumViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LANAlbumViews.swift; sourceTree = "<group>"; };
+		B10000000000000000000018 /* AppMotion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppMotion.swift; sourceTree = "<group>"; };
+		B10000000000000000000019 /* AppLoadingPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLoadingPolicy.swift; sourceTree = "<group>"; };
+		B10000000000000000000020 /* PhotoViewerPresentationBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoViewerPresentationBridge.swift; sourceTree = "<group>"; };
+		B10000000000000000000021 /* ViewerPerformanceTrace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerPerformanceTrace.swift; sourceTree = "<group>"; };
+		B10000000000000000000022 /* ViewerNeighborPrefetch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerNeighborPrefetch.swift; sourceTree = "<group>"; };
+		B10000000000000000000023 /* PhotoGridPlaceholder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoGridPlaceholder.swift; sourceTree = "<group>"; };
+		B10000000000000000000040 /* AIPhotoSearchStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIPhotoSearchStore.swift; sourceTree = "<group>"; };
+		B10000000000000000000041 /* EmbeddingSimilarity.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = EmbeddingSimilarity.metal; sourceTree = "<group>"; };
+		B10000000000000000000042 /* EmbeddingStoreFile.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EmbeddingStoreFile.swift; sourceTree = "<group>"; };
+		B10000000000000000000043 /* GazetteerData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GazetteerData.swift; sourceTree = "<group>"; };
+		B10000000000000000000044 /* MetalSimilaritySearch.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalSimilaritySearch.swift; sourceTree = "<group>"; };
+		B10000000000000000000045 /* OfflineGazetteer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OfflineGazetteer.swift; sourceTree = "<group>"; };
+		B10000000000000000000046 /* PhotoIndexPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoIndexPipeline.swift; sourceTree = "<group>"; };
+		B10000000000000000000047 /* PhotoKitIndexSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoKitIndexSource.swift; sourceTree = "<group>"; };
+		B10000000000000000000048 /* PhotoSearchEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoSearchEngine.swift; sourceTree = "<group>"; };
+		B10000000000000000000049 /* PhotoTextRecognizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoTextRecognizer.swift; sourceTree = "<group>"; };
+		B10000000000000000000050 /* QueryAnalyzer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QueryAnalyzer.swift; sourceTree = "<group>"; };
+		B10000000000000000000051 /* SearchModelResources.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchModelResources.swift; sourceTree = "<group>"; };
+		B10000000000000000000052 /* SearchTextNormalization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchTextNormalization.swift; sourceTree = "<group>"; };
+		B10000000000000000000053 /* SigLIP2TextEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SigLIP2TextEncoder.swift; sourceTree = "<group>"; };
+		B10000000000000000000054 /* SigLIP2Tokenizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SigLIP2Tokenizer.swift; sourceTree = "<group>"; };
+		B10000000000000000000055 /* SigLIP2VisionEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SigLIP2VisionEncoder.swift; sourceTree = "<group>"; };
+		B10000000000000000000056 /* SmartSearchModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartSearchModel.swift; sourceTree = "<group>"; };
+		B10000000000000000000057 /* SmartSearchScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SmartSearchScreen.swift; sourceTree = "<group>"; };
+		B10000000000000000000058 /* AISearchSelfCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AISearchSelfCheck.swift; sourceTree = "<group>"; };
+		B10000000000000000000059 /* SearchModelManifest.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = SearchModelManifest.json; sourceTree = "<group>"; };
+		B10000000000000000000060 /* SigLIP2Text.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = SigLIP2Text.mlpackage; sourceTree = "<group>"; };
+		B10000000000000000000061 /* SigLIP2Vision.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = SigLIP2Vision.mlpackage; sourceTree = "<group>"; };
+		B10000000000000000000062 /* tokenizer-v1.bin */ = {isa = PBXFileReference; lastKnownFileType = file; path = tokenizer-v1.bin; sourceTree = "<group>"; };
+		B20000000000000000000001 /* PhotoVaultUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoVaultUITests.swift; sourceTree = "<group>"; };
+		B20000000000000000000003 /* AIPhotoAccessGrantUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIPhotoAccessGrantUITests.swift; sourceTree = "<group>"; };
+		B20000000000000000000002 /* PhotoVaultUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhotoVaultUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		C10000000000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C20000000000000000000002 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -57,6 +137,7 @@
 			isa = PBXGroup;
 			children = (
 				D10000000000000000000002 /* PhotoVault */,
+				D20000000000000000000001 /* PhotoVaultUITests */,
 				D10000000000000000000003 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -64,6 +145,8 @@
 		D10000000000000000000002 /* PhotoVault */ = {
 			isa = PBXGroup;
 			children = (
+				D10000000000000000000041 /* Models */,
+				D10000000000000000000040 /* Search */,
 				B10000000000000000000001 /* PhotoVaultApp.swift */,
 				B10000000000000000000002 /* Models.swift */,
 				B10000000000000000000003 /* PhotoImageManager.swift */,
@@ -77,8 +160,15 @@
 				B10000000000000000000014 /* RandomPhotoOrganizerView.swift */,
 				B10000000000000000000015 /* LANFolderAlbum.swift */,
 				B10000000000000000000017 /* LANAlbumViews.swift */,
+				B10000000000000000000018 /* AppMotion.swift */,
+				B10000000000000000000019 /* AppLoadingPolicy.swift */,
+				B10000000000000000000020 /* PhotoViewerPresentationBridge.swift */,
+				B10000000000000000000021 /* ViewerPerformanceTrace.swift */,
+				B10000000000000000000022 /* ViewerNeighborPrefetch.swift */,
+				B10000000000000000000023 /* PhotoGridPlaceholder.swift */,
 				B10000000000000000000010 /* Info.plist */,
 				B10000000000000000000013 /* Assets.xcassets */,
+				B10000000000000000000058 /* AISearchSelfCheck.swift */,
 			);
 			path = PhotoVault;
 			sourceTree = "<group>";
@@ -87,8 +177,54 @@
 			isa = PBXGroup;
 			children = (
 				B10000000000000000000011 /* PhotoVault.app */,
+				B20000000000000000000002 /* PhotoVaultUITests.xctest */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		D10000000000000000000040 /* Search */ = {
+			isa = PBXGroup;
+			children = (
+				B10000000000000000000040 /* AIPhotoSearchStore.swift */,
+				B10000000000000000000041 /* EmbeddingSimilarity.metal */,
+				B10000000000000000000042 /* EmbeddingStoreFile.swift */,
+				B10000000000000000000043 /* GazetteerData.swift */,
+				B10000000000000000000044 /* MetalSimilaritySearch.swift */,
+				B10000000000000000000045 /* OfflineGazetteer.swift */,
+				B10000000000000000000046 /* PhotoIndexPipeline.swift */,
+				B10000000000000000000047 /* PhotoKitIndexSource.swift */,
+				B10000000000000000000048 /* PhotoSearchEngine.swift */,
+				B10000000000000000000049 /* PhotoTextRecognizer.swift */,
+				B10000000000000000000050 /* QueryAnalyzer.swift */,
+				B10000000000000000000051 /* SearchModelResources.swift */,
+				B10000000000000000000052 /* SearchTextNormalization.swift */,
+				B10000000000000000000053 /* SigLIP2TextEncoder.swift */,
+				B10000000000000000000054 /* SigLIP2Tokenizer.swift */,
+				B10000000000000000000055 /* SigLIP2VisionEncoder.swift */,
+				B10000000000000000000056 /* SmartSearchModel.swift */,
+				B10000000000000000000057 /* SmartSearchScreen.swift */,
+			);
+			path = Search;
+			sourceTree = "<group>";
+		};
+		D10000000000000000000041 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				B10000000000000000000059 /* SearchModelManifest.json */,
+				B10000000000000000000060 /* SigLIP2Text.mlpackage */,
+				B10000000000000000000061 /* SigLIP2Vision.mlpackage */,
+				B10000000000000000000062 /* tokenizer-v1.bin */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		D20000000000000000000001 /* PhotoVaultUITests */ = {
+			isa = PBXGroup;
+			children = (
+				B20000000000000000000001 /* PhotoVaultUITests.swift */,
+				B20000000000000000000003 /* AIPhotoAccessGrantUITests.swift */,
+			);
+			path = PhotoVaultUITests;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -111,6 +247,23 @@
 			productReference = B10000000000000000000011 /* PhotoVault.app */;
 			productType = "com.apple.product-type.application";
 		};
+		E20000000000000000000001 /* PhotoVaultUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F10000000000000000000003 /* Build configuration list for PBXNativeTarget "PhotoVaultUITests" */;
+			buildPhases = (
+				C20000000000000000000002 /* Frameworks */,
+				C20000000000000000000001 /* Sources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				E20000000000000000000002 /* PBXTargetDependency */,
+			);
+			name = PhotoVaultUITests;
+			productName = PhotoVaultUITests;
+			productReference = B20000000000000000000002 /* PhotoVaultUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -122,6 +275,10 @@
 				TargetAttributes = {
 					E10000000000000000000001 = {
 						CreatedOnToolsVersion = 26.3;
+					};
+					E20000000000000000000001 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = E10000000000000000000001;
 					};
 				};
 			};
@@ -140,6 +297,7 @@
 			projectRoot = "";
 			targets = (
 				E10000000000000000000001 /* PhotoVault */,
+				E20000000000000000000001 /* PhotoVaultUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -149,6 +307,10 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10000000000000000000059 /* SearchModelManifest.json in Resources */,
+				A10000000000000000000060 /* SigLIP2Text.mlpackage in Resources */,
+				A10000000000000000000061 /* SigLIP2Vision.mlpackage in Resources */,
+				A10000000000000000000062 /* tokenizer-v1.bin in Resources */,
 				A10000000000000000000013 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -160,6 +322,25 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10000000000000000000040 /* AIPhotoSearchStore.swift in Sources */,
+				A10000000000000000000041 /* EmbeddingSimilarity.metal in Sources */,
+				A10000000000000000000042 /* EmbeddingStoreFile.swift in Sources */,
+				A10000000000000000000043 /* GazetteerData.swift in Sources */,
+				A10000000000000000000044 /* MetalSimilaritySearch.swift in Sources */,
+				A10000000000000000000045 /* OfflineGazetteer.swift in Sources */,
+				A10000000000000000000046 /* PhotoIndexPipeline.swift in Sources */,
+				A10000000000000000000047 /* PhotoKitIndexSource.swift in Sources */,
+				A10000000000000000000048 /* PhotoSearchEngine.swift in Sources */,
+				A10000000000000000000049 /* PhotoTextRecognizer.swift in Sources */,
+				A10000000000000000000050 /* QueryAnalyzer.swift in Sources */,
+				A10000000000000000000051 /* SearchModelResources.swift in Sources */,
+				A10000000000000000000052 /* SearchTextNormalization.swift in Sources */,
+				A10000000000000000000053 /* SigLIP2TextEncoder.swift in Sources */,
+				A10000000000000000000054 /* SigLIP2Tokenizer.swift in Sources */,
+				A10000000000000000000055 /* SigLIP2VisionEncoder.swift in Sources */,
+				A10000000000000000000056 /* SmartSearchModel.swift in Sources */,
+				A10000000000000000000057 /* SmartSearchScreen.swift in Sources */,
+				A10000000000000000000058 /* AISearchSelfCheck.swift in Sources */,
 				A10000000000000000000001 /* PhotoVaultApp.swift in Sources */,
 				A10000000000000000000002 /* Models.swift in Sources */,
 				A10000000000000000000003 /* PhotoImageManager.swift in Sources */,
@@ -173,10 +354,33 @@
 				A10000000000000000000014 /* RandomPhotoOrganizerView.swift in Sources */,
 				A10000000000000000000015 /* LANFolderAlbum.swift in Sources */,
 				A10000000000000000000017 /* LANAlbumViews.swift in Sources */,
+				A10000000000000000000018 /* AppMotion.swift in Sources */,
+				A10000000000000000000019 /* AppLoadingPolicy.swift in Sources */,
+				A10000000000000000000020 /* PhotoViewerPresentationBridge.swift in Sources */,
+				A10000000000000000000021 /* ViewerPerformanceTrace.swift in Sources */,
+				A10000000000000000000022 /* ViewerNeighborPrefetch.swift in Sources */,
+				A10000000000000000000023 /* PhotoGridPlaceholder.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		C20000000000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A20000000000000000000001 /* PhotoVaultUITests.swift in Sources */,
+				A20000000000000000000002 /* AIPhotoAccessGrantUITests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		E20000000000000000000002 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = E10000000000000000000001 /* PhotoVault */;
+			targetProxy = E20000000000000000000003 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		F20000000000000000000001 /* Debug */ = {
@@ -273,6 +477,48 @@
 			};
 			name = Release;
 		};
+		F40000000000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = U8U443D7ZL;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.misswell.PhotoVaultUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = PhotoVault;
+			};
+			name = Debug;
+		};
+		F40000000000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = U8U443D7ZL;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.misswell.PhotoVaultUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_TARGET_NAME = PhotoVault;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -290,6 +536,15 @@
 			buildConfigurations = (
 				F30000000000000000000001 /* Debug */,
 				F30000000000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F10000000000000000000003 /* Build configuration list for PBXNativeTarget "PhotoVaultUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F40000000000000000000001 /* Debug */,
+				F40000000000000000000002 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

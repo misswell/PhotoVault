@@ -468,8 +468,18 @@ private struct LANFolderImageView: View {
             } else {
                 Color.clear
                     .overlay {
-                        ProgressView()
-                            .tint(.secondary)
+                        if fillsContainer {
+                            // Grid cells: a static tile, never a spinner. A
+                            // folder with hundreds of thumbnails would other-
+                            // wise animate hundreds of indicators while
+                            // scrolling over SMB.
+                            PhotoGridPlaceholder(cornerRadius: 0)
+                        } else {
+                            // Full-screen viewer: one indicator for the single
+                            // visible photo is real information, not noise.
+                            ProgressView()
+                                .tint(.secondary)
+                        }
                     }
             }
         }

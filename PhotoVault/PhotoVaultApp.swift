@@ -8,6 +8,18 @@ struct PhotoVaultApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                #if DEBUG
+                // Triggered by `--pv-ai-selfcheck`; answers the questions that
+                // can only be settled on real hardware. Detached because it
+                // loads the model and opens the index.
+                .task {
+                    if AISearchSelfCheck.isRequested {
+                        await Task.detached(priority: .userInitiated) {
+                            await AISearchSelfCheck.run()
+                        }.value
+                    }
+                }
+                #endif
                 .onReceive(
                     NotificationCenter.default.publisher(
                         for: UIApplication.didReceiveMemoryWarningNotification

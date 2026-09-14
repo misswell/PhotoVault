@@ -415,7 +415,7 @@ class SigLIP2Tokenizer:
 
         Layout (little-endian, all offsets absolute):
 
-            magic    8s   "PVTOK001"
+            magic    8s   "PVTOK002"
             u32      flags            bit0 byte_fallback, bit1 escape_ws,
                                       bit2 add_dummy_prefix, bit3 remove_extra_ws
             u32      vocab_size
@@ -428,11 +428,21 @@ class SigLIP2Tokenizer:
             u32      type_offset      vocab_size u8
             u32      ud_offset        user_defined_count u32 piece ids
             u32      byte_offset      256 u32: byte value -> piece id
+            u32      sorted_offset    vocab_size u32 piece ids, sorted by the
+                                      piece's UTF-8 bytes (lexicographic)
             u32      source_sha_len, then bytes (provenance)
 
         The pieces themselves are stored end-to-end in the blob, so the whole
         file is one allocation plus a few index arrays — no per-piece Swift
         String is needed until a piece actually wins a merge.
+
+        `sorted_ids` is what makes the Swift side cheap. Steps number in the
+        tens for a search query, and each step asks "is this concatenation a
+        piece?". With a lexicographically sorted id list that question is a
+        binary search over the blob (~18 memcmp of a few bytes), so the app
+        never builds a 256000-entry dictionary and never materialises 256000
+        Strings at launch. On a 256k vocabulary that is the difference between
+        a few hundred KB of resident bytes and tens of MB.
         """
         out_path = Path(out_path)
         blob = bytearray()
@@ -456,6 +466,14 @@ class SigLIP2Tokenizer:
         for b, pid in self._byte_pieces.items():
             byte_ids[b] = pid
 
+        # Sort ids by the piece's UTF-8 bytes. Python's bytes comparison is
+        # lexicographic on the encoded form, which is exactly what Swift's
+        # binary search will reproduce.
+        sorted_ids = sorted(
+            range(len(self._pieces)),
+            key=lambda i: self._pieces[i][0].encode("utf-8", "surrogateescape"),
+        )
+
         flags = 0
         if self._byte_fallback:
             flags |= 1
@@ -466,19 +484,23 @@ class SigLIP2Tokenizer:
         if self._remove_extra_whitespaces:
             flags |= 8
 
-        header_size = 4 + 4 + 4 * 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4
-        # magic + flags + vocab_size + 4 ids + ud_count + 9 offsets/lengths
+        # Fixed header: 8 magic + 4 flags + 4 vocab_size + 4*4 special ids
+        # + 4 ud_count + 10 u32 offsets/lengths (piece_table, blob_offset,
+        # blob_length, score_offset, type_offset, ud_offset, byte_offset,
+        # sorted_offset, sha_offset, sha_len) = 76 bytes.
+        header_size = 8 + 4 + 4 + 4 * 4 + 4 + 10 * 4
         piece_table = header_size
         blob_offset = piece_table + 4 * (len(offsets))
         score_offset = blob_offset + len(blob)
         type_offset = score_offset + len(scores)
         ud_offset = type_offset + len(types)
         byte_offset = ud_offset + 4 * len(user_defined_ids)
-        sha_offset = byte_offset + 4 * 256
+        sorted_offset = byte_offset + 4 * 256
+        sha_offset = sorted_offset + 4 * len(sorted_ids)
         sha = source_sha256.encode("utf-8")
 
         buf = bytearray()
-        buf += b"PVTOK001"
+        buf += b"PVTOK002"
         buf += struct.pack("<I", flags)
         buf += struct.pack("<I", len(self._pieces))
         buf += struct.pack("<4i", self.unk_id, self.bos_id, self.eos_id, self.pad_id)
@@ -490,6 +512,7 @@ class SigLIP2Tokenizer:
         buf += struct.pack("<I", type_offset)
         buf += struct.pack("<I", ud_offset)
         buf += struct.pack("<I", byte_offset)
+        buf += struct.pack("<I", sorted_offset)
         buf += struct.pack("<I", sha_offset)
         buf += struct.pack("<I", len(sha))
         assert len(buf) == header_size, (len(buf), header_size)
@@ -499,6 +522,7 @@ class SigLIP2Tokenizer:
         buf += types
         buf += struct.pack(f"<{len(user_defined_ids)}I", *user_defined_ids)
         buf += struct.pack("<256I", *byte_ids)
+        buf += struct.pack(f"<{len(sorted_ids)}I", *sorted_ids)
         buf += sha
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(bytes(buf))
@@ -509,6 +533,7 @@ class SigLIP2Tokenizer:
             "vocabSize": len(self._pieces),
             "blobBytes": len(blob),
             "userDefinedCount": len(user_defined_ids),
+            "sortedIndexCount": len(sorted_ids),
             "sourceSha256": source_sha256,
         }
 

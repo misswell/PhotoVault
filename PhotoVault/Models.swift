@@ -186,6 +186,8 @@ enum PhotoSection: Hashable {
     case home
     case library
     case unsorted
+    /// AI content search: a query over the on-device embedding index.
+    case smartSearch
     case lan
     case album(String)
     case search(String)

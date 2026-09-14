@@ -179,6 +179,9 @@ struct ContentView: View {
                     }
                     .tag(PhotoSection.unsorted)
 
+                    Label("智能搜索", systemImage: "sparkle.magnifyingglass")
+                        .tag(PhotoSection.smartSearch)
+
                     Label("文件夹相册", systemImage: "folder")
                         .tag(PhotoSection.lan)
                 }
@@ -472,7 +475,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
                 Button {
-                    withAnimation(.snappy(duration: 0.22)) {
+                    withAnimation(AppMotion.state) {
                         regularAlbumsExpanded.toggle()
                     }
                 } label: {
@@ -560,7 +563,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
                 Button {
-                    withAnimation(.snappy(duration: 0.22)) {
+                    withAnimation(AppMotion.state) {
                         sharedAlbumsExpanded.toggle()
                     }
                 } label: {
@@ -598,6 +601,9 @@ struct ContentView: View {
         case .unsorted:
             UnsortedPhotosScreen(store: store)
                 .id("unsorted-detail")
+        case .smartSearch:
+            SmartSearchScreen(store: store)
+                .id("smart-search-detail")
         case .lan:
             // The LAN home is the only detail screen that pushes a second
             // level (NavigationLink into a folder grid). On compact width
@@ -1138,7 +1144,7 @@ private struct AlbumFolderSidebarRowLabel: View {
                 .font(.footnote.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .rotationEffect(isExpanded ? .degrees(90) : .zero)
-                .animation(.easeInOut(duration: 0.16), value: isExpanded)
+                .animation(AppMotion.micro, value: isExpanded)
         }
         .contentShape(Rectangle())
     }
@@ -1165,7 +1171,7 @@ private struct AlbumFolderSidebarRow<GestureType: Gesture>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-                withAnimation(.snappy(duration: 0.22)) {
+                withAnimation(AppMotion.state) {
                     isExpanded.toggle()
                 }
             } label: {
@@ -1213,7 +1219,7 @@ private struct AlbumFolderSidebarRow<GestureType: Gesture>: View {
                 .transition(.opacity)
             }
         }
-        .animation(.snappy(duration: 0.22), value: isExpanded)
+        .animation(AppMotion.state, value: isExpanded)
     }
 
     private var folderSummary: String {
@@ -1234,7 +1240,7 @@ private struct AlbumFolderGridCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                withAnimation(.snappy(duration: 0.22)) {
+                withAnimation(AppMotion.state) {
                     isExpanded.toggle()
                 }
             } label: {
@@ -1296,7 +1302,7 @@ private struct AlbumFolderGridCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
-        .animation(.snappy(duration: 0.22), value: isExpanded)
+        .animation(AppMotion.state, value: isExpanded)
     }
 
     private var folderPreview: some View {
@@ -1333,7 +1339,7 @@ private struct AlbumFolderGridChildRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Button {
-                withAnimation(.snappy(duration: 0.22)) {
+                withAnimation(AppMotion.state) {
                     isExpanded.toggle()
                 }
             } label: {

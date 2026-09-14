@@ -29,6 +29,15 @@ Three independent modes:
               Also reports rank agreement for quantized models.
 
   tokenizer   Compare Swift-produced token ids against Python.
+  embedding   Verify the embedding matrix file, unit tests and 100k benchmark.
+  index       Verify the metadata index, slot bookkeeping, filters and FTS.
+  metal       Verify the Metal exact-search kernel against CPU and NumPy.
+  textencoder Run the Swift tokenizer + Core ML text tower against PyTorch.
+  query       Verify the query analyzer (AND / NOT / dates / places).
+  ocr         Verify Vision OCR and its path into the FTS index.
+  geo         Verify the offline gazetteer and geo filtering.
+  search      Verify the search engine end to end (stubbed text tower).
+  vision      Verify the Swift image encoder against the reference.
 
 Exit code is non-zero if any check fails, so this is usable in CI.
 
@@ -39,14 +48,17 @@ Examples
     python verify_siglip2.py coreml --fixtures build/parity \
         --image-model out/SigLIP2ImageEncoder.mlpackage \
         --text-model out/SigLIP2TextEncoder.mlpackage
-    python verify_siglip2.py tokenizer --swift build/swift-tokens.json
+    python verify_siglip2.py tokenizer [--rebuild]
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import json
+import re
 import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -510,24 +522,812 @@ def _report_rank_agreement(c: Checker, ref_scores: np.ndarray, got_scores: np.nd
 # mode: tokenizer
 # --------------------------------------------------------------------------
 def mode_tokenizer(args) -> int:
+    """Verify the Swift tokenizer, end to end, in one command.
+
+    The evidence chain has three links and all three are checked here, in order:
+
+      1. the real sentencepiece processor  --(is the port faithful?)-->
+      2. `siglip2_tokenizer.py`            --(is the artifact + ground truth right?)-->
+      3. `SigLIP2Tokenizer.swift`          --(does on-device code agree?)-->
+
+    Link 1 is the one that matters most: a Swift implementation can only be as
+    correct as the specification it was written against, so the Python port is
+    diffed against sentencepiece on the same adversarial corpus before the Swift
+    result is trusted. Checking only "Swift == Python" would be circular.
+    """
+    import sentencepiece as spm
+
+    from build_tokenizer_corpus import build as build_corpus
+    from siglip2_tokenizer import SigLIP2Tokenizer, _sha256
+
+    checkpoint = Path(args.checkpoint)
+    model_path = checkpoint / "tokenizer.model"
+    if not model_path.exists():
+        print(f"tokenizer.model not found at {model_path}", file=sys.stderr)
+        return 1
+
+    build_dir = HERE / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    corpus_path = build_dir / "tokenizer-corpus.json"
+    truth_path = build_dir / "tokenizer-ground-truth.json"
+    artifact_path = build_dir / "tokenizer-v1.bin"
+
+    # Regenerate inputs when missing or when explicitly asked, so the mode is
+    # reproducible from a clean checkout.
+    if args.rebuild or not corpus_path.exists():
+        corpus_path.write_text(json.dumps({"texts": build_corpus()}, ensure_ascii=False))
+    texts = json.loads(corpus_path.read_text(encoding="utf-8"))["texts"]
+
+    tok = SigLIP2Tokenizer(model_path)
+    if args.rebuild or not artifact_path.exists():
+        tok.to_binary_artifact(artifact_path, _sha256(model_path))
+    if args.rebuild or not truth_path.exists():
+        truth_path.write_text(json.dumps(
+            {"texts": texts, "ids": [tok.encode(t, max_length=64) for t in texts]},
+            ensure_ascii=False,
+        ))
+
     c = Checker()
-    swift = json.loads(Path(args.swift).read_text(encoding="utf-8"))
-    ref = SigLIP2Reference.load(args.checkpoint, device="cpu")
+    facts = tok.facts
+    c.check(facts.precompiled_charsmap_bytes == 0,
+            "normalizer has no precompiled charsmap (identity, no NFKC, no case folding)")
+    c.check(not facts.add_dummy_prefix,
+            "normalizer does not add a dummy prefix (so no leading U+2581)")
+    c.check(facts.escape_whitespaces, "normalizer escapes whitespace to U+2581")
+    c.check(facts.byte_fallback, "byte fallback is enabled")
+    c.check(facts.vocab_size == 256000 and facts.model_type == 2,
+            f"vocabulary is 256000 pieces of BPE (got {facts.vocab_size}, type {facts.model_type})")
+    c.check((facts.unk_id, facts.bos_id, facts.eos_id, facts.pad_id) == (3, 2, 1, 0),
+            "special ids are unk=3 bos=2 eos=1 pad=0")
 
-    cases = swift["cases"] if isinstance(swift, dict) else swift
-    mismatches = []
-    for case in cases:
-        text = case["text"]
-        expected = ref.token_ids([text]).numpy().reshape(-1).tolist()
-        got = list(case["input_ids"])
-        if expected != got:
-            mismatches.append((text, expected, got))
+    # Link 1: the Python port against the authoritative implementation.
+    sp = spm.SentencePieceProcessor(model_file=str(model_path))
+    corpus_mismatch = 0
+    for text in texts:
+        want = sp.encode(text) + [facts.eos_id]
+        want = want[:64] + [facts.pad_id] * max(0, 64 - len(want))
+        if tok.encode(text, max_length=64) != want:
+            corpus_mismatch += 1
+    c.check(not corpus_mismatch,
+            f"Python port matches sentencepiece on {len(texts)} adversarial strings",
+            "" if not corpus_mismatch else f"{corpus_mismatch} mismatches")
 
-    c.check(not mismatches, f"Swift tokenizer matches Python on {len(cases)} cases",
-            "" if not mismatches else f"{len(mismatches)} mismatches, first: {mismatches[0][0]!r}")
-    if mismatches:
-        for text, expected, got in mismatches[:3]:
-            print(f"    {text!r}\n      expected {expected[:12]}…\n      got      {got[:12]}…")
+    # Link 3: the Swift port, compiled here and run against Python's output.
+    swift_source = HERE.parent.parent / "PhotoVault" / "Search" / "SigLIP2Tokenizer.swift"
+    harness = HERE / "tokenizer_test" / "main.swift"
+    if not swift_source.exists() or not harness.exists():
+        c.check(False, "Swift tokenizer sources are present",
+                f"missing {swift_source if not swift_source.exists() else harness}")
+        return c.report()
+
+    binary = Path(args.binary) if args.binary else Path("/tmp/pv-tokenizer-harness")
+    compile_cmd = [
+        "xcrun", "swiftc", "-O", "-o", str(binary), str(harness), str(swift_source),
+    ]
+    compiled = subprocess.run(compile_cmd, capture_output=True, text=True)
+    c.check(compiled.returncode == 0, "Swift tokenizer compiles",
+            compiled.stderr.strip()[:400] if compiled.returncode else "")
+    if compiled.returncode != 0:
+        return c.report()
+
+    run = subprocess.run([str(binary), str(artifact_path), str(truth_path)],
+                         capture_output=True, text=True)
+    for line in run.stdout.splitlines():
+        print(f"    | {line}")
+    if run.stderr.strip():
+        print(f"    | stderr: {run.stderr.strip()[:400]}")
+    c.check(run.returncode == 0, "Swift tokenizer matches Python on the whole corpus")
+    return c.report()
+
+
+# --------------------------------------------------------------------------
+# mode: embedding
+# --------------------------------------------------------------------------
+def mode_embedding(args) -> int:
+    """Verify the embedding matrix file and its exact-search path.
+
+    Three independent angles, because a storage format that is merely
+    self-consistent can still be wrong in a way that only shows up as bad
+    rankings later:
+
+      1. unit tests    -- round trip, swap-remove bookkeeping, growth, and every
+                          corruption case the header must reject
+      2. benchmark     -- 100k rows, so the timing is measured at the size the
+                          plan actually specifies
+      3. NumPy check   -- an independent reader recomputes the top-k from the same
+                          file; this is the golden reference the Phase 4 Metal
+                          kernel must reproduce
+    """
+    repo = HERE.parent.parent
+    store_source = repo / "PhotoVault" / "Search" / "EmbeddingStoreFile.swift"
+    if not store_source.exists():
+        print(f"missing {store_source}", file=sys.stderr)
+        return 1
+
+    c = Checker()
+
+    def build(entry: str, out: str) -> bool:
+        command = [
+            "xcrun", "swiftc", "-O", "-o", out,
+            str(HERE / "embeddingstore_test" / "main.swift" if entry == "test" else HERE / "embeddingstore_bench" / "main.swift"),
+            str(store_source),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(result.stderr.strip()[:800])
+        return result.returncode == 0
+
+    test_binary = "/tmp/pv-embedding-tests"
+    if build("test", test_binary):
+        run = subprocess.run([test_binary], capture_output=True, text=True)
+        for line in run.stdout.splitlines():
+            if "[FAIL]" in line or line.startswith("checks:") or line.startswith("RESULT"):
+                print(f"    | {line}")
+        c.check(run.returncode == 0, "embedding matrix unit tests pass")
+    else:
+        c.check(False, "embedding matrix unit tests compile")
+
+    bench_binary = "/tmp/pv-embedding-bench"
+    if build("bench", bench_binary):
+        run = subprocess.run([bench_binary], capture_output=True, text=True, cwd=HERE)
+        for line in run.stdout.splitlines():
+            print(f"    | {line}")
+        c.check(run.returncode == 0, "100k-row benchmark completes")
+
+        check = subprocess.run(
+            [sys.executable, str(HERE / "embeddingstore_check.py")],
+            capture_output=True, text=True, cwd=HERE,
+        )
+        for line in check.stdout.splitlines():
+            print(f"    | {line}")
+        if check.stderr.strip():
+            print(f"    | stderr: {check.stderr.strip()[:400]}")
+        c.check(check.returncode == 0, "NumPy independently reproduces the rankings")
+    else:
+        c.check(False, "100k-row benchmark compiles")
+
+    return c.report()
+
+
+# --------------------------------------------------------------------------
+# mode: index
+# --------------------------------------------------------------------------
+def mode_index(args) -> int:
+    """Verify the metadata index (`AIPhotoSearchStore`) on macOS.
+
+    PhotoKit is absent here, so the store is driven with synthetic asset
+    identifiers. Everything the store owns is real: the schema, the slot
+    arithmetic shared with the embedding matrix, FTS5, and the filters.
+    """
+    repo = HERE.parent.parent
+    sources = [
+        repo / "PhotoVault" / "Search" / "AIPhotoSearchStore.swift",
+        repo / "PhotoVault" / "Search" / "EmbeddingStoreFile.swift",
+        repo / "PhotoVault" / "Search" / "SearchTextNormalization.swift",
+    ]
+    for source in sources:
+        if not source.exists():
+            print(f"missing {source}", file=sys.stderr)
+            return 1
+
+    c = Checker()
+    binary = "/tmp/pv-aistore-tests"
+    command = ["xcrun", "swiftc", "-O", "-o", binary,
+               str(HERE / "aistore_test" / "main.swift")] + [str(s) for s in sources]
+    build = subprocess.run(command, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stderr.strip()[:800])
+        c.check(False, "search index tests compile")
+        return c.report()
+
+    run = subprocess.run([binary], capture_output=True, text=True)
+    for line in run.stdout.splitlines():
+        if "[FAIL]" in line or line.startswith(("checks:", "RESULT")) or "FTS5 compiled" in line:
+            print(f"    | {line}")
+    c.check(run.returncode == 0, "search index tests pass")
+    return c.report()
+
+
+# --------------------------------------------------------------------------
+# mode: metal
+# --------------------------------------------------------------------------
+def mode_privacy(args) -> int:
+    """Audit the on-device guarantee, as source rather than as a promise.
+
+    The constraint is "no photo, embedding, OCR text or query ever leaves the
+    device". That is easy to state and easy to break later -- one `URLSession`
+    added during debugging is all it takes. So this checks the *source* of the
+    search stack, where such a change would have to appear.
+
+    A greyscale reading of the imports is deliberate: the point is not that the
+    code currently behaves, it is that it *cannot* phone home without this gate
+    failing.
+    """
+    repo = HERE.parent.parent
+    search = repo / "PhotoVault" / "Search"
+    c = Checker()
+
+    sources = sorted(search.glob("*.swift"))
+    if not sources:
+        print(f"    | no sources under {search}", file=sys.stderr)
+        c.check(False, "the search stack is present")
+        return c.report()
+    print(f"    | auditing {len(sources)} files in PhotoVault/Search")
+
+    # ---- 1. no networking -------------------------------------------------
+    network = [
+        "URLSession", "URLRequest", "NWConnection", "NWPathMonitor",
+        "CFReadStream", "CFWriteStream", "uploadTask", "dataTask",
+        "WebSocket", "NSURLConnection", "Network.framework",
+    ]
+    found_network = []
+    for path in sources:
+        text = path.read_text()
+        for token in network:
+            for number, line in enumerate(text.splitlines(), 1):
+                stripped = line.strip()
+                # Comments discuss the guarantee; they are not code.
+                if stripped.startswith("//") or stripped.startswith("///"):
+                    continue
+                if token in line:
+                    found_network.append(f"{path.name}:{number} {token}")
+    c.check(not found_network,
+            "no networking API appears anywhere in the search stack",
+            "; ".join(found_network[:4]))
+
+    # ---- 2. no remote endpoints ------------------------------------------
+    found_urls = []
+    for path in sources:
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("//") or stripped.startswith("///"):
+                continue
+            if "http://" in line or "https://" in line:
+                found_urls.append(f"{path.name}:{number}")
+    c.check(not found_urls, "and no remote endpoint is referenced",
+            "; ".join(found_urls[:4]))
+
+    # ---- 3. system frameworks only ---------------------------------------
+    allowed = {
+        "Foundation", "Photos", "SwiftUI", "UIKit", "CoreML", "CoreGraphics",
+        "Vision", "Metal", "Accelerate", "SQLite3", "CoreImage", "ImageIO",
+        "MetalPerformanceShaders", "os", "UniformTypeIdentifiers", "CoreVideo",
+        "simd", "Darwin", "CryptoKit", "Dispatch", "CoreLocation", "MapKit",
+    }
+    foreign = set()
+    for path in sources:
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if stripped.startswith("import "):
+                module = stripped.split()[1].split(".")[0]
+                if module not in allowed:
+                    foreign.add(module)
+    c.check(not foreign, "only system frameworks are imported",
+            ", ".join(sorted(foreign)))
+
+    # ---- 4. the search stack does not log its inputs ----------------------
+    # Photos, OCR text and queries are exactly what must never reach a log.
+    logging = []
+    for path in sources:
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("//") or stripped.startswith("///"):
+                continue
+            # Word boundary before the call, or `modelFingerprint(` matches
+            # `print(` and the gate reports a log call that does not exist. A
+            # check that cries wolf is a check that gets ignored.
+            for token in ("print", "NSLog", "debugPrint", "os_log", "Logger"):
+                if re.search(r"(?<![A-Za-z0-9_])" + re.escape(token) + r"\s*\(", line):
+                    logging.append(f"{path.name}:{number} {token}(")
+    c.check(not logging, "nothing in the search stack writes to a log",
+            "; ".join(logging[:4]))
+
+    # ---- 5. the embedding matrix is kept out of backups ------------------
+    # It is derived data: 100k x 768 float16 is ~150 MB of something the device
+    # can recompute, and backing it up would push a large private file into
+    # iCloud -- the opposite of "on device".
+    embedding = (search / "EmbeddingStoreFile.swift").read_text()
+    c.check("isExcludedFromBackup" in embedding,
+          "the embedding matrix is excluded from device backups")
+
+    # ---- 6. the notices are complete -------------------------------------
+    notices = repo / "THIRD_PARTY_NOTICES.md"
+    c.check(notices.exists(), "THIRD_PARTY_NOTICES.md exists")
+    if notices.exists():
+        text = notices.read_text()
+        c.check("Apache License" in text and "Version 2.0" in text,
+                "it carries the full Apache-2.0 text")
+        c.check("siglip2-base-patch16-256" in text,
+                "and names the model actually shipped")
+        c.check("Apache-2.0" in text, "with its licence")
+        # The licence requires stating that the files were changed.
+        c.check("MODIF" in text.upper() or "modif" in text,
+                "and discloses that the model was modified")
+
+    # ---- 7. Release builds carry no debug diagnostics --------------------
+    release_binary = (repo / "build" / "DerivedDataRelease" / "Build" / "Products"
+                      / "Release-iphoneos" / "PhotoVault.app" / "PhotoVault")
+    if release_binary.exists():
+        blob = release_binary.read_bytes()
+        # `AISearchSelfCheck.log` is included because the self-check writes a
+        # report and must be `#if DEBUG`; if it ever leaked into Release this
+        # catches it.
+        leaked = [name for name in
+                  (b"PhotoVaultLaunch.log", b"PagerDiagnostics.log", b"lan-folder.log",
+                   b"AISearchSelfCheck")
+                  if name in blob]
+        c.check(not leaked, "the Release binary carries no debug log paths",
+                ", ".join(n.decode() for n in leaked))
+    else:
+        print("    | (Release build not present; skipping the binary check)")
+
+    return c.report()
+
+
+def mode_bundle(args) -> int:
+    """Verify the model artifacts that are actually inside the built app.
+
+    Every other mode here checks the pipeline: Python reference, converted
+    mlpackage, Swift port. All of them passed while the app still had no model in
+    it, because "the mlpackage is correct" and "the app can load what shipped"
+    are separate claims. This mode loads the `.mlmodelc` files out of the built
+    `PhotoVault.app` and runs them.
+
+    The decisive check is cos("CAT", "cat") ~= 0.8616. That one number proves the
+    bundled tokenizer and the bundled text tower are the *pair* that was
+    validated: a mismatched vocabulary, a case-folding normalizer, or a stale
+    model would each move it.
+    """
+    repo = HERE.parent.parent
+    sources = [
+        repo / "PhotoVault" / "Search" / "SearchModelResources.swift",
+        repo / "PhotoVault" / "Search" / "SigLIP2VisionEncoder.swift",
+        repo / "PhotoVault" / "Search" / "SigLIP2TextEncoder.swift",
+        repo / "PhotoVault" / "Search" / "SigLIP2Tokenizer.swift",
+    ]
+    for source in sources:
+        if not source.exists():
+            print(f"missing {source}", file=sys.stderr)
+            return 1
+
+    app = repo / "build" / "DerivedDataPhotoVault" / "Build" / "Products" /         "Debug-iphoneos" / "PhotoVault.app"
+    c = Checker()
+    if not app.exists():
+        print(f"    | the app bundle is not built yet: {app}", file=sys.stderr)
+        print("    | build it first:", file=sys.stderr)
+        print("    |   xcodebuild -project PhotoVault.xcodeproj -scheme PhotoVault \\",
+              file=sys.stderr)
+        print("    |     -configuration Debug -destination 'generic/platform=iOS' build",
+              file=sys.stderr)
+        c.check(False, "the bundled model is loadable")
+        return c.report()
+
+    binary = "/tmp/pv-bundle-tests"
+    command = ["xcrun", "swiftc", "-O", "-o", binary,
+               str(HERE / "bundle_test" / "main.swift")] + [str(s) for s in sources]
+    command += ["-framework", "AppKit", "-framework", "CoreML"]
+    build = subprocess.run(command, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stderr.strip()[:1200])
+        c.check(False, "bundled-model tests compile")
+        return c.report()
+
+    run = subprocess.run([binary, str(app)], capture_output=True, text=True)
+    for line in run.stdout.splitlines():
+        if "[FAIL]" in line or line.startswith(("checks:", "RESULT")) or "cos(" in line:
+            print(f"    | {line}")
+    c.check(run.returncode == 0, "bundled-model tests pass")
+    return c.report()
+
+
+def mode_pipeline(args) -> int:
+    """Verify the indexing pipeline (Phase 3, PhotoKit-free) on macOS.
+
+    PhotoKit is deliberately absent, and that is what makes this worth running.
+    The pipeline's job is not to talk to PhotoKit -- that is framework glue --
+    but to decide when to stop, what to retry, what to defer when the device is
+    hot, and to guarantee that a superseded run cannot write. All of that is
+    pure logic, so all of it is testable here.
+
+    The store is real, so "resume after the app is killed" is tested by throwing
+    the coordinator away and building a new one over the same database.
+    """
+    repo = HERE.parent.parent
+    sources = [
+        repo / "PhotoVault" / "Search" / "PhotoIndexPipeline.swift",
+        repo / "PhotoVault" / "Search" / "AIPhotoSearchStore.swift",
+        repo / "PhotoVault" / "Search" / "EmbeddingStoreFile.swift",
+        repo / "PhotoVault" / "Search" / "SearchTextNormalization.swift",
+        repo / "PhotoVault" / "Search" / "PhotoTextRecognizer.swift",
+    ]
+    for source in sources:
+        if not source.exists():
+            print(f"missing {source}", file=sys.stderr)
+            return 1
+
+    c = Checker()
+    binary = "/tmp/pv-pipeline-tests"
+    command = ["xcrun", "swiftc", "-O", "-o", binary,
+               str(HERE / "pipeline_test" / "main.swift")] + [str(s) for s in sources]
+    command += ["-framework", "AppKit"]
+    build = subprocess.run(command, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stderr.strip()[:1200])
+        c.check(False, "index pipeline tests compile")
+        return c.report()
+
+    run = subprocess.run([binary], capture_output=True, text=True)
+    for line in run.stdout.splitlines():
+        if "[FAIL]" in line or line.startswith(("checks:", "RESULT")):
+            print(f"    | {line}")
+    c.check(run.returncode == 0, "index pipeline tests pass")
+    return c.report()
+
+
+def mode_metal(args) -> int:
+    """Verify the Metal exact-search kernel against the CPU and NumPy rankings.
+
+    The GPU agreeing with the CPU path is only meaningful because the CPU path
+    was itself checked against an independent NumPy reader; without that, both
+    could be wrong together.
+    """
+    repo = HERE.parent.parent
+    sources = [
+        repo / "PhotoVault" / "Search" / "MetalSimilaritySearch.swift",
+        repo / "PhotoVault" / "Search" / "EmbeddingStoreFile.swift",
+    ]
+    metal_source = repo / "PhotoVault" / "Search" / "EmbeddingSimilarity.metal"
+    for source in sources + [metal_source]:
+        if not source.exists():
+            print(f"missing {source}", file=sys.stderr)
+            return 1
+
+    c = Checker()
+    air, metallib = "/tmp/pv-embedding.air", "/tmp/pv-embedding.metallib"
+    for command in (
+        ["xcrun", "-sdk", "macosx", "metal", "-c", str(metal_source), "-o", air],
+        ["xcrun", "-sdk", "macosx", "metallib", air, "-o", metallib],
+    ):
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(result.stderr.strip()[:800])
+            c.check(False, f"Metal kernel builds ({' '.join(command[3:5])})")
+            return c.report()
+    c.check(True, "Metal kernel compiles to a metallib")
+
+    binary = "/tmp/pv-metal-tests"
+    command = ["xcrun", "swiftc", "-O", "-o", binary,
+               str(HERE / "metal_test" / "main.swift")] + [str(s) for s in sources] + ["-framework", "Metal"]
+    build = subprocess.run(command, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stderr.strip()[:800])
+        c.check(False, "Metal search tests compile")
+        return c.report()
+
+    run = subprocess.run([binary, "--library", metallib], capture_output=True, text=True, cwd=HERE)
+    for line in run.stdout.splitlines():
+        if "[FAIL]" in line or line.startswith(("checks:", "RESULT", "SKIP")):
+            print(f"    | {line}")
+        elif "Metal P50" in line or "worst vs Double" in line:
+            print(f"    | {line}")
+    c.check(run.returncode == 0, "Metal search tests pass")
+    return c.report()
+
+
+# --------------------------------------------------------------------------
+# mode: textencoder
+# --------------------------------------------------------------------------
+def mode_textencoder(args) -> int:
+    """Run the whole Swift text pipeline against the PyTorch reference.
+
+    The tokenizer test proves the Swift BPE port matches sentencepiece; the
+    conversion test proves the Core ML graph matches PyTorch. Neither ever runs
+    the two Swift halves together. This does, on the same strings -- which is the
+    only place a wrong case-folding flag or a missing pad token can surface.
+    """
+    repo = HERE.parent.parent
+    sources = [
+        repo / "PhotoVault" / "Search" / "SigLIP2TextEncoder.swift",
+        repo / "PhotoVault" / "Search" / "SigLIP2Tokenizer.swift",
+    ]
+    for source in sources:
+        if not source.exists():
+            print(f"missing {source}", file=sys.stderr)
+            return 1
+
+    c = Checker()
+    fixture = HERE / "build" / "text-parity.json"
+    if not fixture.exists():
+        print("    | building the text-parity fixture (loads the PyTorch reference once)")
+        build = subprocess.run(
+            [sys.executable, str(HERE / "build_text_parity.py")],
+            capture_output=True, text=True, cwd=HERE,
+            env={**os.environ, "HF_HUB_DISABLE_XET": "1"},
+        )
+        for line in build.stdout.strip().splitlines():
+            print(f"    | {line}")
+        if build.returncode != 0:
+            print(build.stderr.strip()[:600])
+            c.check(False, "text-parity fixture builds")
+            return c.report()
+    c.check(True, "text-parity fixture is available")
+
+    binary = "/tmp/pv-textencoder-tests"
+    command = ["xcrun", "swiftc", "-O", "-o", binary,
+               str(HERE / "textencoder_test" / "main.swift"),
+               str(sources[0]), str(sources[1]), "-framework", "CoreML"]
+    build = subprocess.run(command, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stderr.strip()[:800])
+        c.check(False, "text pipeline tests compile")
+        return c.report()
+
+    # W8 is the shipping configuration and therefore the gate; the other two are
+    # run for calibration so the cost of quantisation is visible on every run
+    # rather than buried in a document.
+    models = [("w8", "SigLIP2TextEncoder-w8", 0.998),
+              ("fp16", "SigLIP2TextEncoder", 0.9999),
+              ("fp32", "SigLIP2TextEncoder-fp32", 0.9999)]
+    for label, name, threshold in models:
+        package = HERE / "out" / f"{name}.mlpackage"
+        if not package.exists():
+            print(f"    | SKIP {label}: no {package.name}")
+            continue
+        run = subprocess.run(
+            [binary, "--model", str(package), "--threshold", str(threshold)],
+            capture_output=True, text=True, cwd=HERE,
+        )
+        print(f"    | --- {label} (threshold {threshold}) ---")
+        for line in run.stdout.splitlines():
+            if "[FAIL]" in line or "cosine vs PyTorch" in line or "P50" in line:
+                print(f"    | {line.strip()}")
+        c.check(run.returncode == 0, f"Swift text pipeline matches PyTorch ({label})")
+
+    return c.report()
+
+
+# --------------------------------------------------------------------------
+# mode: query
+# --------------------------------------------------------------------------
+def mode_query(args) -> int:
+    """Verify the query analyzer.
+
+    Pure logic with an injected `now`, so every case pins an exact plan rather
+    than asserting that something was found. A wrong parse returns plausible
+    photos, which is the failure mode this exists to prevent.
+    """
+    repo = HERE.parent.parent
+    source = repo / "PhotoVault" / "Search" / "QueryAnalyzer.swift"
+    if not source.exists():
+        print(f"missing {source}", file=sys.stderr)
+        return 1
+
+    c = Checker()
+    binary = "/tmp/pv-query-tests"
+    build = subprocess.run(
+        ["xcrun", "swiftc", "-O", "-o", binary,
+         str(HERE / "queryanalyzer_test" / "main.swift"), str(source)],
+        capture_output=True, text=True,
+    )
+    if build.returncode != 0:
+        print(build.stderr.strip()[:800])
+        c.check(False, "query analyzer tests compile")
+        return c.report()
+
+    run = subprocess.run([binary], capture_output=True, text=True)
+    for line in run.stdout.splitlines():
+        if "[FAIL]" in line or line.startswith(("checks:", "RESULT")):
+            print(f"    | {line}")
+    c.check(run.returncode == 0, "query analyzer tests pass")
+    return c.report()
+
+
+# --------------------------------------------------------------------------
+# mode: ocr
+# --------------------------------------------------------------------------
+def mode_ocr(args) -> int:
+    """Verify Vision text recognition and its path into the FTS index.
+
+    Recognising text is only half the job; the other half is that a query can
+    then find it. The cached half runs the whole chain -- Vision, normalisation,
+    the store's two FTS paths -- on recognised output rather than on strings
+    typed by hand.
+    """
+    repo = HERE.parent.parent
+    sources = [
+        repo / "PhotoVault" / "Search" / "PhotoTextRecognizer.swift",
+        repo / "PhotoVault" / "Search" / "SearchTextNormalization.swift",
+        repo / "PhotoVault" / "Search" / "AIPhotoSearchStore.swift",
+        repo / "PhotoVault" / "Search" / "EmbeddingStoreFile.swift",
+    ]
+    for source in sources:
+        if not source.exists():
+            print(f"missing {source}", file=sys.stderr)
+            return 1
+
+    c = Checker()
+    binary = "/tmp/pv-ocr-tests"
+    command = (["xcrun", "swiftc", "-O", "-o", binary,
+                str(HERE / "ocr_test" / "main.swift")]
+               + [str(s) for s in sources]
+               + ["-framework", "Vision", "-framework", "AppKit"])
+    build = subprocess.run(command, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stderr.strip()[:800])
+        c.check(False, "OCR tests compile")
+        return c.report()
+
+    run = subprocess.run([binary], capture_output=True, text=True)
+    for line in run.stdout.splitlines():
+        if "[FAIL]" in line or line.startswith(("checks:", "RESULT")):
+            print(f"    | {line}")
+        elif "languages," in line or "OCR P50" in line or "NOTE" in line:
+            print(f"    | {line.strip()}")
+    c.check(run.returncode == 0, "OCR and hybrid FTS tests pass")
+    return c.report()
+
+
+# --------------------------------------------------------------------------
+# mode: geo
+# --------------------------------------------------------------------------
+def mode_geo(args) -> int:
+    """Verify the offline gazetteer and the path from a mention to SQLite rows.
+
+    The end-to-end half matters more than the unit half: a gazetteer that
+    resolves correctly but produces a box the store cannot use would pass every
+    unit test and return nothing in the app.
+    """
+    repo = HERE.parent.parent
+    sources = [
+        repo / "PhotoVault" / "Search" / "OfflineGazetteer.swift",
+        repo / "PhotoVault" / "Search" / "GazetteerData.swift",
+        repo / "PhotoVault" / "Search" / "AIPhotoSearchStore.swift",
+        repo / "PhotoVault" / "Search" / "EmbeddingStoreFile.swift",
+        repo / "PhotoVault" / "Search" / "SearchTextNormalization.swift",
+        repo / "PhotoVault" / "Search" / "QueryAnalyzer.swift",
+    ]
+    for source in sources:
+        if not source.exists():
+            print(f"missing {source}", file=sys.stderr)
+            return 1
+
+    c = Checker()
+    binary = "/tmp/pv-gazetteer-tests"
+    command = (["xcrun", "swiftc", "-O", "-o", binary,
+                str(HERE / "gazetteer_test" / "main.swift")]
+               + [str(s) for s in sources])
+    build = subprocess.run(command, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stderr.strip()[:800])
+        c.check(False, "gazetteer tests compile")
+        return c.report()
+
+    run = subprocess.run([binary], capture_output=True, text=True)
+    for line in run.stdout.splitlines():
+        if "[FAIL]" in line or line.startswith(("checks:", "RESULT")):
+            print(f"    | {line}")
+        elif "places" in line and "by kind" not in line:
+            print(f"    | {line.strip()}")
+        elif "by kind:" in line:
+            print(f"    | {line.strip()}")
+    c.check(run.returncode == 0, "gazetteer, bounding-box and geo-filter tests pass")
+    return c.report()
+
+
+# --------------------------------------------------------------------------
+# mode: search
+# --------------------------------------------------------------------------
+def mode_search(args) -> int:
+    """Verify the search engine end to end.
+
+    Only the text tower is stubbed: the mechanics under test -- how clauses
+    combine, how negation rejects, whether a metadata filter restricts the work
+    -- need vectors whose relationships are known exactly. The store, the mmap
+    matrix and the scoring code are all real.
+    """
+    repo = HERE.parent.parent
+    sources = [
+        repo / "PhotoVault" / "Search" / "PhotoSearchEngine.swift",
+        repo / "PhotoVault" / "Search" / "EmbeddingStoreFile.swift",
+        repo / "PhotoVault" / "Search" / "QueryAnalyzer.swift",
+        repo / "PhotoVault" / "Search" / "OfflineGazetteer.swift",
+        repo / "PhotoVault" / "Search" / "GazetteerData.swift",
+        repo / "PhotoVault" / "Search" / "SearchTextNormalization.swift",
+        repo / "PhotoVault" / "Search" / "AIPhotoSearchStore.swift",
+        repo / "PhotoVault" / "Search" / "SigLIP2TextEncoder.swift",
+        repo / "PhotoVault" / "Search" / "SigLIP2Tokenizer.swift",
+    ]
+    for source in sources:
+        if not source.exists():
+            print(f"missing {source}", file=sys.stderr)
+            return 1
+
+    c = Checker()
+    binary = "/tmp/pv-engine-tests"
+    command = (["xcrun", "swiftc", "-O", "-o", binary,
+                str(HERE / "searchengine_test" / "main.swift")]
+               + [str(s) for s in sources])
+    build = subprocess.run(command, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stderr.strip()[:1200])
+        c.check(False, "engine tests compile")
+        return c.report()
+
+    run = subprocess.run([binary], capture_output=True, text=True)
+    for line in run.stdout.splitlines():
+        if "[FAIL]" in line or line.startswith(("checks:", "RESULT")):
+            print(f"    | {line}")
+        elif line.startswith("         ") and "->" in line:
+            print(f"    | {line.strip()}")
+    c.check(run.returncode == 0, "search engine end-to-end tests pass")
+    return c.report()
+
+
+# --------------------------------------------------------------------------
+# mode: vision
+# --------------------------------------------------------------------------
+def mode_vision(args) -> int:
+    """Verify the Swift image encoder against the Python reference.
+
+    Two numbers, because they fail for different reasons: the tensor compared
+    against the exact array the reference fed to PyTorch (a resize, colour or
+    layout bug in our code), and the Core ML embedding against the reference
+    embeddings (whether an indexed photo is actually findable).
+
+    The decisive section feeds the Swift resampler the bytes PIL produced. That
+    removes image decoding from the comparison, so a difference there is
+    unambiguously ours -- Apple's ImageIO and libjpeg disagree about JPEGs, and
+    without this separation a decoder difference is indistinguishable from a
+    resampling bug.
+    """
+    repo = HERE.parent.parent
+    source = repo / "PhotoVault" / "Search" / "SigLIP2VisionEncoder.swift"
+    if not source.exists():
+        print(f"missing {source}", file=sys.stderr)
+        return 1
+
+    parity = HERE / "build" / "parity"
+    if not (parity / "manifest.json").exists():
+        print("build/parity/manifest.json is missing; run: python verify_siglip2.py walk")
+        return 1
+
+    c = Checker()
+    # The isolated fixtures are ~700 MB of regenerable data, so they are built
+    # only when absent rather than on every run.
+    if not (parity / "resample" / "expected.bin").exists():
+        print("    | building isolated resample fixtures (first run only, ~700 MB) ...")
+        dump = subprocess.run(
+            [sys.executable, str(HERE / "dump_resample_fixtures.py")],
+            capture_output=True, text=True,
+        )
+        if dump.returncode != 0:
+            print(dump.stdout[-600:])
+            print(dump.stderr[-600:])
+            c.check(False, "isolated resample fixtures build")
+            return c.report()
+        tail = [line for line in dump.stdout.splitlines() if "self-check" in line]
+        for line in tail:
+            print(f"    | {line.strip()}")
+
+    binary = "/tmp/pv-vision-tests"
+    command = ["xcrun", "swiftc", "-O", "-o", binary,
+               str(HERE / "visionencoder_test" / "main.swift"), str(source)]
+    build = subprocess.run(command, capture_output=True, text=True)
+    if build.returncode != 0:
+        print(build.stderr.strip()[:800])
+        c.check(False, "vision encoder tests compile")
+        return c.report()
+
+    run = subprocess.run([binary], capture_output=True, text=True)
+    for line in run.stdout.splitlines():
+        if "[FAIL]" in line or line.startswith(("checks:", "RESULT")):
+            print(f"    | {line}")
+        elif line.startswith("         ") and any(
+            key in line for key in ("cos ", "max ", "warm", "first prediction", "images,",
+                                    "reference tensor", "fixture images", "lossy", "model:")
+        ):
+            print(f"    | {line.strip()}")
+    c.check(run.returncode == 0, "vision encoder parity passes")
     return c.report()
 
 
@@ -559,8 +1359,23 @@ def main() -> int:
                     help="min cosine across ALL fixtures including adversarial synthetics")
     cm.add_argument("--label", help="label for the report (e.g. W8)")
 
-    tk = sub.add_parser("tokenizer", help="compare Swift token ids against Python")
-    tk.add_argument("--swift", required=True)
+    sub.add_parser("embedding", help="verify the embedding matrix file and exact search")
+    sub.add_parser("index", help="verify the metadata index, slot bookkeeping and FTS")
+    sub.add_parser("pipeline", help="verify the PhotoKit-free index pipeline: pause, resume, backoff, thermal")
+    sub.add_parser("bundle", help="verify the models inside the built app bundle load and reproduce the reference")
+    sub.add_parser("privacy", help="audit the on-device guarantee as source: no network, no logging, complete notices")
+    sub.add_parser("metal", help="verify the Metal exact-search kernel")
+    sub.add_parser("textencoder", help="run the Swift text pipeline against PyTorch")
+    sub.add_parser("query", help="verify the query analyzer (AND / NOT / dates / places)")
+    sub.add_parser("ocr", help="verify Vision OCR and its path into the FTS index")
+    sub.add_parser("geo", help="verify the offline gazetteer and geo filtering")
+    sub.add_parser("search", help="verify the search engine end to end")
+    sub.add_parser("vision", help="verify the Swift image encoder against the reference")
+
+    tk = sub.add_parser("tokenizer", help="verify the Swift tokenizer against sentencepiece")
+    tk.add_argument("--rebuild", action="store_true",
+                    help="regenerate the corpus, artifact and ground truth first")
+    tk.add_argument("--binary", help="where to put the compiled harness")
 
     args = p.parse_args()
     if args.mode == "reference":
@@ -569,6 +1384,30 @@ def main() -> int:
         return mode_walk(args)
     if args.mode == "coreml":
         return mode_coreml(args)
+    if args.mode == "vision":
+        return mode_vision(args)
+    if args.mode == "search":
+        return mode_search(args)
+    if args.mode == "geo":
+        return mode_geo(args)
+    if args.mode == "ocr":
+        return mode_ocr(args)
+    if args.mode == "query":
+        return mode_query(args)
+    if args.mode == "textencoder":
+        return mode_textencoder(args)
+    if args.mode == "metal":
+        return mode_metal(args)
+    if args.mode == "privacy":
+        return mode_privacy(args)
+    if args.mode == "bundle":
+        return mode_bundle(args)
+    if args.mode == "pipeline":
+        return mode_pipeline(args)
+    if args.mode == "index":
+        return mode_index(args)
+    if args.mode == "embedding":
+        return mode_embedding(args)
     if args.mode == "tokenizer":
         return mode_tokenizer(args)
     p.error(f"unknown mode {args.mode}")

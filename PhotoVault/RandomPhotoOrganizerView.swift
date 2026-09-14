@@ -771,8 +771,8 @@ struct RandomPhotoOrganizerView: View {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.72)
 
         let animation: Animation = accessibilityReduceMotion
-            ? .easeOut(duration: 0.16)
-            : .spring(response: 0.4, dampingFraction: 0.9)
+            ? AppMotion.reducedMotion
+            : AppMotion.organizerCommit
         let delay: Duration = accessibilityReduceMotion
             ? .milliseconds(170)
             : .milliseconds(340)
@@ -831,8 +831,8 @@ struct RandomPhotoOrganizerView: View {
 
     private func resetCardPosition() {
         let animation: Animation = accessibilityReduceMotion
-            ? .easeOut(duration: 0.16)
-            : .spring(response: 0.38, dampingFraction: 0.84)
+            ? AppMotion.reducedMotion
+            : AppMotion.organizerReset
         withAnimation(animation) {
             cardOffset = .zero
             cardRotation = 0

@@ -231,85 +231,29 @@ private func slideshowPageTransition(
     }
 }
 
-/// Shared motion geometry for both viewer variants. Keeping these values in
-/// one place prevents the regular library and the paged "Unsorted" viewer
-/// from drifting into two subtly different interactions.
+/// Shared motion vocabulary for both viewer variants. Opening and closing the
+/// viewer is owned by the system zoom transition (`preferredTransition`), so
+/// there is deliberately no custom presentation or dismissal trajectory here:
+/// the drag feedback, the fly-out and the fade-out that used to live in this
+/// enum were removed with it.
 private enum ViewerMotion {
-    static let presentation = Animation.spring(
-        response: 0.44,
-        dampingFraction: 0.88,
-        blendDuration: 0.04
-    )
-    static let chrome = Animation.spring(
-        response: 0.3,
-        dampingFraction: 0.92,
-        blendDuration: 0
-    )
-    static let cancellation = Animation.spring(
-        response: 0.4,
-        dampingFraction: 0.82,
-        blendDuration: 0.02
-    )
-    static let dismissalDuration = 0.28
+    static let chrome = AppMotion.viewerChrome
+    static let cancellation = AppMotion.viewerCancellation
     static let reducedMotionDuration = 0.18
 
-    static var dismissal: Animation {
-        .easeOut(duration: dismissalDuration)
-    }
-
-    static var dismissalFade: Animation {
-        .easeIn(duration: 0.24)
-    }
-
     static var reducedMotion: Animation {
-        .easeOut(duration: reducedMotionDuration)
+        AppMotion.reducedMotion
     }
 
-    static func progress(
-        translation: CGFloat,
-        viewportHeight: CGFloat
-    ) -> CGFloat {
-        let travel = min(max(viewportHeight * 0.44, 340), 560)
-        return min(max(translation / travel, 0), 1)
+    static func chromeOpacity(isVisible: Bool) -> Double {
+        isVisible ? 1 : 0
     }
 
-    static func easedProgress(_ progress: CGFloat) -> CGFloat {
-        let clamped = min(max(progress, 0), 1)
-        return clamped * (2 - clamped)
-    }
-
-    static func mediaScale(
-        progress: CGFloat,
-        reduceMotion: Bool
-    ) -> CGFloat {
-        guard !reduceMotion else { return 1 }
-        return 1 - easedProgress(progress) * 0.055
-    }
-
-    static func mediaOpacity(progress: CGFloat) -> Double {
-        1 - Double(easedProgress(progress)) * 0.08
-    }
-
-    static func backgroundOpacity(progress: CGFloat) -> Double {
-        1 - Double(easedProgress(progress)) * 0.9
-    }
-
-    static func cornerRadius(
-        progress: CGFloat,
-        reduceMotion: Bool
-    ) -> CGFloat {
-        guard !reduceMotion else { return 0 }
-        return easedProgress(progress) * 28
-    }
-
-    static func chromeOpacity(
-        isVisible: Bool,
-        progress: CGFloat
-    ) -> Double {
-        guard isVisible else { return 0 }
-        return 1 - Double(min(1, progress * 1.35))
-    }
-
+    /// Commit threshold for the *custom* pager styles only. The default
+    /// system-style pager hands pull-down to the zoom transition's own
+    /// interactive dismissal, which decides commit/cancel with UIKit physics;
+    /// the custom fade/push/zoom styles never reach it, so they still need a
+    /// velocity-aware decision here.
     static func shouldDismiss(
         translation: CGFloat,
         predictedTranslation: CGFloat,
@@ -319,10 +263,6 @@ private enum ViewerMotion {
         let projectedThreshold = min(max(viewportHeight * 0.25, 220), 320)
         return translation > directThreshold
             || predictedTranslation > projectedThreshold
-    }
-
-    static func completionOffset(viewportHeight: CGFloat) -> CGFloat {
-        max(480, viewportHeight + 96)
     }
 }
 
@@ -346,6 +286,10 @@ private struct ViewerMediaView: View {
     /// Only the page the viewer was opened on receives one; every other page
     /// loads through the normal PhotoKit path.
     let initialImage: UIImage?
+    /// True inside the zoom-transitioned viewer: the letterbox canvas stays
+    /// transparent so the system dimming provides the black backdrop and the
+    /// zoom-out morphs the photo itself back into its grid cell.
+    let transparentCanvas: Bool
     let onReady: (Bool) -> Void
     let onZoomingChanged: ((Bool) -> Void)?
 
@@ -355,6 +299,7 @@ private struct ViewerMediaView: View {
         contentMode: PHImageContentMode = .aspectFit,
         requestPriority: PhotoRequestPriority = .viewer,
         initialImage: UIImage? = nil,
+        transparentCanvas: Bool = false,
         onReady: @escaping (Bool) -> Void = { _ in },
         onZoomingChanged: ((Bool) -> Void)? = nil
     ) {
@@ -363,6 +308,7 @@ private struct ViewerMediaView: View {
         self.contentMode = contentMode
         self.requestPriority = requestPriority
         self.initialImage = initialImage
+        self.transparentCanvas = transparentCanvas
         self.onReady = onReady
         self.onZoomingChanged = onZoomingChanged
     }
@@ -374,6 +320,7 @@ private struct ViewerMediaView: View {
             VideoAssetViewer(
                 asset: asset,
                 requestPriority: requestPriority,
+                transparentCanvas: transparentCanvas,
                 onReady: onReady
             )
         case .image where asset.mediaSubtypes.contains(.photoLive):
@@ -382,6 +329,7 @@ private struct ViewerMediaView: View {
                 targetSize: targetSize,
                 contentMode: contentMode,
                 requestPriority: requestPriority,
+                transparentCanvas: transparentCanvas,
                 onReady: onReady
             )
         default:
@@ -391,6 +339,7 @@ private struct ViewerMediaView: View {
                 contentMode: contentMode,
                 requestPriority: requestPriority,
                 initialImage: initialImage,
+                canvasBackground: transparentCanvas ? Color.clear : nil,
                 onLoadStateChange: onReady,
                 onZoomingChanged: onZoomingChanged
             )
@@ -417,8 +366,6 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
     let onPagingChanged: ((Bool) -> Void)?
-    let onDismissDragChanged: ((ViewerDismissDrag) -> Void)?
-    let onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         PagerDiagnostics.beginSession()
@@ -448,9 +395,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             initialAssetIdentifier: initialAssetIdentifier,
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
-            onPagingChanged: onPagingChanged,
-            onDismissDragChanged: onDismissDragChanged,
-            onDismissDragEnded: onDismissDragEnded
+            onPagingChanged: onPagingChanged
         )
         return controller
     }
@@ -471,9 +416,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             initialAssetIdentifier: initialAssetIdentifier,
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
-            onPagingChanged: onPagingChanged,
-            onDismissDragChanged: onDismissDragChanged,
-            onDismissDragEnded: onDismissDragEnded
+            onPagingChanged: onPagingChanged
         )
     }
 
@@ -486,7 +429,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, UIPageViewControllerDataSource,
-        UIPageViewControllerDelegate, UIGestureRecognizerDelegate {
+        UIPageViewControllerDelegate {
         private weak var pageController: UIPageViewController?
         private var pageCount = 0
         private var displayedIndex: Int?
@@ -499,9 +442,6 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         private var onMediaReady: ((Bool) -> Void)?
         private var onZoomingChanged: ((Bool) -> Void)?
         private var onPagingChanged: ((Bool) -> Void)?
-        private var onDismissDragChanged: ((ViewerDismissDrag) -> Void)?
-        private var onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
-        private var dismissPanGesture: UIPanGestureRecognizer?
         private var isZooming = false
         private var pages: [Int: PhotoPagerPageController] = [:]
         /// The content identity currently rendered by each page's hosting
@@ -521,24 +461,6 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
 
         func attach(controller: UIPageViewController) {
             pageController = controller
-            let dismissPan = UIPanGestureRecognizer(
-                target: self,
-                action: #selector(handleDismissPan(_:))
-            )
-            dismissPan.delegate = self
-            dismissPan.cancelsTouchesInView = false
-            dismissPan.maximumNumberOfTouches = 1
-            controller.view.addGestureRecognizer(dismissPan)
-            dismissPanGesture = dismissPan
-
-            // Decide vertical dismissal before UIKit's horizontal scroll view
-            // is allowed to begin. A horizontal pan makes this recognizer fail
-            // immediately, then the page controller owns the gesture alone.
-            if let pageScrollView = controller.view.subviews
-                .compactMap({ $0 as? UIScrollView })
-                .first {
-                pageScrollView.panGestureRecognizer.require(toFail: dismissPan)
-            }
         }
 
         func invalidate() {
@@ -554,11 +476,6 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             pageController?.dataSource = nil
             pageController?.delegate = nil
             pageController?.view.isUserInteractionEnabled = false
-            if let dismissPanGesture {
-                dismissPanGesture.delegate = nil
-                dismissPanGesture.view?.removeGestureRecognizer(dismissPanGesture)
-                self.dismissPanGesture = nil
-            }
             pages.removeAll()
             pendingProgrammaticIndex = nil
             displayedIndex = nil
@@ -573,8 +490,6 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             onMediaReady = nil
             onZoomingChanged = nil
             onPagingChanged = nil
-            onDismissDragChanged = nil
-            onDismissDragEnded = nil
             assetProvider = { _ in nil }
             pageController = nil
         }
@@ -591,9 +506,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             initialAssetIdentifier: String?,
             onMediaReady: ((Bool) -> Void)?,
             onZoomingChanged: ((Bool) -> Void)?,
-            onPagingChanged: ((Bool) -> Void)?,
-            onDismissDragChanged: ((ViewerDismissDrag) -> Void)?,
-            onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
+            onPagingChanged: ((Bool) -> Void)?
         ) {
             self.pageCount = max(0, pageCount)
             self.assetProvider = assetProvider
@@ -611,8 +524,6 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             self.onMediaReady = onMediaReady
             self.onZoomingChanged = onZoomingChanged
             self.onPagingChanged = onPagingChanged
-            self.onDismissDragChanged = onDismissDragChanged
-            self.onDismissDragEnded = onDismissDragEnded
             self.isScrubbing = isScrubbing
 
             guard self.pageCount > 0,
@@ -717,70 +628,6 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                     PagerDiagnostics.log("external transition completed=\(clampedIndex)")
                     self.refreshPages(around: clampedIndex)
                 }
-            }
-        }
-
-        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            guard gestureRecognizer === dismissPanGesture,
-                  let dismissPan = gestureRecognizer as? UIPanGestureRecognizer,
-                  !isZooming,
-                  !isManualTransitionInProgress,
-                  pendingProgrammaticIndex == nil
-            else { return false }
-
-            let coordinateView = dismissPan.view?.window ?? dismissPan.view
-            let velocity = dismissPan.velocity(in: coordinateView)
-            let translation = dismissPan.translation(in: coordinateView)
-            let horizontalVelocity = abs(velocity.x)
-            let downwardVelocity = velocity.y
-            let isClearlyDownward: Bool
-            if max(horizontalVelocity, abs(downwardVelocity)) >= 80 {
-                isClearlyDownward = downwardVelocity > 0
-                    && downwardVelocity > horizontalVelocity * 1.3
-            } else {
-                isClearlyDownward = translation.y > 0
-                    && translation.y > abs(translation.x) * 1.3
-            }
-
-            PagerDiagnostics.log(
-                "dismiss pan decision accepted=\(isClearlyDownward) velocity=(\(Int(velocity.x)),\(Int(velocity.y)))"
-            )
-            return isClearlyDownward
-        }
-
-        @objc private func handleDismissPan(_ recognizer: UIPanGestureRecognizer) {
-            guard let view = recognizer.view else { return }
-            let coordinateView = view.window ?? view.superview ?? view
-            let translation = recognizer.translation(in: coordinateView)
-            let velocity = recognizer.velocity(in: coordinateView)
-            let projectionDuration: CGFloat = 0.2
-            let sample = ViewerDismissDrag(
-                translation: CGSize(
-                    width: translation.x,
-                    height: translation.y
-                ),
-                predictedEndTranslation: CGSize(
-                    width: translation.x + velocity.x * projectionDuration,
-                    height: translation.y + velocity.y * projectionDuration
-                )
-            )
-
-            switch recognizer.state {
-            case .began:
-                PagerDiagnostics.log("dismiss pan began")
-                onDismissDragChanged?(sample)
-            case .changed:
-                onDismissDragChanged?(sample)
-            case .ended:
-                PagerDiagnostics.log(
-                    "dismiss pan ended translation=\(Int(translation.y)) velocity=\(Int(velocity.y))"
-                )
-                onDismissDragEnded?(sample, false)
-            case .cancelled, .failed:
-                PagerDiagnostics.log("dismiss pan cancelled")
-                onDismissDragEnded?(sample, true)
-            default:
-                break
             }
         }
 
@@ -933,7 +780,9 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                         : neighborPriority,
                     initialImage: asset.localIdentifier == initialAssetIdentifier
                         ? initialPreviewImage
-                        : nil,                    onReady: { [weak self] ready in
+                        : nil,
+                    transparentCanvas: true,
+                    onReady: { [weak self] ready in
                         guard let self,
                               self.displayedIndex == index
                         else { return }
@@ -1010,7 +859,10 @@ private final class PhotoPagerPageController: UIHostingController<AnyView> {
     init(index: Int, rootView: AnyView) {
         self.index = index
         super.init(rootView: rootView)
-        view.backgroundColor = .black
+        // Clear: the zoom transition's dimming layer provides the black
+        // backdrop, and an opaque page background would make the zoom-out
+        // shrink a full-screen rectangle instead of the photo.
+        view.backgroundColor = .clear
     }
 
     @available(*, unavailable)
@@ -1024,6 +876,7 @@ private struct LivePhotoAssetViewer: View {
     let targetSize: CGSize
     let contentMode: PHImageContentMode
     let requestPriority: PhotoRequestPriority
+    let transparentCanvas: Bool
     let onReady: (Bool) -> Void
 
     @ObservedObject private var audioSession = MediaAudioSession.shared
@@ -1034,7 +887,11 @@ private struct LivePhotoAssetViewer: View {
 
     var body: some View {
         ZStack {
-            Color.black
+            if transparentCanvas {
+                Color.clear
+            } else {
+                Color.black
+            }
 
             if let livePhoto {
                 LivePhotoUIKitView(
@@ -1125,6 +982,7 @@ private struct LivePhotoUIKitView: UIViewRepresentable {
 private struct VideoAssetViewer: View {
     let asset: PHAsset
     let requestPriority: PhotoRequestPriority
+    let transparentCanvas: Bool
     let onReady: (Bool) -> Void
 
     @Environment(\.scenePhase) private var scenePhase
@@ -1136,7 +994,11 @@ private struct VideoAssetViewer: View {
 
     var body: some View {
         ZStack {
-            Color.black
+            if transparentCanvas {
+                Color.clear
+            } else {
+                Color.black
+            }
 
             if let player {
                 VideoPlayer(player: player)
@@ -1224,7 +1086,7 @@ private struct VideoAssetViewer: View {
 }
 
 private struct AssetPager: View {
-    let assets: PHFetchResult<PHAsset>
+    let assets: ViewerAssets
     @Binding var currentIndex: Int
     let targetSize: CGSize
     let contentMode: PHImageContentMode
@@ -1235,7 +1097,9 @@ private struct AssetPager: View {
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
     let onPagingChanged: ((Bool) -> Void)?
-    let onDismissDragChanged: ((ViewerDismissDrag) -> Void)?
+    // Custom swipe styles only: reports a finished vertical drag so the
+    // viewer can decide whether it clears the dismiss threshold. The default
+    // system style hands pull-down to the zoom transition instead.
     let onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
     // True while the user is scrubbing the filmstrip: transitions become
     // instant swaps so the main photo tracks the strip in real time.
@@ -1248,7 +1112,7 @@ private struct AssetPager: View {
     private var swipeStyleRawValue = PhotoSwipeStyle.system.rawValue
 
     init(
-        assets: PHFetchResult<PHAsset>,
+        assets: ViewerAssets,
         currentIndex: Binding<Int>,
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFit,
@@ -1258,7 +1122,6 @@ private struct AssetPager: View {
         onMediaReady: ((Bool) -> Void)? = nil,
         onZoomingChanged: ((Bool) -> Void)? = nil,
         onPagingChanged: ((Bool) -> Void)? = nil,
-        onDismissDragChanged: ((ViewerDismissDrag) -> Void)? = nil,
         onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)? = nil,
         isScrubbing: Bool = false
     ) {
@@ -1272,7 +1135,6 @@ private struct AssetPager: View {
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
         self.onPagingChanged = onPagingChanged
-        self.onDismissDragChanged = onDismissDragChanged
         self.onDismissDragEnded = onDismissDragEnded
         self.isScrubbing = isScrubbing
     }
@@ -1298,7 +1160,6 @@ private struct AssetPager: View {
                 }
             }
         }
-        .background(Color.black)
         .onAppear {
             PagerDiagnostics.beginSession()
             PagerDiagnostics.log(
@@ -1329,9 +1190,7 @@ private struct AssetPager: View {
             initialAssetIdentifier: initialAssetIdentifier,
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
-            onPagingChanged: onPagingChanged,
-            onDismissDragChanged: onDismissDragChanged,
-            onDismissDragEnded: onDismissDragEnded
+            onPagingChanged: onPagingChanged
         )
     }
 
@@ -1346,6 +1205,7 @@ private struct AssetPager: View {
                     == initialAssetIdentifier
                     ? initialPreviewImage
                     : nil,
+                transparentCanvas: true,
                 onReady: { ready in
                     onMediaReady?(ready)
                 },
@@ -1384,25 +1244,6 @@ private struct AssetPager: View {
                         return
                     }
                 }
-
-                guard customDragAxis == .vertical else { return }
-                if horizontalDistance > verticalDistance * 1.2 {
-                    customDragAxis = .horizontal
-                    onDismissDragEnded?(
-                        ViewerDismissDrag(
-                            translation: value.translation,
-                            predictedEndTranslation: value.predictedEndTranslation
-                        ),
-                        true
-                    )
-                    return
-                }
-                onDismissDragChanged?(
-                    ViewerDismissDrag(
-                        translation: value.translation,
-                        predictedEndTranslation: value.predictedEndTranslation
-                    )
-                )
             }
             .onEnded { value in
                 let resolvedAxis = customDragAxis
@@ -1411,10 +1252,7 @@ private struct AssetPager: View {
                     translation: value.translation,
                     predictedEndTranslation: value.predictedEndTranslation
                 )
-                guard !isZooming else {
-                    onDismissDragEnded?(sample, true)
-                    return
-                }
+                guard !isZooming else { return }
                 if resolvedAxis == .vertical {
                     let isStillVertical = value.translation.height
                         > abs(value.translation.width) * 1.2
@@ -1441,13 +1279,58 @@ private struct AssetPager: View {
     }
 }
 
+/// What the viewer needs from a photo collection to page through it.
+///
+/// The viewer only ever asks two things -- how many, and give me the one at this
+/// index -- and both `PHFetchResult` and an array answer them. Introducing the
+/// abstraction is what lets AI search results page in *relevance* order.
+///
+/// Why that is needed: `SmartSearchScreen` hands the ranked identifiers to
+/// `fetchAssets(withLocalIdentifiers:)`, and measurement on device-class iOS
+/// (simulator, iOS 26.3) shows the returned order is unrelated to the order
+/// passed in --
+///
+///     requested first: AA91AB0D, F80027A9
+///     returned first:  106E99A1, 99D53A1F
+///     input order kept: NO
+///
+/// -- which matches Apple documenting the order as unspecified. So a ranked
+/// result set cannot be expressed as a `PHFetchResult`: opening the 5th search
+/// hit would swipe onward in PhotoKit's order rather than the ranking.
+///
+/// Ordering is a property of the whole viewer, not just the pager: every
+/// `assets.object(at:)` in this file resolves `currentIndex`, so the pager, the
+/// filmstrip and the info panel must all read the same sequence or the indices
+/// desynchronise. Routing them through one type makes that automatic.
+enum ViewerAssets {
+    case fetch(PHFetchResult<PHAsset>)
+    case ordered([PHAsset])
+
+    var count: Int {
+        switch self {
+        case .fetch(let result): return result.count
+        case .ordered(let assets): return assets.count
+        }
+    }
+
+    func object(at index: Int) -> PHAsset {
+        switch self {
+        case .fetch(let result): return result.object(at: index)
+        case .ordered(let assets): return assets[index]
+        }
+    }
+}
+
 struct PhotoViewerView: View {
-    let assets: PHFetchResult<PHAsset>
+    let assets: ViewerAssets
     let initialIndex: Int
     /// First-frame seed handed over by the grid cell that was tapped. Used
     /// only for the opening asset; every other page loads through PhotoKit.
     let initialPreviewImage: UIImage?
     let initialAssetIdentifier: String?
+    /// Kept in sync with the displayed photo so the system zoom transition can
+    /// resolve the current grid cell at dismissal time.
+    let transitionState: PhotoViewerTransitionState?
     @ObservedObject var store: PhotoLibraryStore
     let album: PhotoAlbum?
     let onDismissRequested: (() -> Void)?
@@ -1461,25 +1344,24 @@ struct PhotoViewerView: View {
     @State private var isFavorite: Bool
     @State private var filmstripPosition: Int?
     @State private var isScrubbingFilmstrip = false
-    @State private var dismissDragOffset: CGSize = .zero
     @State private var isZooming = false
     @State private var isPaging = false
     @State private var isDismissing = false
-    @State private var presentationProgress: CGFloat = 0
-    @State private var dismissalOpacity: Double = 1
     @State private var viewportHeight: CGFloat = 844
-    @State private var crossedDismissThreshold = false
+    @State private var viewportSize = CGSize(width: 390, height: 844)
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
     @State private var alert: PhotoVaultAlert?
+    @StateObject private var neighborPrefetch = ViewerNeighborPrefetch()
 
     init(
-        assets: PHFetchResult<PHAsset>,
+        assets: ViewerAssets,
         initialIndex: Int,
         store: PhotoLibraryStore,
         album: PhotoAlbum? = nil,
         initialPreviewImage: UIImage? = nil,
         initialAssetIdentifier: String? = nil,
+        transitionState: PhotoViewerTransitionState? = nil,
         onDismissRequested: (() -> Void)? = nil
     ) {
         self.assets = assets
@@ -1488,6 +1370,7 @@ struct PhotoViewerView: View {
         self.album = album
         self.initialPreviewImage = initialPreviewImage
         self.initialAssetIdentifier = initialAssetIdentifier
+        self.transitionState = transitionState
         self.onDismissRequested = onDismissRequested
         _currentIndex = State(initialValue: self.initialIndex)
         _isFavorite = State(
@@ -1498,15 +1381,13 @@ struct PhotoViewerView: View {
     var body: some View {
         GeometryReader { presentationProxy in
             ZStack {
-                Color.black.opacity(ViewerMotion.backgroundOpacity(progress: dismissProgress))
-                    .ignoresSafeArea()
-
                 // Keep UIKit's page controller on its original stable layer.
                 // Transforming a container around UIPageViewController during
                 // an interactive scroll can invalidate UIKit's transition
-                // bookkeeping. The pure-SwiftUI chrome mirrors the same drag
-                // offset independently below, which keeps positions aligned
-                // without disturbing the pager hierarchy.
+                // bookkeeping. The page background is transparent: the zoom
+                // transition's dimming layer provides the black backdrop, so
+                // opening zooms the photo up out of its grid cell and closing
+                // zooms it back instead of moving a full-screen page.
                 GeometryReader { proxy in
                         AssetPager(
                             assets: assets,
@@ -1519,33 +1400,10 @@ struct PhotoViewerView: View {
                                 isZooming = zooming
                             },
                             onPagingChanged: handlePagingChanged,
-                            onDismissDragChanged: handleDismissDragChanged,
                             onDismissDragEnded: handleDismissDragEnded,
                             isScrubbing: isScrubbingFilmstrip
                         )
                         .frame(width: proxy.size.width, height: proxy.size.height)
-                        .offset(dismissDragOffset)
-                        .scaleEffect(
-                            ViewerMotion.mediaScale(
-                                progress: dismissProgress,
-                                reduceMotion: accessibilityReduceMotion
-                            )
-                        )
-                        .clipShape(
-                            RoundedRectangle(
-                                cornerRadius: ViewerMotion.cornerRadius(
-                                    progress: dismissProgress,
-                                    reduceMotion: accessibilityReduceMotion
-                                ),
-                                style: .continuous
-                            )
-                        )
-                        .opacity(ViewerMotion.mediaOpacity(progress: dismissProgress))
-                        .shadow(
-                            color: .black.opacity(Double(dismissProgress) * 0.32),
-                            radius: dismissProgress * 24,
-                            y: dismissProgress * 10
-                        )
                         .contentShape(Rectangle())
                         .simultaneousGesture(
                             TapGesture().onEnded {
@@ -1589,38 +1447,24 @@ struct PhotoViewerView: View {
                         .opacity(chromeOpacity)
                         .offset(y: controlsVisible ? 0 : 24)
                 }
-                .offset(dismissDragOffset)
-                .scaleEffect(
-                    ViewerMotion.mediaScale(
-                        progress: dismissProgress,
-                        reduceMotion: accessibilityReduceMotion
-                    )
-                )
                 .animation(chromeAnimation, value: controlsVisible)
                 .allowsHitTesting(controlsVisible && !isDismissing)
             }
-            .opacity(viewerOpacity)
-            .offset(
-                y: accessibilityReduceMotion
-                    ? 0
-                    : (1 - presentationProgress) * max(1, presentationProxy.size.height)
-            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onAppear {
                 viewportHeight = max(1, presentationProxy.size.height)
+                viewportSize = presentationProxy.size
+                updateNeighborPrefetch()
             }
             .onChange(of: presentationProxy.size.height) { _, newHeight in
                 viewportHeight = max(1, newHeight)
+                viewportSize = presentationProxy.size
+                updateNeighborPrefetch()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.clear)
-        .presentationBackground(.clear)
         .statusBarHidden(!controlsVisible || isDismissing)
         .persistentSystemOverlays(.automatic)
-        // The viewer owns the Photos-style pull-down gesture below. Keeping
-        // the cover's default interactive dismissal disabled prevents UIKit
-        // from competing with it during the short dismissal transition.
-        .interactiveDismissDisabled(true)
         .sheet(isPresented: $isShowingInfo) {
             if assets.count > 0 {
                 PhotoInfoView(asset: assets.object(at: currentIndex))
@@ -1656,59 +1500,93 @@ struct PhotoViewerView: View {
         .onChange(of: currentIndex) { _, newIndex in
             guard assets.count > 0 else { return }
             isFavorite = assets.object(at: newIndex).isFavorite
+            transitionState?.update(
+                index: newIndex,
+                assetIdentifier: assets.object(at: newIndex).localIdentifier
+            )
+            updateNeighborPrefetch()
         }
         .onAppear {
             isDismissing = false
-            dismissalOpacity = 1
             isPaging = false
-            crossedDismissThreshold = false
+            transitionState?.update(
+                index: currentIndex,
+                assetIdentifier: currentAsset?.localIdentifier
+            )
+            // The zoom transition consults these for the whole time the
+            // viewer is on screen: the veto keeps pull-down from stealing
+            // drags that belong to the zoomed photo or the pager, and the
+            // alignment rect makes the morph land on the photo itself.
+            transitionState?.interactiveDismissVeto = { [self] in
+                isZooming || isPaging
+            }
+            transitionState?.zoomAlignmentRectProvider = { [self] containerSize in
+                mediaAlignmentRect(in: containerSize)
+            }
             PagerDiagnostics.log(
                 "viewer appear kind=fetch count=\(assets.count) index=\(currentIndex)"
             )
-            withAnimation(
-                accessibilityReduceMotion
-                    ? ViewerMotion.reducedMotion
-                    : ViewerMotion.presentation
-            ) {
-                presentationProgress = 1
-            }
+            updateNeighborPrefetch()
         }
         .onDisappear {
             PagerDiagnostics.log(
                 "viewer disappear kind=fetch index=\(currentIndex) dismissing=\(isDismissing)"
             )
-            // Do not reset the drag presentation state here. SwiftUI can call
-            // onDisappear at the beginning of the full-screen cover's exit
-            // transition; snapping the media back to the center at that
-            // point produces a visible flash before the cover is gone.
+            transitionState?.interactiveDismissVeto = nil
+            transitionState?.zoomAlignmentRectProvider = nil
+            neighborPrefetch.stop()
         }
     }
 
-    private var dismissProgress: CGFloat {
-        ViewerMotion.progress(
-            translation: dismissDragOffset.height,
-            viewportHeight: viewportHeight
+    /// The rect the photo currently occupies inside the full-screen viewer,
+    /// used by the zoom transition to align the source grid cell with the
+    /// image rather than the letterboxed view. nil (full-bleed mode, unknown
+    /// media) falls back to the system's default whole-view alignment.
+    private func mediaAlignmentRect(in containerSize: CGSize) -> CGRect? {
+        guard !isFullScreen,
+              containerSize.width > 0,
+              containerSize.height > 0,
+              let asset = currentAsset,
+              asset.pixelWidth > 0,
+              asset.pixelHeight > 0
+        else { return nil }
+
+        let scale = min(
+            containerSize.width / CGFloat(asset.pixelWidth),
+            containerSize.height / CGFloat(asset.pixelHeight)
+        )
+        let fittedSize = CGSize(
+            width: CGFloat(asset.pixelWidth) * scale,
+            height: CGFloat(asset.pixelHeight) * scale
+        )
+        return CGRect(
+            x: (containerSize.width - fittedSize.width) / 2,
+            y: (containerSize.height - fittedSize.height) / 2,
+            width: fittedSize.width,
+            height: fittedSize.height
+        )
+    }
+
+    /// Keep a bounded ring of warm neighbours around the current photo. The
+    /// pager still renders only current ± 1 pages; this only asks PhotoKit to
+    /// pre-cache the wider ring so a fast swipe lands on a warm frame.
+    private func updateNeighborPrefetch() {
+        neighborPrefetch.update(
+            assets: assets,
+            currentIndex: currentIndex,
+            targetSize: mediaTargetSize(for: viewportSize),
+            contentMode: viewerContentMode
         )
     }
 
     private var chromeOpacity: Double {
-        ViewerMotion.chromeOpacity(
-            isVisible: controlsVisible,
-            progress: dismissProgress
-        )
+        ViewerMotion.chromeOpacity(isVisible: controlsVisible)
     }
 
     private var chromeAnimation: Animation {
         accessibilityReduceMotion
             ? ViewerMotion.reducedMotion
             : ViewerMotion.chrome
-    }
-
-    private var viewerOpacity: Double {
-        let presentationOpacity = accessibilityReduceMotion
-            ? Double(presentationProgress)
-            : 1
-        return max(0, dismissalOpacity * presentationOpacity)
     }
 
     private var currentAsset: PHAsset? {
@@ -1721,7 +1599,7 @@ struct PhotoViewerView: View {
     }
 
     private func toggleControls() {
-        guard !isDismissing, dismissDragOffset == .zero else { return }
+        guard !isDismissing else { return }
         withAnimation(chromeAnimation) {
             controlsVisible.toggle()
         }
@@ -1742,46 +1620,26 @@ struct PhotoViewerView: View {
         )
     }
 
-    private func handleDismissDragChanged(_ drag: ViewerDismissDrag) {
-        guard !isDismissing, !isZooming, !isPaging else { return }
-        dismissDragOffset = CGSize(
-            width: drag.translation.width * 0.12,
-            height: max(0, drag.translation.height)
-        )
-
-        let shouldDismiss = ViewerMotion.shouldDismiss(
-            translation: drag.translation.height,
-            predictedTranslation: drag.predictedEndTranslation.height,
-            viewportHeight: viewportHeight
-        )
-        if shouldDismiss != crossedDismissThreshold {
-            if shouldDismiss {
-                UIImpactFeedbackGenerator(style: .soft)
-                    .impactOccurred(intensity: 0.65)
-            }
-            crossedDismissThreshold = shouldDismiss
-        }
-    }
-
+    /// Custom swipe styles only: the zoom transition's interactive dismissal
+    /// never reaches them, so a finished vertical drag is checked against the
+    /// commit threshold here. There is no custom trajectory either way — a
+    /// commit simply triggers the same system zoom-out as the close button.
     private func handleDismissDragEnded(_ drag: ViewerDismissDrag, cancelled: Bool) {
-        crossedDismissThreshold = false
-        guard !cancelled, !isDismissing, !isZooming, !isPaging else {
-            resetDismissOffset()
-            return
-        }
+        guard !cancelled, !isDismissing, !isZooming, !isPaging else { return }
 
-        let shouldDismiss = ViewerMotion.shouldDismiss(
+        if ViewerMotion.shouldDismiss(
             translation: drag.translation.height,
             predictedTranslation: drag.predictedEndTranslation.height,
             viewportHeight: viewportHeight
-        )
-        if shouldDismiss {
+        ) {
             requestDismiss(reason: "pull-down")
-        } else {
-            resetDismissOffset()
         }
     }
 
+    /// Single dismissal entry point for the close button, the custom-style
+    /// pull-down and every other exit path. The visual zoom-out itself is
+    /// owned by the system transition; this only locks interaction and hands
+    /// over to the presentation bridge immediately.
     private func requestDismiss(reason: String) {
         guard !isDismissing, !isPaging else {
             if isPaging {
@@ -1792,70 +1650,14 @@ struct PhotoViewerView: View {
             return
         }
         isDismissing = true
-        crossedDismissThreshold = false
         PagerDiagnostics.log(
             "viewer dismiss requested kind=fetch reason=\(reason) index=\(currentIndex)"
         )
-        finishDismissAnimation(reason: reason)
+        onDismissRequested?()
     }
 
     private func handlePagingChanged(_ paging: Bool) {
         isPaging = paging
-        guard paging else { return }
-        crossedDismissThreshold = false
-        if dismissDragOffset != .zero {
-            var transaction = Transaction()
-            transaction.animation = nil
-            withTransaction(transaction) {
-                dismissDragOffset = .zero
-            }
-        }
-    }
-
-    private func finishDismissAnimation(reason: String) {
-        let animation = accessibilityReduceMotion
-            ? ViewerMotion.reducedMotion
-            : ViewerMotion.dismissal
-        let delay: Duration = accessibilityReduceMotion
-            ? .milliseconds(180)
-            : .milliseconds(280)
-
-        withAnimation(animation) {
-            if reason == "pull-down" {
-                dismissDragOffset.height = ViewerMotion.completionOffset(
-                    viewportHeight: viewportHeight
-                )
-            } else {
-                presentationProgress = 0
-            }
-        }
-        withAnimation(
-            accessibilityReduceMotion
-                ? ViewerMotion.reducedMotion
-                : ViewerMotion.dismissalFade
-        ) {
-            dismissalOpacity = 0
-        }
-
-        Task { @MainActor in
-            try? await Task.sleep(for: delay)
-            guard isDismissing else { return }
-            PagerDiagnostics.log(
-                "viewer dismiss animation completed kind=fetch index=\(currentIndex)"
-            )
-            onDismissRequested?()
-        }
-    }
-
-    private func resetDismissOffset() {
-        guard !isDismissing, dismissDragOffset != .zero else { return }
-        withAnimation(
-            accessibilityReduceMotion
-                ? ViewerMotion.reducedMotion
-                : ViewerMotion.cancellation
-        ) {
-            dismissDragOffset = .zero
-        }
     }
 
     private var topBar: some View {
@@ -2049,7 +1851,7 @@ struct PhotoViewerView: View {
 }
 
 private struct ViewerFilmstrip: UIViewRepresentable {
-    let assets: PHFetchResult<PHAsset>
+    let assets: ViewerAssets
     @Binding var currentIndex: Int
     @Binding var position: Int?
     var onScrubbingChanged: (Bool) -> Void = { _ in }
@@ -2099,7 +1901,7 @@ private struct ViewerFilmstrip: UIViewRepresentable {
     final class Coordinator: NSObject, UICollectionViewDataSource, UICollectionViewDelegate,
         UICollectionViewDataSourcePrefetching, UIScrollViewDelegate {
         private let thumbnailSize = CGSize(width: 128, height: 128)
-        private var assets: PHFetchResult<PHAsset>
+        private var assets: ViewerAssets
         private var selectedIndex: Int
         private var collectionView: UICollectionView?
         private var isProgrammaticScroll = false
@@ -2110,7 +1912,7 @@ private struct ViewerFilmstrip: UIViewRepresentable {
         private var onScrubbingChanged: (Bool) -> Void
 
         init(
-            assets: PHFetchResult<PHAsset>,
+            assets: ViewerAssets,
             currentIndex: Binding<Int>,
             position: Binding<Int?>,
             onScrubbingChanged: @escaping (Bool) -> Void
@@ -2135,7 +1937,7 @@ private struct ViewerFilmstrip: UIViewRepresentable {
 
         func update(
             collectionView: UICollectionView,
-            assets: PHFetchResult<PHAsset>,
+            assets: ViewerAssets,
             currentIndex: Int
         ) {
             self.collectionView = collectionView
@@ -2518,7 +2320,8 @@ private struct IndexedAssetPager: View {
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
     let onPagingChanged: ((Bool) -> Void)?
-    let onDismissDragChanged: ((ViewerDismissDrag) -> Void)?
+    // Custom swipe styles only: reports a finished vertical drag so the
+    // viewer can decide whether it clears the dismiss threshold.
     let onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
     // True while the user is scrubbing the filmstrip: transitions become
     // instant swaps so the main photo tracks the strip in real time.
@@ -2553,7 +2356,6 @@ private struct IndexedAssetPager: View {
         onMediaReady: ((Bool) -> Void)? = nil,
         onZoomingChanged: ((Bool) -> Void)? = nil,
         onPagingChanged: ((Bool) -> Void)? = nil,
-        onDismissDragChanged: ((ViewerDismissDrag) -> Void)? = nil,
         onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)? = nil,
         isScrubbing: Bool = false,
         isIndexingUnsorted: Bool = false
@@ -2567,10 +2369,12 @@ private struct IndexedAssetPager: View {
         self.neighborPriority = neighborPriority
         self.initialPreviewImage = initialPreviewImage
         self.initialAssetIdentifier = initialAssetIdentifier
+        self.initialPreviewIndex = initialPreviewImage == nil
+            ? nil
+            : currentIndex.wrappedValue
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
         self.onPagingChanged = onPagingChanged
-        self.onDismissDragChanged = onDismissDragChanged
         self.onDismissDragEnded = onDismissDragEnded
         self.isScrubbing = isScrubbing
         self.isIndexingUnsorted = isIndexingUnsorted
@@ -2597,7 +2401,6 @@ private struct IndexedAssetPager: View {
                 }
             }
         }
-        .background(Color.black)
         .onAppear {
             isVisible = true
             loadGeneration &+= 1
@@ -2686,9 +2489,7 @@ private struct IndexedAssetPager: View {
             initialAssetIdentifier: initialAssetIdentifier,
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
-            onPagingChanged: onPagingChanged,
-            onDismissDragChanged: onDismissDragChanged,
-            onDismissDragEnded: onDismissDragEnded
+            onPagingChanged: onPagingChanged
         )
     }
 
@@ -2704,6 +2505,7 @@ private struct IndexedAssetPager: View {
                     initialImage: asset.localIdentifier == initialAssetIdentifier
                         ? initialPreviewImage
                         : nil,
+                    transparentCanvas: true,
                     onReady: { ready in
                         onMediaReady?(ready)
                     },
@@ -2726,7 +2528,7 @@ private struct IndexedAssetPager: View {
             // The unsorted pager loads metadata page by page, so the opening
             // asset may not have arrived yet. Show the tapped thumbnail
             // instead of a spinner while the page resolves.
-            Color.black
+            Color.clear
                 .overlay {
                     Image(uiImage: initialPreviewImage)
                         .resizable()
@@ -2770,25 +2572,6 @@ private struct IndexedAssetPager: View {
                         return
                     }
                 }
-
-                guard customDragAxis == .vertical else { return }
-                if horizontalDistance > verticalDistance * 1.2 {
-                    customDragAxis = .horizontal
-                    onDismissDragEnded?(
-                        ViewerDismissDrag(
-                            translation: value.translation,
-                            predictedEndTranslation: value.predictedEndTranslation
-                        ),
-                        true
-                    )
-                    return
-                }
-                onDismissDragChanged?(
-                    ViewerDismissDrag(
-                        translation: value.translation,
-                        predictedEndTranslation: value.predictedEndTranslation
-                    )
-                )
             }
             .onEnded { value in
                 let resolvedAxis = customDragAxis
@@ -2797,10 +2580,7 @@ private struct IndexedAssetPager: View {
                     translation: value.translation,
                     predictedEndTranslation: value.predictedEndTranslation
                 )
-                guard !isZooming else {
-                    onDismissDragEnded?(sample, true)
-                    return
-                }
+                guard !isZooming else { return }
                 if resolvedAxis == .vertical {
                     let isStillVertical = value.translation.height
                         > abs(value.translation.width) * 1.2
@@ -3249,6 +3029,12 @@ struct IndexedPhotoViewerView: View {
     let title: String
     let totalCount: Int
     let initialIndex: Int
+    /// First-frame seed handed over by the unsorted grid cell that was tapped.
+    let initialPreviewImage: UIImage?
+    let initialAssetIdentifier: String?
+    /// Kept in sync with the displayed photo so the system zoom transition can
+    /// resolve the current grid cell at dismissal time.
+    let transitionState: PhotoViewerTransitionState?
     @ObservedObject var store: PhotoLibraryStore
     let onDismissRequested: (() -> Void)?
 
@@ -3261,29 +3047,33 @@ struct IndexedPhotoViewerView: View {
     @State private var isPreparingShare = false
     @State private var isFavorite = false
     @State private var isScrubbingFilmstrip = false
-    @State private var dismissDragOffset: CGSize = .zero
     @State private var isZooming = false
     @State private var isPaging = false
     @State private var isDismissing = false
-    @State private var presentationProgress: CGFloat = 0
-    @State private var dismissalOpacity: Double = 1
     @State private var viewportHeight: CGFloat = 844
-    @State private var crossedDismissThreshold = false
+    @State private var viewportSize = CGSize(width: 390, height: 844)
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
     @State private var alert: PhotoVaultAlert?
+    @StateObject private var neighborPrefetch = ViewerNeighborPrefetch()
 
     init(
         title: String,
         totalCount: Int,
         initialIndex: Int,
         store: PhotoLibraryStore,
+        initialPreviewImage: UIImage? = nil,
+        initialAssetIdentifier: String? = nil,
+        transitionState: PhotoViewerTransitionState? = nil,
         onDismissRequested: (() -> Void)? = nil
     ) {
         self.title = title
         self.totalCount = max(0, totalCount)
         self.initialIndex = min(max(0, initialIndex), max(0, totalCount - 1))
         self.store = store
+        self.initialPreviewImage = initialPreviewImage
+        self.initialAssetIdentifier = initialAssetIdentifier
+        self.transitionState = transitionState
         self.onDismissRequested = onDismissRequested
         _currentIndex = State(initialValue: self.initialIndex)
     }
@@ -3299,14 +3089,10 @@ struct IndexedPhotoViewerView: View {
     var body: some View {
         GeometryReader { presentationProxy in
             ZStack {
-                Color.black.opacity(
-                    ViewerMotion.backgroundOpacity(progress: dismissProgress)
-                )
-                .ignoresSafeArea()
-
                 // Same stable-layer rule as the regular viewer: never wrap
                 // UIPageViewController in the continuously transformed chrome
-                // container.
+                // container. Background stays transparent — the zoom
+                // transition's dimming layer provides the black backdrop.
                 GeometryReader { proxy in
                         IndexedAssetPager(
                             totalCount: totalCount,
@@ -3315,38 +3101,17 @@ struct IndexedPhotoViewerView: View {
                             assetsByIndex: $assetsByIndex,
                             targetSize: mediaTargetSize(for: proxy.size),
                             contentMode: viewerContentMode,
+                            initialPreviewImage: initialPreviewImage,
+                            initialAssetIdentifier: initialAssetIdentifier,
                             onZoomingChanged: { zooming in
                                 isZooming = zooming
                             },
                             onPagingChanged: handlePagingChanged,
-                            onDismissDragChanged: handleDismissDragChanged,
                             onDismissDragEnded: handleDismissDragEnded,
                             isScrubbing: isScrubbingFilmstrip,
                             isIndexingUnsorted: store.isIndexingUnsorted
                         )
                         .frame(width: proxy.size.width, height: proxy.size.height)
-                        .offset(dismissDragOffset)
-                        .scaleEffect(
-                            ViewerMotion.mediaScale(
-                                progress: dismissProgress,
-                                reduceMotion: accessibilityReduceMotion
-                            )
-                        )
-                        .clipShape(
-                            RoundedRectangle(
-                                cornerRadius: ViewerMotion.cornerRadius(
-                                    progress: dismissProgress,
-                                    reduceMotion: accessibilityReduceMotion
-                                ),
-                                style: .continuous
-                            )
-                        )
-                        .opacity(ViewerMotion.mediaOpacity(progress: dismissProgress))
-                        .shadow(
-                            color: .black.opacity(Double(dismissProgress) * 0.32),
-                            radius: dismissProgress * 24,
-                            y: dismissProgress * 10
-                        )
                         .contentShape(Rectangle())
                         .simultaneousGesture(
                             TapGesture().onEnded {
@@ -3387,35 +3152,24 @@ struct IndexedPhotoViewerView: View {
                         .opacity(chromeOpacity)
                         .offset(y: controlsVisible ? 0 : 24)
                 }
-                .offset(dismissDragOffset)
-                .scaleEffect(
-                    ViewerMotion.mediaScale(
-                        progress: dismissProgress,
-                        reduceMotion: accessibilityReduceMotion
-                    )
-                )
                 .animation(chromeAnimation, value: controlsVisible)
                 .allowsHitTesting(controlsVisible && !isDismissing)
             }
-            .opacity(viewerOpacity)
-            .offset(
-                y: accessibilityReduceMotion
-                    ? 0
-                    : (1 - presentationProgress) * max(1, presentationProxy.size.height)
-            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onAppear {
                 viewportHeight = max(1, presentationProxy.size.height)
+                viewportSize = presentationProxy.size
+                updateNeighborPrefetch()
             }
             .onChange(of: presentationProxy.size.height) { _, newHeight in
                 viewportHeight = max(1, newHeight)
+                viewportSize = presentationProxy.size
+                updateNeighborPrefetch()
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.clear)
-        .presentationBackground(.clear)
         .statusBarHidden(!controlsVisible || isDismissing)
         .persistentSystemOverlays(.automatic)
-        .interactiveDismissDisabled(true)
         .sheet(isPresented: $isShowingInfo) {
             if let currentAsset {
                 PhotoInfoView(asset: currentAsset)
@@ -3450,45 +3204,90 @@ struct IndexedPhotoViewerView: View {
         }
         .onChange(of: currentAssetID) { _, _ in
             isFavorite = currentAsset?.isFavorite ?? false
+            transitionState?.update(
+                index: currentIndex,
+                assetIdentifier: currentAsset?.localIdentifier
+            )
+            updateNeighborPrefetch()
         }
         .onAppear {
             isDismissing = false
-            dismissalOpacity = 1
             isPaging = false
-            crossedDismissThreshold = false
+            transitionState?.update(
+                index: currentIndex,
+                assetIdentifier: currentAsset?.localIdentifier
+            )
+            transitionState?.interactiveDismissVeto = { [self] in
+                isZooming || isPaging
+            }
+            transitionState?.zoomAlignmentRectProvider = { [self] containerSize in
+                mediaAlignmentRect(in: containerSize)
+            }
             PagerDiagnostics.log(
                 "viewer appear kind=indexed count=\(totalCount) index=\(currentIndex)"
             )
-            withAnimation(
-                accessibilityReduceMotion
-                    ? ViewerMotion.reducedMotion
-                    : ViewerMotion.presentation
-            ) {
-                presentationProgress = 1
-            }
+            updateNeighborPrefetch()
         }
         .onDisappear {
             PagerDiagnostics.log(
                 "viewer disappear kind=indexed index=\(currentIndex) dismissing=\(isDismissing)"
             )
-            // Keep the final drag frame intact until the cover has finished
-            // dismissing. Resetting it during onDisappear causes a one-frame
-            // snap/flash in the system full-screen transition.
+            transitionState?.interactiveDismissVeto = nil
+            transitionState?.zoomAlignmentRectProvider = nil
+            neighborPrefetch.stop()
         }
     }
 
-    private var dismissProgress: CGFloat {
-        ViewerMotion.progress(
-            translation: dismissDragOffset.height,
-            viewportHeight: viewportHeight
+    /// Same contract as the regular viewer: report the fitted photo rect so
+    /// the zoom-out morphs the image into its unsorted grid cell.
+    private func mediaAlignmentRect(in containerSize: CGSize) -> CGRect? {
+        guard !isFullScreen,
+              containerSize.width > 0,
+              containerSize.height > 0,
+              let asset = currentAsset,
+              asset.pixelWidth > 0,
+              asset.pixelHeight > 0
+        else { return nil }
+
+        let scale = min(
+            containerSize.width / CGFloat(asset.pixelWidth),
+            containerSize.height / CGFloat(asset.pixelHeight)
+        )
+        let fittedSize = CGSize(
+            width: CGFloat(asset.pixelWidth) * scale,
+            height: CGFloat(asset.pixelHeight) * scale
+        )
+        return CGRect(
+            x: (containerSize.width - fittedSize.width) / 2,
+            y: (containerSize.height - fittedSize.height) / 2,
+            width: fittedSize.width,
+            height: fittedSize.height
+        )
+    }
+
+    /// The unsorted pager resolves assets page by page, so only the
+    /// already-resolved neighbours can be warmed. Same adaptive radius as the
+    /// regular viewer; the ring stays bounded by the 60-item metadata page.
+    private func updateNeighborPrefetch() {
+        var ring: [PHAsset] = []
+        let radius = PhotoImageManager.viewerPrefetchRadius
+        for offset in 1...max(1, radius) {
+            for candidate in [currentIndex - offset, currentIndex + offset]
+            where candidate >= 0 && candidate < totalCount {
+                if let asset = assetsByIndex[candidate] {
+                    ring.append(asset)
+                }
+            }
+        }
+        neighborPrefetch.update(
+            assets: ring,
+            targetSize: mediaTargetSize(for: viewportSize),
+            contentMode: viewerContentMode
         )
     }
 
     private var chromeOpacity: Double {
-        ViewerMotion.chromeOpacity(
-            isVisible: controlsVisible,
-            progress: dismissProgress
-        )
+        ViewerMotion.chromeOpacity(isVisible: controlsVisible)
     }
 
     private var chromeAnimation: Animation {
@@ -3497,19 +3296,12 @@ struct IndexedPhotoViewerView: View {
             : ViewerMotion.chrome
     }
 
-    private var viewerOpacity: Double {
-        let presentationOpacity = accessibilityReduceMotion
-            ? Double(presentationProgress)
-            : 1
-        return max(0, dismissalOpacity * presentationOpacity)
-    }
-
     private var viewerContentMode: PHImageContentMode {
         isFullScreen ? .aspectFill : .aspectFit
     }
 
     private func toggleControls() {
-        guard !isDismissing, dismissDragOffset == .zero else { return }
+        guard !isDismissing else { return }
         withAnimation(chromeAnimation) {
             controlsVisible.toggle()
         }
@@ -3530,33 +3322,9 @@ struct IndexedPhotoViewerView: View {
         )
     }
 
-    private func handleDismissDragChanged(_ drag: ViewerDismissDrag) {
-        guard !isDismissing, !isZooming, !isPaging else { return }
-        dismissDragOffset = CGSize(
-            width: drag.translation.width * 0.12,
-            height: max(0, drag.translation.height)
-        )
-
-        let shouldDismiss = ViewerMotion.shouldDismiss(
-            translation: drag.translation.height,
-            predictedTranslation: drag.predictedEndTranslation.height,
-            viewportHeight: viewportHeight
-        )
-        if shouldDismiss != crossedDismissThreshold {
-            if shouldDismiss {
-                UIImpactFeedbackGenerator(style: .soft)
-                    .impactOccurred(intensity: 0.65)
-            }
-            crossedDismissThreshold = shouldDismiss
-        }
-    }
-
+    /// Custom swipe styles only; see the regular viewer for the contract.
     private func handleDismissDragEnded(_ drag: ViewerDismissDrag, cancelled: Bool) {
-        crossedDismissThreshold = false
-        guard !cancelled, !isDismissing, !isZooming, !isPaging else {
-            resetDismissOffset()
-            return
-        }
+        guard !cancelled, !isDismissing, !isZooming, !isPaging else { return }
 
         if ViewerMotion.shouldDismiss(
             translation: drag.translation.height,
@@ -3564,11 +3332,11 @@ struct IndexedPhotoViewerView: View {
             viewportHeight: viewportHeight
         ) {
             requestDismiss(reason: "pull-down")
-        } else {
-            resetDismissOffset()
         }
     }
 
+    /// Single dismissal entry point; the system zoom transition owns the
+    /// visual zoom-out.
     private func requestDismiss(reason: String) {
         guard !isDismissing, !isPaging else {
             if isPaging {
@@ -3579,70 +3347,14 @@ struct IndexedPhotoViewerView: View {
             return
         }
         isDismissing = true
-        crossedDismissThreshold = false
         PagerDiagnostics.log(
             "viewer dismiss requested kind=indexed reason=\(reason) index=\(currentIndex)"
         )
-        finishDismissAnimation(reason: reason)
+        onDismissRequested?()
     }
 
     private func handlePagingChanged(_ paging: Bool) {
         isPaging = paging
-        guard paging else { return }
-        crossedDismissThreshold = false
-        if dismissDragOffset != .zero {
-            var transaction = Transaction()
-            transaction.animation = nil
-            withTransaction(transaction) {
-                dismissDragOffset = .zero
-            }
-        }
-    }
-
-    private func finishDismissAnimation(reason: String) {
-        let animation = accessibilityReduceMotion
-            ? ViewerMotion.reducedMotion
-            : ViewerMotion.dismissal
-        let delay: Duration = accessibilityReduceMotion
-            ? .milliseconds(180)
-            : .milliseconds(280)
-
-        withAnimation(animation) {
-            if reason == "pull-down" {
-                dismissDragOffset.height = ViewerMotion.completionOffset(
-                    viewportHeight: viewportHeight
-                )
-            } else {
-                presentationProgress = 0
-            }
-        }
-        withAnimation(
-            accessibilityReduceMotion
-                ? ViewerMotion.reducedMotion
-                : ViewerMotion.dismissalFade
-        ) {
-            dismissalOpacity = 0
-        }
-
-        Task { @MainActor in
-            try? await Task.sleep(for: delay)
-            guard isDismissing else { return }
-            PagerDiagnostics.log(
-                "viewer dismiss animation completed kind=indexed index=\(currentIndex)"
-            )
-            onDismissRequested?()
-        }
-    }
-
-    private func resetDismissOffset() {
-        guard !isDismissing, dismissDragOffset != .zero else { return }
-        withAnimation(
-            accessibilityReduceMotion
-                ? ViewerMotion.reducedMotion
-                : ViewerMotion.cancellation
-        ) {
-            dismissDragOffset = .zero
-        }
     }
 
     private var topBar: some View {

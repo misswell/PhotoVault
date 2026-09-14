@@ -320,6 +320,7 @@ struct PhotoGridView: UIViewRepresentable {
     let isActive: Bool
     let selectionMode: Bool
     let selectedIDs: Set<String>
+    let transitionCoordinator: PhotoGridTransitionCoordinator?
     let onOpen: (PhotoOpenContext) -> Void
     let onToggleSelection: (PHAsset) -> Void
     let onFavorite: (PHAsset) -> Void
@@ -331,12 +332,47 @@ struct PhotoGridView: UIViewRepresentable {
     let onAddToQuickAlbum: (PHAsset, PhotoAlbum) -> Void
     let quickAlbums: () -> [PhotoAlbum]
 
+    init(
+        assets: PHFetchResult<PHAsset>,
+        isActive: Bool,
+        selectionMode: Bool,
+        selectedIDs: Set<String>,
+        transitionCoordinator: PhotoGridTransitionCoordinator? = nil,
+        onOpen: @escaping (PhotoOpenContext) -> Void,
+        onToggleSelection: @escaping (PHAsset) -> Void,
+        onFavorite: @escaping (PHAsset) -> Void,
+        onShare: @escaping (PHAsset) -> Void,
+        onDelete: @escaping (PHAsset) -> Void,
+        onAddToAlbum: @escaping (PHAsset) -> Void,
+        onRemoveFromAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+        containingUserAlbums: @escaping (PHAsset) -> [PhotoAlbum],
+        onAddToQuickAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+        quickAlbums: @escaping () -> [PhotoAlbum]
+    ) {
+        self.assets = assets
+        self.isActive = isActive
+        self.selectionMode = selectionMode
+        self.selectedIDs = selectedIDs
+        self.transitionCoordinator = transitionCoordinator
+        self.onOpen = onOpen
+        self.onToggleSelection = onToggleSelection
+        self.onFavorite = onFavorite
+        self.onShare = onShare
+        self.onDelete = onDelete
+        self.onAddToAlbum = onAddToAlbum
+        self.onRemoveFromAlbum = onRemoveFromAlbum
+        self.containingUserAlbums = containingUserAlbums
+        self.onAddToQuickAlbum = onAddToQuickAlbum
+        self.quickAlbums = quickAlbums
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(
             assets: assets,
             isActive: isActive,
             selectionMode: selectionMode,
             selectedIDs: selectedIDs,
+            transitionCoordinator: transitionCoordinator,
             onOpen: onOpen,
             onToggleSelection: onToggleSelection,
             onFavorite: onFavorite,
@@ -365,6 +401,7 @@ struct PhotoGridView: UIViewRepresentable {
             isActive: isActive,
             selectionMode: selectionMode,
             selectedIDs: selectedIDs,
+            transitionCoordinator: transitionCoordinator,
             onOpen: onOpen,
             onToggleSelection: onToggleSelection,
             onFavorite: onFavorite,
@@ -379,7 +416,8 @@ struct PhotoGridView: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, UICollectionViewDataSource, UICollectionViewDelegate,
-        UICollectionViewDataSourcePrefetching, UICollectionViewDelegateFlowLayout {
+        UICollectionViewDataSourcePrefetching, UICollectionViewDelegateFlowLayout,
+        PhotoGridAssetProviding {
         private struct AssetSignature: Equatable {
             let count: Int
             let firstIdentifier: String?
@@ -398,6 +436,7 @@ struct PhotoGridView: UIViewRepresentable {
         private var selectionPanDriver: PhotoSelectionPanDriver?
         private var pinchDriver: PhotoGridPinchDriver?
         private weak var collectionView: UICollectionView?
+        private weak var transitionCoordinator: PhotoGridTransitionCoordinator?
 
         private var onOpen: (PhotoOpenContext) -> Void
         private var onToggleSelection: (PHAsset) -> Void
@@ -415,6 +454,7 @@ struct PhotoGridView: UIViewRepresentable {
             isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
+            transitionCoordinator: PhotoGridTransitionCoordinator? = nil,
             onOpen: @escaping (PhotoOpenContext) -> Void,
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
@@ -432,6 +472,7 @@ struct PhotoGridView: UIViewRepresentable {
             needsReloadOnActivation = !isActive
             self.selectionMode = selectionMode
             self.selectedIDs = selectedIDs
+            self.transitionCoordinator = transitionCoordinator
             self.onOpen = onOpen
             self.onToggleSelection = onToggleSelection
             self.onFavorite = onFavorite
@@ -446,6 +487,7 @@ struct PhotoGridView: UIViewRepresentable {
 
         func dismantle(_ collectionView: UICollectionView) {
             cancelVisibleRequests(in: collectionView)
+            transitionCoordinator?.unregister(collectionView: collectionView)
             collectionView.isUserInteractionEnabled = false
             collectionView.dataSource = nil
             collectionView.delegate = nil
@@ -534,6 +576,7 @@ struct PhotoGridView: UIViewRepresentable {
             isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
+            transitionCoordinator: PhotoGridTransitionCoordinator? = nil,
             onOpen: @escaping (PhotoOpenContext) -> Void,
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
@@ -553,6 +596,13 @@ struct PhotoGridView: UIViewRepresentable {
             collectionView.isUserInteractionEnabled = isActive
             self.selectionMode = selectionMode
             self.selectedIDs = selectedIDs
+            self.transitionCoordinator = transitionCoordinator
+            if let transitionCoordinator {
+                transitionCoordinator.register(
+                    collectionView: collectionView,
+                    assetProvider: self
+                )
+            }
             self.onOpen = onOpen
             self.onToggleSelection = onToggleSelection
             self.onFavorite = onFavorite
@@ -923,6 +973,17 @@ struct PhotoGridView: UIViewRepresentable {
                     : nil
             )
         }
+
+        // MARK: PhotoGridAssetProviding
+
+        var assetCount: Int {
+            assets.count
+        }
+
+        func assetIdentifier(at index: Int) -> String? {
+            guard index >= 0, index < assets.count else { return nil }
+            return assets.object(at: index).localIdentifier
+        }
     }
 }
 
@@ -930,7 +991,6 @@ final class PhotoGridCell: UICollectionViewCell {
     static let reuseIdentifier = "PhotoGridCell"
 
     private let imageView = UIImageView()
-    private let loadingIndicator = UIActivityIndicatorView(style: .medium)
     private let selectionImageView = UIImageView()
     private let liveBadge = UIImageView()
     private let videoDurationLabel = UILabel()
@@ -946,6 +1006,13 @@ final class PhotoGridCell: UICollectionViewCell {
         imageView.image
     }
 
+    /// What the system zoom transition should scale from / back to. The
+    /// thumbnail itself is preferred so the zoom grows out of the photo;
+    /// an unloaded cell falls back to its content view.
+    var zoomSourceView: UIView {
+        imageView.image == nil ? contentView : imageView
+    }
+
     override init(frame: CGRect) {
         super.init(frame: frame)
 
@@ -956,11 +1023,6 @@ final class PhotoGridCell: UICollectionViewCell {
         imageView.clipsToBounds = true
         imageView.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(imageView)
-
-        loadingIndicator.color = .secondaryLabel
-        loadingIndicator.hidesWhenStopped = true
-        loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(loadingIndicator)
 
         selectionImageView.contentMode = .scaleAspectFit
         selectionImageView.tintColor = .white
@@ -991,8 +1053,6 @@ final class PhotoGridCell: UICollectionViewCell {
             imageView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
             imageView.topAnchor.constraint(equalTo: contentView.topAnchor),
             imageView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
-            loadingIndicator.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-            loadingIndicator.centerYAnchor.constraint(equalTo: contentView.centerYAnchor),
             selectionImageView.widthAnchor.constraint(equalToConstant: 21),
             selectionImageView.heightAnchor.constraint(equalToConstant: 21),
             selectionImageView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 4),
@@ -1022,7 +1082,6 @@ final class PhotoGridCell: UICollectionViewCell {
         imageView.alpha = 1
         liveBadge.isHidden = true
         videoDurationLabel.isHidden = true
-        loadingIndicator.stopAnimating()
         selectionImageView.isHidden = true
     }
 
@@ -1038,20 +1097,19 @@ final class PhotoGridCell: UICollectionViewCell {
         representedTargetSize = targetSize
 
         // Serve an already-decoded thumbnail in the same frame. Without this
-        // probe every recycle blanked the cell and spun an indicator even for
-        // photos that had been on screen moments earlier.
-        if let cachedImage = PhotoImageManager.shared.cachedImage(
+        // probe every recycle blanked the cell and re-requested a photo that
+        // had been on screen moments earlier.
+        //
+        // A missing thumbnail paints the cell's static grouped background.
+        // There is deliberately no activity indicator here: dozens of
+        // recycling cells animating spinners is pure visual noise, and the
+        // grid is already prefetched ahead of the viewport.
+        imageView.image = PhotoImageManager.shared.cachedImage(
             for: asset,
             targetSize: targetSize,
             contentMode: .aspectFill,
             scope: .gridThumbnail
-        ) {
-            imageView.image = cachedImage
-            loadingIndicator.stopAnimating()
-        } else {
-            imageView.image = nil
-            loadingIndicator.startAnimating()
-        }
+        )
 
         liveBadge.isHidden = !asset.mediaSubtypes.contains(.photoLive)
         videoDurationLabel.isHidden = asset.mediaType != .video
@@ -1080,17 +1138,7 @@ final class PhotoGridCell: UICollectionViewCell {
             priority: .photoGrid,
             isNetworkAccessAllowed: true,
             cacheResult: true,
-            cacheScope: .gridThumbnail,
-            progressHandler: { [weak self] progress, error, _, _ in
-                Task { @MainActor [weak self] in
-                    guard let self,
-                          self.representedIdentifier == asset.localIdentifier
-                    else { return }
-                    if error != nil || progress >= 1 {
-                        self.loadingIndicator.stopAnimating()
-                    }
-                }
-            }
+            cacheScope: .gridThumbnail
         ) { [weak self] image, info in
             let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
             let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
@@ -1106,9 +1154,10 @@ final class PhotoGridCell: UICollectionViewCell {
                       self.representedIdentifier == asset.localIdentifier,
                       self.representedTargetSize == targetSize
                 else { return }
-                self.loadingIndicator.stopAnimating()
                 // A degraded frame is still a valid displayable image; never
-                // replace an already-shown thumbnail with nothing.
+                // replace an already-shown thumbnail with nothing. No fade:
+                // fast scrolling would otherwise run dozens of simultaneous
+                // opacity animations for no benefit.
                 if let image {
                     self.imageView.image = image
                 }
@@ -1126,7 +1175,6 @@ final class PhotoGridCell: UICollectionViewCell {
         let sameTargetSize = representedTargetSize == targetSize
 
         if sameAsset, sameTargetSize, imageView.image != nil {
-            loadingIndicator.stopAnimating()
             setSelection(selectionMode: selectionMode, isSelected: isSelected)
             return
         }
@@ -1154,7 +1202,6 @@ final class PhotoGridCell: UICollectionViewCell {
 
     func releaseDecodedImage() {
         imageView.image = nil
-        loadingIndicator.stopAnimating()
         cancelRequest()
     }
 
@@ -1170,7 +1217,6 @@ final class PhotoGridCell: UICollectionViewCell {
         imageView.alpha = 1
         liveBadge.isHidden = true
         videoDurationLabel.isHidden = true
-        loadingIndicator.startAnimating()
         setSelection(selectionMode: selectionMode, isSelected: isSelected)
     }
 
@@ -1201,6 +1247,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
     let isActive: Bool
     let selectionMode: Bool
     let selectedIDs: Set<String>
+    let transitionCoordinator: PhotoGridTransitionCoordinator?
     let onOpen: (PHAsset, Int, UIImage?) -> Void
     let onToggleSelection: (PHAsset) -> Void
     let onFavorite: (PHAsset) -> Void
@@ -1212,6 +1259,42 @@ struct IndexedPhotoGridView: UIViewRepresentable {
     let onAddToQuickAlbum: (PHAsset, PhotoAlbum) -> Void
     let quickAlbums: () -> [PhotoAlbum]
 
+    init(
+        totalCount: Int,
+        store: PhotoLibraryStore,
+        isActive: Bool,
+        selectionMode: Bool,
+        selectedIDs: Set<String>,
+        transitionCoordinator: PhotoGridTransitionCoordinator? = nil,
+        onOpen: @escaping (PHAsset, Int, UIImage?) -> Void,
+        onToggleSelection: @escaping (PHAsset) -> Void,
+        onFavorite: @escaping (PHAsset) -> Void,
+        onShare: @escaping (PHAsset) -> Void,
+        onDelete: @escaping (PHAsset) -> Void,
+        onAddToAlbum: @escaping (PHAsset) -> Void,
+        onRemoveFromAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+        containingUserAlbums: @escaping (PHAsset) -> [PhotoAlbum],
+        onAddToQuickAlbum: @escaping (PHAsset, PhotoAlbum) -> Void,
+        quickAlbums: @escaping () -> [PhotoAlbum]
+    ) {
+        self.totalCount = totalCount
+        self.store = store
+        self.isActive = isActive
+        self.selectionMode = selectionMode
+        self.selectedIDs = selectedIDs
+        self.transitionCoordinator = transitionCoordinator
+        self.onOpen = onOpen
+        self.onToggleSelection = onToggleSelection
+        self.onFavorite = onFavorite
+        self.onShare = onShare
+        self.onDelete = onDelete
+        self.onAddToAlbum = onAddToAlbum
+        self.onRemoveFromAlbum = onRemoveFromAlbum
+        self.containingUserAlbums = containingUserAlbums
+        self.onAddToQuickAlbum = onAddToQuickAlbum
+        self.quickAlbums = quickAlbums
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(
             totalCount: totalCount,
@@ -1219,6 +1302,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             isActive: isActive,
             selectionMode: selectionMode,
             selectedIDs: selectedIDs,
+            transitionCoordinator: transitionCoordinator,
             onOpen: onOpen,
             onToggleSelection: onToggleSelection,
             onFavorite: onFavorite,
@@ -1247,6 +1331,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             isActive: isActive,
             selectionMode: selectionMode,
             selectedIDs: selectedIDs,
+            transitionCoordinator: transitionCoordinator,
             onOpen: onOpen,
             onToggleSelection: onToggleSelection,
             onFavorite: onFavorite,
@@ -1261,7 +1346,8 @@ struct IndexedPhotoGridView: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, UICollectionViewDataSource, UICollectionViewDelegate,
-        UICollectionViewDataSourcePrefetching, UICollectionViewDelegateFlowLayout {
+        UICollectionViewDataSourcePrefetching, UICollectionViewDelegateFlowLayout,
+        PhotoGridAssetProviding {
         private let pageSize = 240
         private var totalCount: Int
         private let store: PhotoLibraryStore
@@ -1283,6 +1369,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         private var selectionPanDriver: PhotoSelectionPanDriver?
         private var pinchDriver: PhotoGridPinchDriver?
         private weak var collectionView: UICollectionView?
+        private weak var transitionCoordinator: PhotoGridTransitionCoordinator?
 
         private var onOpen: (PHAsset, Int, UIImage?) -> Void
         private var onToggleSelection: (PHAsset) -> Void
@@ -1301,6 +1388,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
+            transitionCoordinator: PhotoGridTransitionCoordinator? = nil,
             onOpen: @escaping (PHAsset, Int, UIImage?) -> Void,
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
@@ -1318,6 +1406,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             needsReloadOnActivation = !isActive
             self.selectionMode = selectionMode
             self.selectedIDs = selectedIDs
+            self.transitionCoordinator = transitionCoordinator
             self.onOpen = onOpen
             self.onToggleSelection = onToggleSelection
             self.onFavorite = onFavorite
@@ -1343,6 +1432,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             resetCachingWindow()
             prefetchIndices.removeAll(keepingCapacity: false)
             cancelVisibleRequests(in: collectionView)
+            transitionCoordinator?.unregister(collectionView: collectionView)
             collectionView.isUserInteractionEnabled = false
             collectionView.dataSource = nil
             collectionView.delegate = nil
@@ -1425,6 +1515,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             isActive: Bool,
             selectionMode: Bool,
             selectedIDs: Set<String>,
+            transitionCoordinator: PhotoGridTransitionCoordinator? = nil,
             onOpen: @escaping (PHAsset, Int, UIImage?) -> Void,
             onToggleSelection: @escaping (PHAsset) -> Void,
             onFavorite: @escaping (PHAsset) -> Void,
@@ -1441,6 +1532,13 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             let oldCount = self.totalCount
             self.isActive = isActive
             collectionView.isUserInteractionEnabled = isActive
+            self.transitionCoordinator = transitionCoordinator
+            if let transitionCoordinator {
+                transitionCoordinator.register(
+                    collectionView: collectionView,
+                    assetProvider: self
+                )
+            }
             self.selectionMode = selectionMode
             self.selectedIDs = selectedIDs
             self.onOpen = onOpen
@@ -2010,6 +2108,16 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             offset.x = min(max(offset.x, minimumX), maximumX)
             offset.y = min(max(offset.y, minimumY), maximumY)
             collectionView.setContentOffset(offset, animated: false)
+        }
+
+        // MARK: PhotoGridAssetProviding
+
+        var assetCount: Int {
+            max(0, totalCount)
+        }
+
+        func assetIdentifier(at index: Int) -> String? {
+            assetsByIndex[index]?.localIdentifier
         }
     }
 }

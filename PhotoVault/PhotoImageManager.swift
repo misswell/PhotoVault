@@ -649,6 +649,17 @@ final class PhotoImageManager {
         scheduler.cancel(handle)
     }
 
+    /// How many neighbours the viewer warms on each side of the current photo.
+    /// Two extra pages cost little on a modern device and make a fast
+    /// left/right swipe land on an already-warm frame; a 4 GB device keeps the
+    /// narrower single-neighbour window so the small image cache is never
+    /// crowded out by photos the user is unlikely to reach.
+    static var viewerPrefetchRadius: Int {
+        ProcessInfo.processInfo.physicalMemory <= 4 * 1_024 * 1_024 * 1_024
+            ? 1
+            : 2
+    }
+
     /// Stop queued and running work at or below the supplied priority. The
     /// app uses this when backgrounding so the current viewer page can remain
     /// responsive while grid and look-ahead work is released.

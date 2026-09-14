@@ -314,6 +314,32 @@ def verify_against_reference(ref: SigLIP2Reference, image_ml, text_ml, image_inp
 
 
 # --------------------------------------------------------------------------
+def _empirical_case_folding(facts, checkpoint_dir) -> bool:
+    """Determine case folding by observation rather than by configuration.
+
+    HuggingFace's tokenizer wrapper reports ``do_lower_case=True`` for this
+    checkpoint, but the sentencepiece artifact does not fold case: ``CAT``,
+    ``Cat`` and ``cat`` map to three different ids, and the reference model
+    scores cos("CAT", "cat") = 0.86 rather than ~1.0.
+
+    The config flag describes an intent that the pipeline does not act on, so
+    writing it into the manifest would ship a false statement about the artifact
+    -- and any client that trusted it would lowercase its input and silently
+    stop matching the reference. Probing the artifact cannot be fooled that way.
+    """
+    try:
+        import sentencepiece as spm
+    except ImportError:  # pragma: no cover - sentencepiece is a hard dependency here
+        return bool(facts.do_lower_case)
+
+    processor = spm.SentencePieceProcessor()
+    processor.LoadFromFile(str(Path(checkpoint_dir) / "tokenizer.model"))
+    for upper, lower in (("CAT", "cat"), ("RECEIPT", "receipt"), ("PHOTO", "photo")):
+        if processor.EncodeAsIds(upper) != processor.EncodeAsIds(lower):
+            return False
+    return True
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT_DIR))
@@ -419,6 +445,10 @@ def main() -> int:
         )
 
     print("=== 6. writing model_manifest.json")
+    case_folding = _empirical_case_folding(facts, args.checkpoint)
+    print(f"empirical case folding: {case_folding} "
+          f"(HF config reported {facts.do_lower_case})")
+
     manifest = {
         "name": f"siglip2-base-patch16-256{suffix}",
         "source": facts.repo_id,
@@ -463,7 +493,7 @@ def main() -> int:
             "eosTokenId": facts.eos_token_id,
             "bosTokenId": facts.bos_token_id,
             "unkTokenId": facts.unk_token_id,
-            "doLowerCase": facts.do_lower_case,
+            "doLowerCase": case_folding,
             "appendEOS": True,
             "paddingSide": "right",
             "pooling": "last-position",

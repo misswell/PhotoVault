@@ -8,6 +8,9 @@ struct PhotoGridScreen: View {
     @ObservedObject var store: PhotoLibraryStore
     let album: PhotoAlbum?
 
+    /// Shared with the presentation bridge so the system zoom transition can
+    /// resolve the grid cell for whichever photo the viewer is showing.
+    @StateObject private var transitionCoordinator = PhotoGridTransitionCoordinator()
     @State private var selectionMode = false
     @State private var selectedAssets: [String: PHAsset] = [:]
     @State private var viewerRequest: PhotoViewerRequest?
@@ -48,6 +51,7 @@ struct PhotoGridScreen: View {
                             && !isShowingSlideshow,
                         selectionMode: selectionMode,
                         selectedIDs: Set(selectedAssets.keys),
+                        transitionCoordinator: transitionCoordinator,
                         onOpen: { context in
                             presentViewer(with: context)
                         },
@@ -71,6 +75,36 @@ struct PhotoGridScreen: View {
             }
         }
         .background(Color(uiColor: .systemGroupedBackground))
+        .background(
+            PhotoViewerPresentationBridge(
+                request: viewerRequest,
+                makeViewer: { request in
+                    PhotoViewerView(
+                        assets: .fetch(assets ?? PHFetchResult<PHAsset>()),
+                        initialIndex: request.index,
+                        store: store,
+                        album: album,
+                        initialPreviewImage: request.previewImage,
+                        initialAssetIdentifier: request.assetIdentifier,
+                        transitionState: transitionCoordinator.viewerTransitionState,
+                        onDismissRequested: dismissViewer
+                    )
+                },
+                transitionCoordinator: transitionCoordinator,
+                onDismissalCommitted: {
+                    // The zoom-out runs over a live grid from its commit
+                    // point: scrolling and tapping work before it finishes.
+                    isViewerTransitioning = false
+                },
+                onDismissalCancelled: {
+                    // An interactive pull-down bounced back: the viewer is
+                    // still on screen, so cover the grid again.
+                    isViewerTransitioning = true
+                },
+                onDismissed: handleViewerDismissed
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        )
         .navigationTitle(title)
         .onAppear {
             photoVaultTrace("grid screen appear title=\(title)")
@@ -166,23 +200,6 @@ struct PhotoGridScreen: View {
                     }
                     .disabled(selectedAssets.isEmpty)
                 }
-            }
-        }
-        .fullScreenCover(item: $viewerRequest, onDismiss: {
-            photoVaultTrace("photo viewer dismissed title=\(title)")
-            viewerRequest = nil
-            isViewerTransitioning = false
-        }) { request in
-            if let assets {
-                PhotoViewerView(
-                    assets: assets,
-                    initialIndex: request.index,
-                    store: store,
-                    album: album,
-                    initialPreviewImage: request.previewImage,
-                    initialAssetIdentifier: request.assetIdentifier,
-                    onDismissRequested: dismissViewer
-                )
             }
         }
         .fullScreenCover(isPresented: $isShowingSlideshow) {
@@ -344,6 +361,7 @@ struct PhotoGridScreen: View {
                 + "asset=\(photoVaultShortAssetID(context.assetIdentifier)) "
                 + "preview=\(context.previewImage != nil)"
         )
+        ViewerPerformanceTrace.gridTap(assetIdentifier: context.assetIdentifier)
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -358,6 +376,30 @@ struct PhotoGridScreen: View {
 
     private func dismissViewer() {
         photoVaultTrace("photo viewer dismiss committed title=\(title)")
+        // This is the only trigger for the UIKit dismissal: clearing the
+        // request is what makes `updateUIViewController` tell the bridge to
+        // run its zoom-out.
+        //
+        // The grid resumes in the same transaction. That is safe because the
+        // grid coordinator only calls `reloadData()` when the data source
+        // actually changed; otherwise it just re-enables the already-rendered
+        // cells, so the paused snapshot stays on screen under the transition
+        // instead of being replaced by a loading state.
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            viewerRequest = nil
+            isViewerTransitioning = false
+        }
+    }
+
+    /// UIKit reports that the dismissal (and its zoom-out) has finished. The
+    /// id tells us which viewer session ended: a newer open request (the user
+    /// tapped the next photo while the old zoom-out was still running) must
+    /// survive this callback so the bridge can present it.
+    private func handleViewerDismissed(_ dismissedID: UUID?) {
+        photoVaultTrace("photo viewer dismissed title=\(title)")
+        guard viewerRequest?.id == dismissedID else { return }
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
@@ -380,9 +422,13 @@ struct UnsortedPhotosScreen: View {
         )
     }
 
+    @StateObject private var transitionCoordinator = PhotoGridTransitionCoordinator()
     @State private var selectionMode = false
     @State private var selectedAssets: [String: PHAsset] = [:]
-    @State private var viewerIndex: Int?
+    /// One stable request per open session: the id is how `handleViewerDismissed`
+    /// tells "the session I opened" apart from a newer request the user made
+    /// while the previous zoom-out was still running.
+    @State private var viewerRequest: PhotoViewerRequest?
     @State private var isViewerTransitioning = false
     @State private var isShowingSlideshow = false
     @State private var isShowingAlbumPicker = false
@@ -395,6 +441,36 @@ struct UnsortedPhotosScreen: View {
     var body: some View {
         contentView
         .background(Color(uiColor: .systemGroupedBackground))
+        .background(
+            PhotoViewerPresentationBridge(
+                request: viewerRequest,
+                makeViewer: { request in
+                    IndexedPhotoViewerView(
+                        title: "未整理",
+                        totalCount: store.unsortedCount,
+                        initialIndex: request.index,
+                        store: store,
+                        initialPreviewImage: request.previewImage,
+                        initialAssetIdentifier: request.assetIdentifier,
+                        transitionState: transitionCoordinator.viewerTransitionState,
+                        onDismissRequested: dismissViewer
+                    )
+                },
+                transitionCoordinator: transitionCoordinator,
+                onDismissalCommitted: {
+                    // The zoom-out runs over a live grid from its commit
+                    // point: scrolling and tapping work before it finishes.
+                    isViewerTransitioning = false
+                },
+                onDismissalCancelled: {
+                    // An interactive pull-down bounced back: the viewer is
+                    // still on screen, so cover the grid again.
+                    isViewerTransitioning = true
+                },
+                onDismissed: handleViewerDismissed
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        )
         .navigationTitle("未整理")
         .onAppear {
             photoVaultTrace(
@@ -470,14 +546,6 @@ struct UnsortedPhotosScreen: View {
                 }
             }
         }
-        .fullScreenCover(
-            isPresented: viewerPresentationBinding,
-            onDismiss: {
-                photoVaultTrace("indexed photo viewer dismissed")
-                viewerIndex = nil
-                isViewerTransitioning = false
-            }
-        ) { viewerView }
         .fullScreenCover(isPresented: $isShowingSlideshow) {
             IndexedSlideshowView(
                 title: "未整理",
@@ -544,7 +612,8 @@ struct UnsortedPhotosScreen: View {
                     && !isShowingSlideshow,
                 selectionMode: selectionMode,
                 selectedIDs: Set(selectedAssets.keys),
-                onOpen: openViewer(asset:index:),
+                transitionCoordinator: transitionCoordinator,
+                onOpen: openViewer(asset:index:previewImage:),
                 onToggleSelection: toggleSelection(for:),
                 onFavorite: toggleFavorite(for:),
                 onShare: share(asset:),
@@ -561,41 +630,47 @@ struct UnsortedPhotosScreen: View {
         }
     }
 
-    @ViewBuilder
-    private var viewerView: some View {
-        if let viewerIndex {
-            IndexedPhotoViewerView(
-                title: "未整理",
-                totalCount: store.unsortedCount,
-                initialIndex: viewerIndex,
-                store: store,
-                onDismissRequested: dismissViewer
-            )
-        }
-    }
-
-    private var viewerPresentationBinding: Binding<Bool> {
-        Binding(
-            get: { viewerIndex != nil },
-            set: { if !$0 { viewerIndex = nil } }
+    private func openViewer(asset: PHAsset, index: Int, previewImage: UIImage?) {
+        photoVaultTrace(
+            "grid_tap index=\(index) "
+                + "asset=\(photoVaultShortAssetID(asset.localIdentifier)) "
+                + "preview=\(previewImage != nil)"
         )
-    }
-
-    private func openViewer(asset: PHAsset, index: Int) {
+        ViewerPerformanceTrace.gridTap(assetIdentifier: asset.localIdentifier)
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
             isViewerTransitioning = true
-            viewerIndex = index
+            viewerRequest = PhotoViewerRequest(
+                index: index,
+                assetIdentifier: asset.localIdentifier,
+                previewImage: previewImage
+            )
         }
     }
 
     private func dismissViewer() {
         photoVaultTrace("indexed photo viewer dismiss committed")
+        // Clearing the request is what tells the presentation bridge to run
+        // its dismissal; `handleViewerDismissed` only logs the completion.
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            viewerIndex = nil
+            viewerRequest = nil
+            isViewerTransitioning = false
+        }
+    }
+
+    /// UIKit reports that the dismissal (and its zoom-out) has finished. A
+    /// newer open request — the user tapped the next photo while this
+    /// zoom-out was still running — must survive this callback.
+    private func handleViewerDismissed(_ dismissedID: UUID?) {
+        photoVaultTrace("indexed photo viewer dismissed")
+        guard viewerRequest?.id == dismissedID else { return }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            viewerRequest = nil
             isViewerTransitioning = false
         }
     }

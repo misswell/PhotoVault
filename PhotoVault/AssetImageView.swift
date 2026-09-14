@@ -11,6 +11,11 @@ struct AssetImageView: View {
     let cacheScope: PhotoImageCacheScope
     let usesPhotoKitCaching: Bool
     let onLoadStateChange: ((Bool) -> Void)?
+    /// Overrides the default canvas behind the image. The zoom-transitioned
+    /// viewer passes `.clear` so the system dimming shows through the
+    /// letterbox and the zoom-out morphs the photo — not an opaque
+    /// full-screen rectangle — back into its grid cell.
+    let canvasBackground: Color?
 
     @State private var image: UIImage?
     @State private var requestHandle: PhotoRequestHandle?
@@ -19,6 +24,10 @@ struct AssetImageView: View {
     @State private var loadAttempt = 0
     @State private var activeRequestKey: String?
     @State private var displayedAssetIdentifier: String?
+    /// Set once the asset has been on screen for longer than
+    /// `AppLoadingPolicy.indicatorDelay` without a usable frame. Until then a
+    /// blank page stays black instead of flashing a spinner.
+    @State private var showsDelayedLoading = false
 
     private var requestKey: String {
         "\(asset.localIdentifier)-\(Int(targetSize.width))-\(Int(targetSize.height))-\(contentMode.rawValue)"
@@ -33,7 +42,8 @@ struct AssetImageView: View {
         cacheScope: PhotoImageCacheScope = .standard,
         usesPhotoKitCaching: Bool = true,
         initialImage: UIImage? = nil,
-        onLoadStateChange: ((Bool) -> Void)? = nil
+        onLoadStateChange: ((Bool) -> Void)? = nil,
+        canvasBackground: Color? = nil
     ) {
         self.asset = asset
         self.targetSize = targetSize
@@ -43,6 +53,7 @@ struct AssetImageView: View {
         self.cacheScope = cacheScope
         self.usesPhotoKitCaching = usesPhotoKitCaching
         self.onLoadStateChange = onLoadStateChange
+        self.canvasBackground = canvasBackground
         // Seed the first frame from an already-decoded thumbnail (typically
         // the grid cell the viewer was opened from). Binding the displayed
         // identifier at the same time keeps the "same asset" branch in
@@ -57,9 +68,10 @@ struct AssetImageView: View {
         ZStack {
             // A viewer uses aspectFit over a black canvas, while grid cells
             // retain the grouped-background placeholder used by Photos.
-            contentMode == .aspectFit
-                ? Color.black
-                : Color(uiColor: .secondarySystemGroupedBackground)
+            canvasBackground
+                ?? (contentMode == .aspectFit
+                    ? Color.black
+                    : Color(uiColor: .secondarySystemGroupedBackground))
 
             if let image {
                 if contentMode == .aspectFit {
@@ -86,7 +98,9 @@ struct AssetImageView: View {
                 }
                 .foregroundStyle(.secondary)
                 .accessibilityLabel(loadError)
-            } else {
+            } else if showsDelayedLoading {
+                // Only reached when there is no image at all: a seeded grid
+                // thumbnail or a previously displayed frame suppresses this.
                 if let loadProgress, loadProgress > 0, loadProgress < 1 {
                     ProgressView(value: loadProgress)
                         .progressViewStyle(.circular)
@@ -144,11 +158,21 @@ struct AssetImageView: View {
         }
         loadProgress = nil
         loadError = nil
+        // Any frame already on screen (a seeded grid thumbnail, a cached page,
+        // a kept frame for the same asset) is enough to keep the spinner away
+        // forever. Only a genuinely blank page arms the delayed indicator.
+        showsDelayedLoading = false
+        if image == nil {
+            armDelayedLoadingIndicator(requestKey: requestKey)
+        }
         // "Ready" means the viewer has a frame a user can look at, not that
         // the final PhotoKit result has landed. A seeded preview (or a kept
         // frame for the same asset) is already usable, so do not report the
         // page as blank and flash a spinner over an image that is on screen.
         onLoadStateChange?(image != nil)
+        if contentMode == .aspectFit, image != nil {
+            ViewerPerformanceTrace.viewerFirstFrame()
+        }
 
         if usesPhotoKitCaching {
             PhotoImageManager.shared.startCaching(
@@ -200,6 +224,11 @@ struct AssetImageView: View {
                 }
                 self.loadError = nil
                 self.loadProgress = 1
+                self.showsDelayedLoading = false
+                self.traceViewerDelivery(
+                    isDegraded: (info?[PHImageResultIsDegradedKey] as? Bool) ?? false,
+                    didSetImage: true
+                )
                 if self.shouldAnimateAppearance {
                     withAnimation(.easeOut(duration: 0.16)) {
                         self.image = image
@@ -212,6 +241,35 @@ struct AssetImageView: View {
                 // the slideshow never advances into a blank page.
                 self.onLoadStateChange?(true)
             }
+        }
+    }
+
+    /// `@autoclosure` so call sites that would build a string every frame stay
+    /// free in release builds.
+    private func traceViewerDelivery(isDegraded: Bool, didSetImage: Bool) {
+        guard contentMode == .aspectFit else { return }
+        if didSetImage, isDegraded {
+            ViewerPerformanceTrace.viewerFirstFrame()
+        } else if didSetImage {
+            ViewerPerformanceTrace.viewerHighQualityReady()
+        } else if image != nil {
+            // The request finished without replacing the frame — the seeded
+            // grid thumbnail (or a kept frame) is what the user is seeing.
+            ViewerPerformanceTrace.viewerFirstFrame()
+        }
+    }
+
+    /// Arm the delayed spinner for a blank page. A local thumbnail resolves
+    /// well before the deadline, so this only fires for genuinely slow sources
+    /// (iCloud download, stalled network) where feedback is actually useful.
+    private func armDelayedLoadingIndicator(requestKey: String) {
+        Task { @MainActor in
+            try? await Task.sleep(for: AppLoadingPolicy.indicatorDelay)
+            guard activeRequestKey == requestKey,
+                  image == nil,
+                  loadError == nil
+            else { return }
+            showsDelayedLoading = true
         }
     }
 
@@ -263,6 +321,7 @@ struct ZoomableAssetView: View {
     let contentMode: PHImageContentMode
     let requestPriority: PhotoRequestPriority
     let initialImage: UIImage?
+    let canvasBackground: Color?
     let onLoadStateChange: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
 
@@ -272,6 +331,7 @@ struct ZoomableAssetView: View {
         contentMode: PHImageContentMode = .aspectFit,
         requestPriority: PhotoRequestPriority = .viewer,
         initialImage: UIImage? = nil,
+        canvasBackground: Color? = nil,
         onLoadStateChange: ((Bool) -> Void)? = nil,
         onZoomingChanged: ((Bool) -> Void)? = nil
     ) {
@@ -280,6 +340,7 @@ struct ZoomableAssetView: View {
         self.contentMode = contentMode
         self.requestPriority = requestPriority
         self.initialImage = initialImage
+        self.canvasBackground = canvasBackground
         self.onLoadStateChange = onLoadStateChange
         self.onZoomingChanged = onZoomingChanged
     }
@@ -299,7 +360,8 @@ struct ZoomableAssetView: View {
                 contentMode: contentMode,
                 requestPriority: requestPriority,
                 initialImage: initialImage,
-                onLoadStateChange: onLoadStateChange
+                onLoadStateChange: onLoadStateChange,
+                canvasBackground: canvasBackground
             )
             .frame(width: proxy.size.width, height: proxy.size.height)
             .scaleEffect(scale)
