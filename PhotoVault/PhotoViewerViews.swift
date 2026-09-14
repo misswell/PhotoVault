@@ -1678,6 +1678,9 @@ struct PhotoViewerView: View {
             Text("\(currentIndex + 1) / \(assets.count)")
                 .font(.subheadline.weight(.medium))
                 .monospacedDigit()
+                // Lets a UI test assert *which* photo the viewer is showing,
+                // not merely that some viewer opened.
+                .accessibilityIdentifier("viewer-counter")
 
             if currentAsset?.hasPlayableAudio == true {
                 MediaAudioButton()
@@ -3373,6 +3376,9 @@ struct IndexedPhotoViewerView: View {
             Text("\(min(currentIndex + 1, max(1, totalCount))) / \(totalCount)")
                 .font(.subheadline.weight(.medium))
                 .monospacedDigit()
+                // Lets a UI test assert *which* photo the viewer is showing,
+                // not merely that some viewer opened.
+                .accessibilityIdentifier("viewer-counter")
 
             if currentAsset?.hasPlayableAudio == true {
                 MediaAudioButton()

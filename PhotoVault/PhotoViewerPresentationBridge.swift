@@ -80,6 +80,48 @@ final class PhotoGridTransitionCoordinator: ObservableObject {
         self.assetProvider = nil
     }
 
+    /// True when `view` is the registered grid or one of its ancestors, so
+    /// disabling `view`'s touches would disable the grid's too.
+    ///
+    /// The dismissal override walks up from the viewer looking for the highest
+    /// view that is still the viewer's own; this is the fence that stops it
+    /// from crossing into a shared ancestor (the transition root, a SwiftUI
+    /// wrapper, the window) and taking the grid down with it.
+    func containsRegisteredGrid(in view: UIView) -> Bool {
+        guard let collectionView else { return false }
+        return collectionView === view || collectionView.isDescendant(of: view)
+    }
+
+    /// Re-enable the grid's touches the moment a dismissal commits, instead of
+    /// waiting for the next SwiftUI update to push `isActive` back down. The
+    /// SwiftUI state still changes; this only removes the one-frame gap during
+    /// which the zoom-out is already running over a grid that cannot be touched.
+    func setGridInteractionEnabled(_ enabled: Bool) {
+        collectionView?.isUserInteractionEnabled = enabled
+    }
+
+    #if DEBUG
+    /// The single question this fix turns on: while the zoom-out is running,
+    /// would a touch at a grid cell reach the grid? Asked with a real
+    /// `hitTest` so the answer reflects the actual view stack rather than the
+    /// state the bridge believes it set.
+    func debugHitTestProbe() -> String {
+        guard let collectionView, let window = collectionView.window else {
+            return "grid=no-window"
+        }
+        let point = collectionView.convert(
+            CGPoint(x: collectionView.bounds.midX, y: collectionView.bounds.midY),
+            to: window
+        )
+        guard let hit = window.hitTest(point, with: nil) else {
+            return "grid=hitTest-nil enabled=\(collectionView.isUserInteractionEnabled)"
+        }
+        let reached = hit === collectionView || hit.isDescendant(of: collectionView)
+        return "grid=reached:\(reached) hit=\(String(describing: type(of: hit))) "
+            + "enabled=\(collectionView.isUserInteractionEnabled)"
+    }
+    #endif
+
     /// The view the system should zoom from or back to. Returning nil makes
     /// UIKit fall back to its default transition; the zoom transition is an
     /// enhancement and must never block opening or closing the viewer.
@@ -163,21 +205,6 @@ final class PhotoGridTransitionCoordinator: ObservableObject {
 /// `fullScreenCover` cannot do this: SwiftUI owns the hosting controller and
 /// applies its presentation immediately, so `preferredTransition` would be set
 /// too late. This bridge builds the hosting controller itself.
-/// DEBUG-only touch observer for the zoom-out animation. Sits at window
-/// level above the presentation container and passes every touch through;
-/// its only job is counting how many hit-tests arrive mid-animation so a
-/// "taps don't work until the animation ends" report can be split into
-/// "events never reach the window" vs "our view stack swallows them".
-final class MidDismissTouchProbe: UIView {
-    nonisolated(unsafe) static var touchCount = 0
-    nonisolated(unsafe) static var current: MidDismissTouchProbe?
-
-    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
-        MidDismissTouchProbe.touchCount += 1
-        return nil
-    }
-}
-
 struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentable {
     let request: PhotoViewerRequest?
     let makeViewer: (PhotoViewerRequest) -> Viewer
@@ -239,52 +266,125 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
     /// precisely because a began-but-cancelled dismissal leaves the viewer
     /// on screen.
     final class PhotoViewerHostingController<Root: View>: UIHostingController<Root> {
-        var onVanishedWithoutCallback: (() -> Void)?
-        /// A dismissal transition started (commit OR an interactive drag
-        /// beginning). Only a real dismissal also passes `isBeingDismissed`;
-        /// a share sheet covering this viewer does not.
-        var onDismissTransitionBegan: (() -> Void)?
-        /// An interactive pull-down that began was cancelled: the viewer
-        /// stays on screen and everything the began hook released must be
-        /// restored.
+        /// Carries the controller itself so a late `viewDidDisappear` from an
+        /// already-settled viewer cannot be mistaken for the current one.
+        var onVanishedWithoutCallback: ((UIViewController) -> Void)?
+        /// A dismissal transition is starting; `interactive` says whether UIKit
+        /// is driving it from the zoom transition's pull-down gesture, which
+        /// can still be cancelled.
+        var onDismissTransitionBegan: ((_ interactive: Bool) -> Void)?
+        /// An interactive pull-down that began was cancelled: the viewer stays
+        /// on screen and everything the began hook released must be restored.
         var onDismissTransitionCancelled: (() -> Void)?
-        private var isDismissTransitionActive = false
+        /// An interactive pull-down passed the commit threshold: the zoom-out
+        /// will finish, so the grid can come back while it plays.
+        var onDismissTransitionCommitted: (() -> Void)?
+        /// DEBUG: lets the bridge ask the hit-test question from inside the
+        /// transition's own animation block, rather than before it starts.
+        var onTransitionAnimationStep: (() -> Void)?
+        /// Only a drag that actually began may report an outcome.
+        private var isInteractiveDismissActive = false
 
         override func viewWillDisappear(_ animated: Bool) {
             super.viewWillDisappear(animated)
-            if isBeingDismissed {
-                isDismissTransitionActive = true
-                onDismissTransitionBegan?()
+            // A share sheet covering the viewer also reaches here; only a real
+            // dismissal has `isBeingDismissed` set.
+            guard isBeingDismissed else { return }
+
+            guard let coordinator = transitionCoordinator else {
+                // Nothing to observe, and a dismissal is by definition not
+                // cancellable at this point.
+                onDismissTransitionBegan?(false)
+                onDismissTransitionCommitted?()
+                return
+            }
+
+            let interactive = coordinator.initiallyInteractive
+            if interactive { isInteractiveDismissActive = true }
+            onDismissTransitionBegan?(interactive)
+
+            // DEBUG: step inside the transition's animation block so the
+            // "can the grid be touched yet?" question is answered while the
+            // zoom-out is actually running, not before or after it.
+            coordinator.animate(alongsideTransition: { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.onTransitionAnimationStep?()
+                }
+            }, completion: nil)
+
+            guard interactive else {
+                // Close button and every programmatic exit: not cancellable, so
+                // the dismissal is committed the moment it starts.
+                onDismissTransitionCommitted?()
+                return
+            }
+
+            // ⚠️ `viewWillDisappear` fires when the DRAG starts, so it is not a
+            // commit signal — a short drag returns through `viewWillAppear`. The
+            // transition coordinator is the only trustworthy source: it reports
+            // once when the interaction ends, and `isCancelled` says which way.
+            coordinator.notifyWhenInteractionChanges { [weak self] context in
+                MainActor.assumeIsolated {
+                    guard let self, self.isInteractiveDismissActive else { return }
+                    self.isInteractiveDismissActive = false
+                    if context.isCancelled {
+                        self.onDismissTransitionCancelled?()
+                    } else {
+                        self.onDismissTransitionCommitted?()
+                    }
+                }
             }
         }
 
         override func viewWillAppear(_ animated: Bool) {
             super.viewWillAppear(animated)
-            if isDismissTransitionActive {
-                isDismissTransitionActive = false
+            // Fallback for a cancelled drag whose coordinator callback never
+            // arrived: the viewer is coming back and must be reachable again.
+            // Idempotent — the bridge ignores a cancel when nothing is in
+            // flight.
+            if isInteractiveDismissActive {
+                isInteractiveDismissActive = false
                 onDismissTransitionCancelled?()
             }
         }
 
         override func viewDidDisappear(_ animated: Bool) {
             super.viewDidDisappear(animated)
-            isDismissTransitionActive = false
-            onVanishedWithoutCallback?()
+            isInteractiveDismissActive = false
+            onVanishedWithoutCallback?(self)
         }
     }
 
     @MainActor
     final class Coordinator: NSObject, UIAdaptivePresentationControllerDelegate {
+        /// How far the current dismissal has got.
+        ///
+        /// The old code collapsed "a drag began" and "the viewer is going away"
+        /// into one boolean, so a cancelled pull-down was indistinguishable from
+        /// a committed close — and the grid was released for both.
+        private enum DismissalPhase {
+            case idle
+            /// An interactive pull-down is being dragged. UIKit may still
+            /// cancel it, so nothing may be released yet.
+            case interactive
+            /// The dismissal will finish. The zoom-out is running and the grid
+            /// may take touches again.
+            case committed
+        }
+
         private weak var presenter: UIViewController?
         private weak var hosted: UIViewController?
+        /// The session currently presented *or* dismissing. Cleared only when
+        /// the dismissal settles, which is what lets `sync` recognise a new
+        /// open request as "arrived while the old viewer was on its way out".
         private var presentedRequestID: UUID?
         private var generation = 0
         private var pendingRequest: PhotoViewerRequest?
-        /// Set when a dismissal transition has committed (zoom-out in
-        /// flight): a new open request supersedes the dying session instead
-        /// of being ignored.
-        private var isDismissTransitionInFlight = false
-        private var isScheduledPresentRetry = false
+        private var dismissalPhase: DismissalPhase = .idle
+        /// The highest ancestor that belongs to the viewer alone and was
+        /// therefore safe to take out of hit testing. Never the grid, its
+        /// ancestors, the window or the shared transition root.
+        private weak var outgoingInteractionRoot: UIView?
         private var makeViewer: ((PhotoViewerRequest) -> PhotoViewerHostingController<Viewer>)?
         private weak var transitionCoordinator: PhotoGridTransitionCoordinator?
         /// Carries the id of the viewer session that finished dismissing, so
@@ -311,10 +411,9 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             hosted = nil
             presentedRequestID = nil
             pendingRequest = nil
-            isDismissTransitionInFlight = false
-            isScheduledPresentRetry = false
+            dismissalPhase = .idle
             makeViewer = nil
-            endDismissalInteractionOverride()
+            restoreViewerInteraction()
         }
 
         func sync(
@@ -334,22 +433,25 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             if presentedRequestID == nil {
                 pendingRequest = request
                 flushPendingRequest()
-            } else if isDismissTransitionInFlight,
-                      request.id != presentedRequestID {
-                // The old viewer is zooming out and the user already tapped
-                // the next photo: supersede the dying session instead of
-                // dropping the request. The queued open presents the moment
-                // the presenter is free. The dismissing session's OWN request
-                // also re-arrives here whenever the wake-the-grid callback
-                // triggers a SwiftUI update — same id, so it is ignored.
-                presentedRequestID = nil
+            } else if request.id != presentedRequestID,
+                      dismissalPhase != .idle {
+                // The old viewer is on its way out and the user already tapped
+                // the next photo: hold the request instead of dropping it. The
+                // dismissal completion flushes it — no polling. The dying
+                // session's OWN request also re-arrives here whenever the
+                // wake-the-grid callback triggers a SwiftUI update; same id, so
+                // it is ignored.
                 pendingRequest = request
-                flushPendingRequest()
+                photoVaultTrace("pending_viewer_request_queued")
             }
-            // A different request while a viewer is simply on screen is
-            // ignored: the viewer is full-screen and owns its own navigation.
+            // A different request while a viewer is simply on screen
+            // (phase == .idle) is ignored: the viewer is full-screen and owns
+            // its own navigation.
         }
 
+        /// Presents the queued request. Only ever called when no viewer session
+        /// is outstanding — the open path, or a dismissal completion — so there
+        /// is no retry loop here.
         private func flushPendingRequest() {
             guard presentedRequestID == nil,
                   let request = pendingRequest,
@@ -359,32 +461,21 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                   presenter.view.window != nil
             else { return }
 
-            // A previous dismissal may still be animating out. UIKit cannot
-            // start a new presentation from this presenter until it is fully
-            // gone, so keep the request queued and retry on the main queue
-            // instead of dropping it.
-            if presenter.presentedViewController != nil {
-                schedulePresentRetry()
+            guard presenter.presentedViewController == nil else {
+                // Something is still animating out. The request stays queued;
+                // the dismissal completion re-enters here.
+                photoVaultTrace("pending_viewer_request_deferred")
                 return
             }
 
             pendingRequest = nil
+            photoVaultTrace("pending_viewer_request_presented")
             present(
                 request: request,
                 presenter: presenter,
                 makeViewer: makeViewer,
                 transitionCoordinator: transitionCoordinator
             )
-        }
-
-        private func schedulePresentRetry() {
-            guard !isScheduledPresentRetry else { return }
-            isScheduledPresentRetry = true
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                isScheduledPresentRetry = false
-                flushPendingRequest()
-            }
         }
 
         private func present(
@@ -420,7 +511,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             )
 
             presentedRequestID = request.id
-            isDismissTransitionInFlight = false
+            dismissalPhase = .idle
             generation &+= 1
             let currentGeneration = generation
 
@@ -437,17 +528,23 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                 // a presentation is active, reconcile app state. Idempotent —
                 // a programmatic dismissal already cleared the bookkeeping by
                 // the time this runs.
-                hosting.onVanishedWithoutCallback = { [weak self] in
-                    self?.hostedViewDidVanish()
+                hosting.onVanishedWithoutCallback = { [weak self] controller in
+                    self?.hostedViewDidVanish(controller: controller)
                 }
-                // Commit point of every dismissal: the zoom-out now runs over
-                // a live grid.
-                hosting.onDismissTransitionBegan = { [weak self] in
-                    self?.dismissTransitionBegan()
+                hosting.onDismissTransitionBegan = { [weak self] interactive in
+                    self?.dismissTransitionBegan(interactive: interactive)
                 }
                 hosting.onDismissTransitionCancelled = { [weak self] in
                     self?.dismissTransitionCancelled()
                 }
+                hosting.onDismissTransitionCommitted = { [weak self] in
+                    self?.dismissTransitionCommitted()
+                }
+                #if DEBUG
+                hosting.onTransitionAnimationStep = { [weak self] in
+                    self?.debugProbeMidTransition()
+                }
+                #endif
                 photoVaultTrace("viewer_present_complete")
                 Self.debugDumpTransitionGestures(
                     presentationController: hosting.presentationController
@@ -455,151 +552,183 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             }
         }
 
-        /// A dismissal started — either a committed close-button zoom-out or
-        /// the BEGINNING of an interactive pull-down drag (UIKit fires
-        /// `viewWillDisappear` at drag start; a cancel comes back through
-        /// `dismissTransitionCancelled`). Hand touches straight through the
-        /// presentation container so the user can scroll the grid — or open
-        /// the next photo — without waiting for the animation.
-        private func dismissTransitionBegan() {
-            photoVaultTrace("viewer_dismiss_transition_began")
-            isDismissTransitionInFlight = true
-            releasePresentationContainerInteraction()
+        /// A dismissal transition is starting. `interactive` distinguishes the
+        /// system's pull-down (still cancellable) from a close button or any
+        /// programmatic exit (already committed) — see `DismissalPhase`.
+        private func dismissTransitionBegan(interactive: Bool) {
+            photoVaultTrace(
+                "viewer_dismiss_transition_began interactive=\(interactive)"
+            )
+            guard dismissalPhase == .idle else { return }
+            dismissalPhase = interactive ? .interactive : .committed
+        }
+
+        /// The zoom-out will finish: the grid may take touches again and the
+        /// viewer's own subtree stops hit testing, so the rest of the animation
+        /// plays over a fully live grid. Nothing here touches alpha, transform,
+        /// frame or the transition itself.
+        private func dismissTransitionCommitted() {
+            guard dismissalPhase != .committed else { return }
+            photoVaultTrace("viewer_dismiss_committed")
+            dismissalPhase = .committed
+
+            // Re-enable the grid directly as well as through SwiftUI state:
+            // the state update lands a frame later, and the whole point is that
+            // scrolling and tapping work while the zoom-out is still running.
+            transitionCoordinator?.setGridInteractionEnabled(true)
+            photoVaultTrace("grid_interaction_enabled")
+
+            let root = outgoingViewerInteractionRoot()
+            outgoingInteractionRoot = root
+            root?.isUserInteractionEnabled = false
+            photoVaultTrace(
+                "viewer_interaction_root_disabled "
+                    + "class=\(root.map { String(describing: type(of: $0)) } ?? "nil")"
+            )
+            #if DEBUG
+            debugTraceInteractionHierarchy()
+            photoVaultTrace(
+                "dismiss_probe "
+                    + (transitionCoordinator?.debugHitTestProbe() ?? "no-coordinator")
+            )
+            // Only non-nil on the interactive path, which commits mid-transition.
+            installMidTransitionProbe()
+            #endif
+
             onDismissalCommitted?()
         }
 
-        /// An interactive pull-down was cancelled: the viewer stays on
-        /// screen, so everything `dismissTransitionBegan` released must be
-        /// restored — a disabled container here would leave a live viewer
-        /// that no touch can reach.
+        /// An interactive pull-down was cancelled: the viewer stays on screen,
+        /// so everything the commit path released must be restored — a disabled
+        /// viewer here would leave a live viewer that no touch can reach.
         private func dismissTransitionCancelled() {
-            guard isDismissTransitionInFlight else { return }
-            photoVaultTrace("viewer_dismiss_transition_cancelled")
-            isDismissTransitionInFlight = false
-            endDismissalInteractionOverride()
-            restorePresentationContainerInteraction()
+            guard dismissalPhase != .idle else { return }
+            photoVaultTrace("viewer_dismiss_cancelled")
+            dismissalPhase = .idle
+            restoreViewerInteraction()
+            transitionCoordinator?.setGridInteractionEnabled(false)
             onDismissalCancelled?()
         }
 
-        private var interactionReassertTimer: Timer?
-        private var interactionReassertTicksRemaining = 0
-
-        private func releasePresentationContainerInteraction() {
-            guard let container = presentationContainer() else { return }
-            container.isUserInteractionEnabled = false
-            #if DEBUG
-            installMidDismissProbe(container: container)
-            #endif
-            // UIKit's transition bookkeeping can re-enable the container when
-            // the interactive drag commits — its setup runs AFTER the
-            // `viewWillDisappear` hook that disabled it, and a re-enabled
-            // container swallows every touch for the rest of the zoom-out
-            // (the "动画没结束就不能操作" symptom). Re-assert the disabled
-            // state for the first moment of the animation; the container is
-            // torn down with the dismissal anyway.
-            interactionReassertTimer?.invalidate()
-            interactionReassertTicksRemaining = 10
-            interactionReassertTimer = Timer.scheduledTimer(
-                withTimeInterval: 0.08,
-                repeats: true
-            ) { [weak self] _ in
-                MainActor.assumeIsolated {
-                    self?.interactionReassertTick()
-                }
-            }
+        /// Give the viewer's touches back and cover the grid again.
+        private func restoreViewerInteraction() {
+            outgoingInteractionRoot?.isUserInteractionEnabled = true
+            outgoingInteractionRoot = nil
         }
 
-        @MainActor
-        private func interactionReassertTick() {
-            defer {
-                interactionReassertTicksRemaining -= 1
-                if interactionReassertTicksRemaining <= 0 {
-                    interactionReassertTimer?.invalidate()
-                    interactionReassertTimer = nil
+        /// The highest view that is still the viewer's own branch of the
+        /// hierarchy — the only thing safe to take out of hit testing.
+        ///
+        /// Walking straight up to the window is what broke this before: the
+        /// view below the window (UITransitionView or a SwiftUI wrapper) can be
+        /// a shared ancestor of the viewer *and* the grid, so disabling it
+        /// disabled the grid too and nothing responded until the animation
+        /// ended. Stop as soon as the next ancestor would contain the grid.
+        private func outgoingViewerInteractionRoot() -> UIView? {
+            guard let hostedView = hosted?.view
+                ?? presenter?.presentedViewController?.view
+            else { return nil }
+
+            var candidate = hostedView
+            var current = hostedView.superview
+            while let view = current, !(view is UIWindow) {
+                if transitionCoordinator?.containsRegisteredGrid(in: view) == true {
+                    break
                 }
+                candidate = view
+                current = view.superview
             }
-            guard isDismissTransitionInFlight,
-                  let container = presentationContainer()
-            else {
-                interactionReassertTimer?.invalidate()
-                interactionReassertTimer = nil
+            return candidate
+        }
+
+        #if DEBUG
+        /// The hit-test question asked from inside the running transition.
+        private func debugProbeMidTransition() {
+            // An interactive drag registers this at DRAG START, when the viewer
+            // is still supposed to own the touch (the drag can still cancel).
+            // Only a committed dismissal may report a hit-test answer.
+            guard dismissalPhase == .committed else {
+                photoVaultTrace("dismiss_probe_mid_transition phase=interactive")
                 return
             }
-            if container.isUserInteractionEnabled {
+            photoVaultTrace(
+                "dismiss_probe_mid_transition "
+                    + (transitionCoordinator?.debugHitTestProbe() ?? "no-coordinator")
+            )
+        }
+
+        /// DEBUG: the interactive path only reaches `.committed` while the
+        /// transition is already running, so it has to register here rather
+        /// than in `viewWillDisappear`.
+        private func installMidTransitionProbe() {
+            guard let transition = hosted?.transitionCoordinator else { return }
+            transition.animate(alongsideTransition: { [weak self] _ in
+                MainActor.assumeIsolated { self?.debugProbeMidTransition() }
+            }, completion: nil)
+        }
+        #endif
+
+        #if DEBUG
+        /// One-shot census of the dismissal hierarchy: for every ancestor of
+        /// the viewer, whether it also contains the grid. This is the evidence
+        /// that the interaction override stayed inside the viewer's branch.
+        private func debugTraceInteractionHierarchy() {
+            guard let hostedView = hosted?.view else { return }
+            var view: UIView? = hostedView
+            var depth = 0
+            while let current = view, !(current is UIWindow) {
+                let containsGrid = transitionCoordinator?
+                    .containsRegisteredGrid(in: current) == true
                 photoVaultTrace(
-                    "container_interaction_reasserted (UIKit re-enabled it)"
+                    "dismiss_hierarchy depth=\(depth) "
+                        + "class=\(String(describing: type(of: current))) "
+                        + "containsGrid=\(containsGrid) "
+                        + "interaction=\(current.isUserInteractionEnabled)"
                 )
-                container.isUserInteractionEnabled = false
+                view = current.superview
+                depth += 1
             }
         }
-
-        private func stopInteractionReassert() {
-            interactionReassertTimer?.invalidate()
-            interactionReassertTimer = nil
-        }
-
-        /// DEBUG: a window-level pass-through observer above the transition
-        /// view, so mid-animation touches can be counted.
-        fileprivate func installMidDismissProbe(container: UIView) {
-            MidDismissTouchProbe.current?.removeFromSuperview()
-            guard let window = container.window else { return }
-            MidDismissTouchProbe.touchCount = 0
-            let probe = MidDismissTouchProbe(frame: window.bounds)
-            probe.isUserInteractionEnabled = true
-            probe.backgroundColor = .clear
-            window.addSubview(probe)
-            MidDismissTouchProbe.current = probe
-        }
-
-        fileprivate func endDismissalInteractionOverride() {
-            stopInteractionReassert()
-            #if DEBUG
-            MidDismissTouchProbe.current?.removeFromSuperview()
-            MidDismissTouchProbe.current = nil
-            if MidDismissTouchProbe.touchCount > 0 {
-                photoVaultTrace(
-                    "mid_dismiss_touches=\(MidDismissTouchProbe.touchCount)"
-                )
-            }
-            MidDismissTouchProbe.touchCount = 0
-            #endif
-        }
-
-        private func restorePresentationContainerInteraction() {
-            guard let container = presentationContainer() else { return }
-            container.isUserInteractionEnabled = true
-        }
-
-        /// The presentation container is the view directly below the window
-        /// (UITransitionView for modal presentations). Walking all the way up
-        /// would reach the window itself — disabling that would freeze the
-        /// whole app.
-        private func presentationContainer() -> UIView? {
-            guard let hosted else { return nil }
-            var container = hosted.view.superview
-            while let parent = container?.superview, !(parent is UIWindow) {
-                container = parent
-            }
-            return container
-        }
+        #endif
 
         /// Runs when the presented viewer's view disappeared but the bridge
         /// still had it registered — i.e. UIKit dismissed it without our
-        /// `dismissIfNeeded` completing. Reset the bookkeeping exactly like
-        /// the programmatic path does, and tell the screen so the grid wakes
-        /// back up.
-        private func hostedViewDidVanish() {
-            guard presentedRequestID != nil else { return }
-            let dismissedID = presentedRequestID
+        /// `dismissIfNeeded` completing (the system's interactive pull-down).
+        /// `controller` identifies the session: a late `viewDidDisappear` from
+        /// an already-settled viewer must not tear down the one that replaced
+        /// it.
+        private func hostedViewDidVanish(controller: UIViewController) {
+            guard hosted === controller, let dismissedID = presentedRequestID
+            else { return }
             photoVaultTrace("viewer_hosted_view_did_vanish")
-            presentedRequestID = nil
-            isDismissTransitionInFlight = false
-            hosted = nil
-            endDismissalInteractionOverride()
-            generation &+= 1
             ViewerPerformanceTrace.viewerDismissStart()
+            finishDismissal(sessionID: dismissedID)
+        }
+
+        /// The single settle point of every dismissal. The programmatic
+        /// `dismiss` completion, UIKit ending the presentation on its own and
+        /// the presentation-controller delegate all funnel here, and matching
+        /// the session id makes it idempotent so the routes cannot fight each
+        /// other.
+        private func finishDismissal(sessionID: UUID?) {
+            guard let sessionID, presentedRequestID == sessionID else { return }
+            photoVaultTrace("viewer_dismiss_complete")
+            presentedRequestID = nil
+            // Always hand the viewer's touches back before dropping the last
+            // reference to it: leaving a view disabled here would strand a live
+            // viewer that nothing can reach.
+            restoreViewerInteraction()
+            hosted = nil
+            dismissalPhase = .idle
+            generation &+= 1
             ViewerPerformanceTrace.viewerDismissEnd()
-            onDismissed?(dismissedID)
+
+            // The presenter is free again, so this is the event that opens the
+            // photo the user tapped while the previous zoom-out was running —
+            // no polling. Present it before reporting the old session as
+            // ended, so a stale callback cannot discard the queued request.
+            flushPendingRequest()
+            onDismissed?(sessionID)
         }
 
         private static func zoomTransition(
@@ -676,40 +805,43 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         }
 
         private func dismissIfNeeded() {
-            guard presentedRequestID != nil else {
-                let voidedID = pendingRequest?.id
+            // A dismissal is already underway (an interactive drag, or a
+            // zoom-out): the repeated `sync(nil)` that a SwiftUI re-render
+            // produces must not issue a second `dismiss`.
+            guard dismissalPhase == .idle else { return }
+
+            guard let dismissedID = presentedRequestID else {
+                // Nothing is presented. Only report a withdrawal when a queued
+                // request was actually dropped: this runs on every SwiftUI
+                // update, so a plain re-render with no viewer must stay silent.
+                guard let voidedID = pendingRequest?.id else { return }
                 pendingRequest = nil
                 onDismissed?(voidedID)
                 return
             }
-            let dismissedID = presentedRequestID
-            presentedRequestID = nil
-            isDismissTransitionInFlight = false
+
             generation &+= 1
             let presenter = self.presenter
-            let hosted = self.hosted
             guard let target = hosted ?? presenter?.presentedViewController else {
                 // Nothing is actually on screen; treat the request as already
                 // settled instead of leaving the grid paused forever.
                 photoVaultTrace("viewer_dismiss_no_target")
                 ViewerPerformanceTrace.viewerDismissStart()
                 ViewerPerformanceTrace.viewerDismissEnd()
+                presentedRequestID = nil
+                hosted = nil
+                flushPendingRequest()
                 onDismissed?(dismissedID)
                 return
             }
+
             ViewerPerformanceTrace.viewerDismissStart()
-            target.dismiss(animated: !UIAccessibility.isReduceMotionEnabled) { [weak self, weak target] in
-                guard let self else { return }
-                // A newer session may already own `hosted` (the user opened
-                // the next photo while this zoom-out was running) — don't
-                // clobber its bookkeeping.
-                if self.hosted === target {
-                    self.hosted = nil
-                }
-                self.endDismissalInteractionOverride()
-                ViewerPerformanceTrace.viewerDismissEnd()
-                photoVaultTrace("viewer_dismiss_complete")
-                self.onDismissed?(dismissedID)
+            // A programmatic close is not cancellable, so it commits the moment
+            // it is issued: the grid comes back for the whole zoom-out, not
+            // after it.
+            dismissTransitionCommitted()
+            target.dismiss(animated: !UIAccessibility.isReduceMotionEnabled) { [weak self] in
+                self?.finishDismissal(sessionID: dismissedID)
             }
         }
 
@@ -717,13 +849,12 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// an ancestor is torn down). Keeps the grid's active state in sync.
         func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
             photoVaultTrace("viewer_presentation_controller_did_dismiss")
-            guard presentedRequestID != nil else { return }
-            let dismissedID = presentedRequestID
-            presentedRequestID = nil
-            hosted = nil
-            generation &+= 1
-            endDismissalInteractionOverride()
-            onDismissed?(dismissedID)
+            // Ignore a stale controller: a presentation that already ended must
+            // not settle the session that replaced it.
+            guard let hosted,
+                  presentationController.presentedViewController === hosted
+            else { return }
+            finishDismissal(sessionID: presentedRequestID)
         }
     }
 }

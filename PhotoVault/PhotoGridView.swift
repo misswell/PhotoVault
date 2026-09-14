@@ -666,6 +666,10 @@ struct PhotoGridView: UIViewRepresentable {
                 withReuseIdentifier: PhotoGridCell.reuseIdentifier,
                 for: indexPath
             ) as! PhotoGridCell
+            // Position-stable identity so UI tests can prove the grid actually
+            // scrolled (`photo-cell-0` leaving the viewport) rather than just
+            // that some cell still exists.
+            cell.accessibilityIdentifier = "photo-cell-\(indexPath.item)"
             guard isActive else {
                 cell.showPlaceholder(
                     selectionMode: selectionMode,
@@ -748,6 +752,11 @@ struct PhotoGridView: UIViewRepresentable {
 
         func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
             isFastScrolling = false
+            // Evidence that a touch got through to the grid while the viewer's
+            // zoom-out was still playing.
+            photoVaultTrace(
+                "grid scroll began offsetY=\(Int(scrollView.contentOffset.y))"
+            )
         }
 
         func scrollViewDidScroll(_ scrollView: UIScrollView) {
@@ -764,6 +773,10 @@ struct PhotoGridView: UIViewRepresentable {
             willDecelerate decelerate: Bool
         ) {
             if !decelerate { isFastScrolling = false }
+            photoVaultTrace(
+                "grid scroll ended offsetY=\(Int(scrollView.contentOffset.y)) "
+                    + "decelerate=\(decelerate)"
+            )
         }
 
         func collectionView(
@@ -1625,6 +1638,9 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                 withReuseIdentifier: PhotoGridCell.reuseIdentifier,
                 for: indexPath
             ) as! PhotoGridCell
+            // Position-stable identity so UI tests can prove the grid actually
+            // scrolled rather than just that some cell still exists.
+            cell.accessibilityIdentifier = "photo-cell-\(indexPath.item)"
             guard isActive else {
                 cell.showPlaceholder(
                     selectionMode: selectionMode,
