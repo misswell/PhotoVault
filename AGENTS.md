@@ -110,6 +110,7 @@
 - 缩放转场选项：`interactiveDismissShouldBegin` 里查 `interactiveDismissVeto`（`isZooming || isPaging` 时拒绝，把单指拖动还给图片平移和 pager）；`alignmentRectProvider` 返回照片 aspect-fit 实际矩形（letterbox 除外），让缩放 morph 对准照片本体而不是全屏容器。
 - 🔴 查看器静止背景必须不透明：`dimmingColor` 只覆盖转场进行中/交互中，呈现完成后的静止态没有暗化层——hosting 背景若为 clear，letterbox 会透出底层网格（连"图库"标题栏都看得见）。`hosting.view.backgroundColor = .black` 且不要再改回 clear。
 - 🔴 不要试图替换分页器内部 scrollView 的 pan delegate：`UIScrollView` 强制内置 pan 的 delegate 是它自己，`setDelegate:` 直接 SIGABRT（`'UIScrollView's built-in pan gesture recognizer must have its scroll view as its delegate'`）。真机触摸下系统下拉与 pager 手势仲裁本来就通，无需（也不要）用 `require(toFail:)` 给 pager pan 加等待。
+- 🔴 **查看器里读不到 `@Environment(\.scenePhase)`（恒为 `.background`）**：详情页由 `PhotoViewerPresentationBridge` 手工创建 `UIHostingController` 并自己 `present`，没有 `Scene` 挂在上面的 SwiftUI 层级只会拿到该环境键的**默认值**。实测后果两处：① 从详情页开播的幻灯片永远停在第 1 张——自动推进任务的 `guard phase == .active` 直接 return（从图库页开播的同一条幻灯片正常，因为它在 App 自己的层级里）；② `VideoAssetViewer` 的 `onAppear` 不敢 `play()`，详情页的视频不播。凡是从查看器可达的代码一律用 `AppSceneState.shared.phase`（`PhotoVaultApp.swift`，由 `UIApplication` 的 active/inactive/background 通知驱动，任何层级都正确），不要再写 `@Environment(\.scenePhase)`；只有活在 App 自己层级里的页面（`ContentView`、LAN 相册、设置、智能搜索）才可以用环境值。`SlideshowView` / `IndexedSlideshowView` / `VideoAssetViewer` 已改。
 - 查看器退出路径的回归用 UI 测试跑：`xcodebuild test -project PhotoVault.xcodeproj -scheme PhotoVault -destination 'platform=iOS Simulator,id=<id>' -only-testing:PhotoVaultUITests`。覆盖：关闭退出、下拉退出、短拉取消连续、翻页后关闭、未整理查看器下拉退出——每个场景都断言"退出后网格仍可交互"（再现 P0 死屏的最直接探针）。**模拟器的输入自动化必须用 XCUITest**：macOS 侧 CGEvent 合成事件会被桌面窗墙吃掉，到不了模拟器窗口。
 - 详情展示期间要让底层相册网格进入 inactive 状态，暂停其交互和图片请求；确认退出后可立即恢复底层滚动交互，视觉转场仍由详情页完成，`onDismiss` 只做最终清理，避免用户退出后还要等待才能滑动。
 - 详情返回时不要因为 `isActive` 恢复就无条件对相册网格调用 `reloadData()`；这会清掉已经显示的缩略图并重新显示 loading，和全屏退出动画叠加成闪屏。未变化的数据应保留可见 cell，只恢复取消的请求；数据源变化时才整体刷新。
@@ -151,6 +152,7 @@
 - 详情页开播：两套详情页都传自己的 `startingIndex/startingOffset`。普通详情页关闭幻灯片后按 `onSourceIndexChanged` 回到**最后播放到的那张**（不是进入时那张）；未整理详情页用 `onAssetChanged` 记下资产，关闭后按**未筛选**排序求 rank 再回写 `currentIndex`（筛选后的播放位置不能直接当索引）。
 - 🔴 **先关面板再开覆盖页**：`pendingSlideshow` 暂存启动参数，`.onChange(of: isShowingSlideshowOptions)` 里等面板关闭后才把 `slideshowLaunch` 置上再 `fullScreenCover`；直接同时触发会被系统丢掉 cover。
 - 文件夹相册（`LANFolderSlideshowScreen`）只有播放方式，`source` 传 `nil`：它是 `[URL]` 支撑的，画幅/分辨率要解码每个文件才知道，面板上明确写“画幅筛选不适用”。“填充满画面”在文件夹幻灯片里同样生效（透传给 `LANFolderImageView(fillsContainer:)`）。
+- 🔴 **幻灯片自动推进必须有回归测试**：`testSlideshowAdvancesOnItsOwn`（图库页起播）、`testSlideshowFromDetailAdvancesOnItsOwn`（普通详情页起播）、`testUnsortedSlideshowAdvancesOnItsOwn`（未整理详情页起播）把间隔钉成 3 秒，断言计数器在 20 秒内变化。此前只测「从哪张开始播」、间隔钉 12 秒，**自动推进整个坏掉都看不出来**（用户先发现的）。新增任何起播入口都要补一条。
 - UI 回归在 `PhotoVaultUITests/SlideshowOptionsUITests`：图库页开面板→开播→从第 1 张起；详情页开播→从当前这张（**当前正在看的那张**，不写死第 3 张——点击可能落在相邻 cell 上）起；未整理详情页选“横屏照片”→走 SQL 统计→从筛选后第 1 张起。测试通过 UserDefaults 参数域把间隔钉成 12 秒，避免和自动播放抢时间；点工具栏“播放”会重试，因为网格工具栏在启动窗口/相册扫描发布期间会重建，XCUITest 先解析再点击可能落到旁边的“选择”上。
 - ⚠️ **`-Key value` 启动参数（参数域）会盖住 `@AppStorage` 且不可写**：面板会记住用户上次选的筛选，所以测试之间会互相影响（上一个用例选了“横屏照片”，下一个用例的“从当前这张开始”就会因为筛选后起点不同而失败）。解决办法是给“不会自己改这一项”的用例把 `-PhotoVault.slideshow.contentFilter` 钉成 `all`；但**要改筛选的用例绝对不能钉**——参数域优先级最高，picker 写入会被静默忽略，表现为“点了没反应”。
 

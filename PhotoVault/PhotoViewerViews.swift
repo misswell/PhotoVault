@@ -985,7 +985,9 @@ private struct VideoAssetViewer: View {
     let transparentCanvas: Bool
     let onReady: (Bool) -> Void
 
-    @Environment(\.scenePhase) private var scenePhase
+    /// Not `@Environment(\.appScene.phase)`: this view lives inside the viewer,
+    /// where that key is stuck at `.background` (see `AppSceneState`).
+    @ObservedObject private var appScene = AppSceneState.shared
     @ObservedObject private var audioSession = MediaAudioSession.shared
     @State private var player: AVPlayer?
     @State private var requestHandle: PhotoRequestHandle?
@@ -1004,7 +1006,7 @@ private struct VideoAssetViewer: View {
                 VideoPlayer(player: player)
                     .onAppear {
                         player.isMuted = audioSession.isMuted
-                        if scenePhase == .active {
+                        if appScene.phase == .active {
                             player.play()
                         }
                     }
@@ -1037,7 +1039,7 @@ private struct VideoAssetViewer: View {
         .onChange(of: audioSession.isMuted) { _, isMuted in
             player?.isMuted = isMuted
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: appScene.phase) { _, phase in
             if phase == .active {
                 audioSession.resumeAfterBackground()
                 player?.play()
@@ -4104,7 +4106,10 @@ struct SlideshowView: View {
     var onSourceIndexChanged: ((Int) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.scenePhase) private var scenePhase
+    /// Not `@Environment(\.appScene.phase)`: a slideshow opened from a detail page
+    /// inherits the viewer's environment, where that key reads `.background`
+    /// and the autoplay task below would never run (see `AppSceneState`).
+    @ObservedObject private var appScene = AppSceneState.shared
     @Environment(\.displayScale) private var displayScale
     @State private var currentIndex: Int
     @State private var controlsVisible = true
@@ -4317,7 +4322,7 @@ struct SlideshowView: View {
             guard let offset = sourceOffset(forPosition: position) else { return }
             onSourceIndexChanged?(offset)
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: appScene.phase) { _, phase in
             if phase == .active {
                 UIApplication.shared.isIdleTimerDisabled = true
             } else {
@@ -4329,10 +4334,12 @@ struct SlideshowView: View {
             mediaReady = false
         }
         .task(id: slideshowTaskID) {
-            guard scenePhase == .active,
+            guard appScene.phase == .active,
                   !isPaused,
                   playlistCount > 1
-            else { return }
+            else {
+                return
+            }
             while !Task.isCancelled {
                 do {
                     try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
@@ -4341,7 +4348,7 @@ struct SlideshowView: View {
                 }
 
                 guard !Task.isCancelled,
-                      scenePhase == .active,
+                      appScene.phase == .active,
                       !isPaused
                 else { return }
                 // iCloud delivery must never stop the sequence. The new
@@ -4353,7 +4360,7 @@ struct SlideshowView: View {
     }
 
     private var slideshowTaskID: String {
-        "\(scenePhase)-\(isPaused)-\(interval)-\(currentIndex)-\(isShuffled)-\(loops)"
+        "\(appScene.phase)-\(isPaused)-\(interval)-\(currentIndex)-\(isShuffled)-\(loops)"
     }
 
     private var slideshowContentMode: PHImageContentMode {
@@ -4432,7 +4439,10 @@ struct IndexedSlideshowView: View {
     var onAssetChanged: ((PHAsset) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.scenePhase) private var scenePhase
+    /// Not `@Environment(\.appScene.phase)`: a slideshow opened from a detail page
+    /// inherits the viewer's environment, where that key reads `.background`
+    /// and the autoplay task below would never run (see `AppSceneState`).
+    @ObservedObject private var appScene = AppSceneState.shared
     @Environment(\.displayScale) private var displayScale
     @State private var currentIndex: Int
     @State private var assetsByIndex: [Int: PHAsset] = [:]
@@ -4608,7 +4618,7 @@ struct IndexedSlideshowView: View {
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = previousIdleTimerDisabled
         }
-        .onChange(of: scenePhase) { _, phase in
+        .onChange(of: appScene.phase) { _, phase in
             UIApplication.shared.isIdleTimerDisabled = phase == .active
             if phase != .active {
                 PhotoImageManager.shared.cancelRequests(exactly: .slideshow)
@@ -4621,7 +4631,7 @@ struct IndexedSlideshowView: View {
             }
         }
         .task(id: timerTaskID) {
-            guard scenePhase == .active,
+            guard appScene.phase == .active,
                   !isPaused,
                   totalCount > 1
             else { return }
@@ -4632,7 +4642,7 @@ struct IndexedSlideshowView: View {
                     return
                 }
                 guard !Task.isCancelled,
-                      scenePhase == .active,
+                      appScene.phase == .active,
                       !isPaused
                 else { return }
                 showNext()
@@ -4641,7 +4651,7 @@ struct IndexedSlideshowView: View {
     }
 
     private var timerTaskID: String {
-        "\(scenePhase)-\(currentIndex)-\(isPaused)-\(interval)-\(isShuffled)-\(loops)"
+        "\(appScene.phase)-\(currentIndex)-\(isPaused)-\(interval)-\(isShuffled)-\(loops)"
     }
 
     private var slideshowContentMode: PHImageContentMode {

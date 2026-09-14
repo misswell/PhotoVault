@@ -374,10 +374,10 @@ final class SlideshowOptionsUITests: XCTestCase {
         continueAfterFailure = false
     }
 
-    private func launchToGrid() -> XCUIApplication {
+    private func launchToGrid(interval: String = "12") -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments += [
-            "-PhotoVault.slideshow.interval", "12",
+            "-PhotoVault.slideshow.interval", interval,
             "-PhotoVault.slideshow.fillsScreen", "NO",
             "-PhotoVault.slideshow.shuffles", "NO",
             // The launch sheet persists what the user last chose, and the
@@ -444,13 +444,16 @@ final class SlideshowOptionsUITests: XCTestCase {
     ///
     /// In compact width the sidebar starts collapsed, so the unsorted list is
     /// behind the leading navigation-bar button.
-    private func openUnsortedViewer() -> XCUIApplication {
+    private func openUnsortedViewer(
+        interval: String = "12",
+        extraArguments: [String] = []
+    ) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments += [
-            "-PhotoVault.slideshow.interval", "12",
+            "-PhotoVault.slideshow.interval", interval,
             "-PhotoVault.slideshow.fillsScreen", "NO",
             "-PhotoVault.slideshow.shuffles", "NO",
-        ]
+        ] + extraArguments
         app.launch()
 
         XCTAssertTrue(
@@ -537,6 +540,91 @@ final class SlideshowOptionsUITests: XCTestCase {
         XCTAssertTrue(
             app.collectionViews["photo-grid"].waitForExistence(timeout: 10),
             "关闭幻灯片后应回到图库网格"
+        )
+    }
+
+    /// 幻灯片必须自己往下走：没人碰屏幕，计数器也要从第 1 张走到第 2 张。
+    ///
+    /// 这条此前没被覆盖过：其它用例只断言从哪张开始播，间隔被钉成 12 秒，
+    /// 自动推进坏掉是看不出来的（实测就是坏掉的状态被用户先发现）。
+    func testSlideshowAdvancesOnItsOwn() {
+        let app = launchToGrid(interval: "3")
+        openSlideshowOptions(fromGrid: app)
+        app.buttons["slideshow-start"].tap()
+
+        let counter = app.staticTexts["slideshow-counter"]
+        XCTAssertTrue(counter.waitForExistence(timeout: 15), "幻灯片应开始播放")
+        let first = counter.label
+        XCTAssertTrue(first.hasPrefix("1 /"), "应从第 1 张开始，实际 \(first)")
+
+        let moved = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label != %@", first),
+            object: counter
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [moved], timeout: 20),
+            .completed,
+            "间隔 3 秒，20 秒内幻灯片应自动切到下一张（一直停在 \(first)）"
+        )
+    }
+
+    /// 同一条自动推进，但从详情页的 `viewer-slideshow` 起播（用户实际用的入口）。
+    func testSlideshowFromDetailAdvancesOnItsOwn() {
+        let app = launchToGrid(interval: "3")
+        let firstCell = app.collectionViews["photo-grid"].cells.firstMatch
+        XCTAssertTrue(firstCell.waitForExistence(timeout: 20))
+        firstCell.tap()
+
+        let slideshowButton = app.buttons["viewer-slideshow"]
+        XCTAssertTrue(waitUntilHittable(slideshowButton, timeout: 15), "详情页应有播放幻灯片按钮")
+        slideshowButton.tap()
+
+        let start = app.buttons["slideshow-start"]
+        XCTAssertTrue(start.waitForExistence(timeout: 10), "详情页也应弹出设置面板")
+        start.tap()
+
+        let counter = app.staticTexts["slideshow-counter"]
+        XCTAssertTrue(counter.waitForExistence(timeout: 15), "幻灯片应开始播放")
+        let first = counter.label
+
+        let moved = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label != %@", first),
+            object: counter
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [moved], timeout: 20),
+            .completed,
+            "详情页起播的幻灯片也应自动切换（一直停在 \(first)）"
+        )
+    }
+
+    /// 未整理详情页起播的幻灯片也要自己往下走：它和普通详情页同源——两者都在
+    /// UIKit 承载的查看器里，`\.scenePhase` 在那里恒为 `.background`。
+    func testUnsortedSlideshowAdvancesOnItsOwn() {
+        let app = openUnsortedViewer(
+            interval: "3",
+            extraArguments: ["-PhotoVault.slideshow.contentFilter", "all"]
+        )
+        let slideshowButton = app.buttons["viewer-slideshow"]
+        XCTAssertTrue(waitUntilHittable(slideshowButton, timeout: 15), "未整理详情页应有播放按钮")
+        slideshowButton.tap()
+
+        let start = app.buttons["slideshow-start"]
+        XCTAssertTrue(start.waitForExistence(timeout: 10), "应弹出设置面板")
+        start.tap()
+
+        let counter = app.staticTexts["slideshow-counter"]
+        XCTAssertTrue(counter.waitForExistence(timeout: 15), "未整理幻灯片应开始播放")
+        let first = counter.label
+
+        let moved = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label != %@", first),
+            object: counter
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [moved], timeout: 20),
+            .completed,
+            "未整理幻灯片也应自动切换（一直停在 \(first)）"
         )
     }
 
