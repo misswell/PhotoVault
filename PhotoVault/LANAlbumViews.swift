@@ -163,7 +163,11 @@ struct LANFolderGridScreen: View {
     @State private var hasAutoPresentedPicker = false
     @State private var reauthDirectory: URL?
     @State private var viewerIndex: Int?
-    @State private var isShowingSlideshow = false
+    /// Folder slideshows are set up in the same sheet as album slideshows,
+    /// minus the content filters: a folder is `[URL]`-backed, so orientation
+    /// and resolution are not known without decoding every file.
+    @State private var isShowingSlideshowOptions = false
+    @State private var isStartingSlideshow = false
 
     private let columns = [
         GridItem(.adaptive(minimum: 88, maximum: 150), spacing: 2)
@@ -234,7 +238,7 @@ struct LANFolderGridScreen: View {
             ToolbarItem(placement: .topBarTrailing) {
                 if !files.isEmpty {
                     Button {
-                        isShowingSlideshow = true
+                        isShowingSlideshowOptions = true
                     } label: {
                         Label("播放", systemImage: "play.fill")
                     }
@@ -287,7 +291,20 @@ struct LANFolderGridScreen: View {
                 )
             }
         }
-        .fullScreenCover(isPresented: $isShowingSlideshow) {
+        .sheet(isPresented: $isShowingSlideshowOptions) {
+            SlideshowOptionsSheet(
+                title: "\(folder.name)幻灯片",
+                source: nil,
+                onStart: { _ in
+                    isStartingSlideshow = true
+                    isShowingSlideshowOptions = false
+                }
+            )
+        }
+        .fullScreenCover(
+            isPresented: $isStartingSlideshow,
+            onDismiss: { isStartingSlideshow = false }
+        ) {
             // Same rule as the viewer cover: never gate on folderURL (nil on
             // the session-cache replay path), otherwise the cover presents
             // empty with no exit controls.
@@ -1049,7 +1066,12 @@ struct LANFolderSlideshowScreen: View {
     @State private var currentIndex = 0
     @State private var controlsVisible = true
     @State private var isPaused = false
-    @State private var isShuffled = false
+    /// Shared with the album slideshows: the launch sheet writes these keys,
+    /// so "随机顺序" and "填充满画面" mean the same thing in every slideshow.
+    @AppStorage(SlideshowPlaybackSettings.shufflesKey)
+    private var isShuffled = SlideshowPlaybackSettings.defaultShuffles
+    @AppStorage(SlideshowPlaybackSettings.fillsScreenKey)
+    private var fillsScreen = SlideshowPlaybackSettings.defaultFillsScreen
     @AppStorage(SlideshowSettings.loopsStorageKey)
     private var loops = SlideshowSettings.defaultLoops
     @AppStorage(SlideshowSettings.intervalStorageKey)
@@ -1072,6 +1094,7 @@ struct LANFolderSlideshowScreen: View {
             Color.black.ignoresSafeArea()
 
             LANFolderSlideshowPage(
+                fillsContainer: fillsScreen,
                 files: files,
                 folderID: folderID,
                 rootURL: rootURL,
@@ -1272,6 +1295,7 @@ struct LANFolderSlideshowScreen: View {
 /// Single visible slideshow page with the user's configured transition and
 /// the same swipe thresholds as the album's SlideshowAssetPager.
 private struct LANFolderSlideshowPage: View {
+    let fillsContainer: Bool
     let files: [URL]
     let folderID: UUID
     let rootURL: URL
@@ -1292,7 +1316,7 @@ private struct LANFolderSlideshowPage: View {
                     folderID: folderID,
                     rootURL: rootURL,
                     maxPixelSize: 2048,
-                    fillsContainer: false
+                    fillsContainer: fillsContainer
                 )
                 .id("lan-slideshow-\(index)")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

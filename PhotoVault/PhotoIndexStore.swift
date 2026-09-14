@@ -46,7 +46,7 @@ enum PhotoIndexError: LocalizedError {
 /// requests image data, video resources, or Live Photos while indexing.
 final class PhotoIndexStore: @unchecked Sendable {
     private static let databaseName = "PhotoIndex.sqlite"
-    private static let schemaVersion = "2"
+    private static let schemaVersion = "4"
     private static func makeMediaOptions() -> PHFetchOptions {
         let options = PHFetchOptions()
         options.predicate = NSPredicate(
@@ -536,14 +536,16 @@ final class PhotoIndexStore: @unchecked Sendable {
 
                 let assetStatement = try prepare("""
                     INSERT INTO asset_index
-                        (asset_id, creation_date, modification_date, media_type, media_subtype, favorite, album_count)
-                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                        (asset_id, creation_date, modification_date, media_type, media_subtype, favorite, album_count, pixel_width, pixel_height)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
                     ON CONFLICT(asset_id) DO UPDATE SET
                         creation_date = excluded.creation_date,
                         modification_date = excluded.modification_date,
                         media_type = excluded.media_type,
                         media_subtype = excluded.media_subtype,
-                        favorite = excluded.favorite
+                        favorite = excluded.favorite,
+                        pixel_width = excluded.pixel_width,
+                        pixel_height = excluded.pixel_height
                     """)
                 defer { sqlite3_finalize(assetStatement) }
 
@@ -796,14 +798,16 @@ final class PhotoIndexStore: @unchecked Sendable {
                 try setMeta("library_signature", value: librarySignature)
                 let statement = try prepare("""
                     INSERT INTO asset_index
-                        (asset_id, creation_date, modification_date, media_type, media_subtype, favorite, album_count)
-                    VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT album_count FROM asset_index WHERE asset_id = ?), 0))
+                        (asset_id, creation_date, modification_date, media_type, media_subtype, favorite, album_count, pixel_width, pixel_height)
+                    VALUES (?, ?, ?, ?, ?, ?, COALESCE((SELECT album_count FROM asset_index WHERE asset_id = ?), 0), ?, ?)
                     ON CONFLICT(asset_id) DO UPDATE SET
                         creation_date = excluded.creation_date,
                         modification_date = excluded.modification_date,
                         media_type = excluded.media_type,
                         media_subtype = excluded.media_subtype,
-                        favorite = excluded.favorite
+                        favorite = excluded.favorite,
+                        pixel_width = excluded.pixel_width,
+                        pixel_height = excluded.pixel_height
                     """)
                 defer { sqlite3_finalize(statement) }
 
@@ -1040,6 +1044,209 @@ final class PhotoIndexStore: @unchecked Sendable {
         return identifiers
     }
 
+    // MARK: - Filtered unsorted reads (slideshow)
+
+    /// Runs `readOnReader` on the dedicated snapshot connection and retries on
+    /// the writer connection when the reader cannot serve it (WAL recovery
+    /// edge case, see `unsortedIdentifiers`). Duplicated here rather than
+    /// inlined three times: a reader-side failure must never stall the
+    /// Unsorted screen, the detail viewer *or* a slideshow.
+    private func readWithFallback<T>(
+        _ readOnReader: @escaping (PhotoIndexStore) throws -> T,
+        _ readOnWriter: @escaping (PhotoIndexStore) throws -> T,
+        completion: @escaping (Result<T, Error>) -> Void
+    ) {
+        let completionBox = Callback(value: completion)
+        readQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                let value = try self.withReadDatabase { try readOnReader(self) }
+                DispatchQueue.main.async { completionBox.value(.success(value)) }
+            } catch {
+                photoVaultTrace(
+                    "index filtered-read falling back to writer connection "
+                        + "error=\(error.localizedDescription)"
+                )
+                self.queue.async { [weak self] in
+                    guard let self else { return }
+                    do {
+                        let value = try self.withDatabase { try readOnWriter(self) }
+                        DispatchQueue.main.async { completionBox.value(.success(value)) }
+                    } catch {
+                        DispatchQueue.main.async { completionBox.value(.failure(error)) }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prepares a statement for the filtered slideshow queries, binding the
+    /// filter's parameters from `SlideshowFilter.sqlBindings` first. Keeping
+    /// the clause and its bindings in one place is what stops the two from
+    /// drifting apart (they are asserted against each other by
+    /// `SlideshowFilterProbe`).
+    private func prepareFiltered(
+        _ sql: String,
+        filter: SlideshowFilter,
+        onReader: Bool,
+        bindTail: (OpaquePointer, Int32) throws -> Void = { _, _ in }
+    ) throws -> OpaquePointer {
+        let statement = onReader ? try prepareRead(sql) : try prepare(sql)
+        var index: Int32 = 1
+        for binding in filter.sqlBindings {
+            try bindInt64(binding, at: index, to: statement)
+            index += 1
+        }
+        try bindTail(statement, index)
+        return statement
+    }
+
+    private func readIdentifierColumn(
+        _ statement: OpaquePointer,
+        capacity: Int = 0
+    ) throws -> [String] {
+        defer { sqlite3_finalize(statement) }
+        var identifiers = [String]()
+        identifiers.reserveCapacity(min(max(0, capacity), 4096))
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let value = sqlite3_column_text(statement, 0) {
+                identifiers.append(String(cString: value))
+            }
+        }
+        return identifiers
+    }
+
+    private func readUnsortedIdentifiers(
+        matching filter: SlideshowFilter,
+        limit: Int,
+        offset: Int,
+        onReader: Bool
+    ) throws -> [String] {
+        let statement = try prepareFiltered(
+            """
+            SELECT asset_id
+            FROM asset_index
+            WHERE album_count = 0 AND (\(filter.sqlWhere))
+            ORDER BY creation_date DESC, asset_id DESC
+            LIMIT ? OFFSET ?
+            """,
+            filter: filter,
+            onReader: onReader
+        ) { statement, start in
+            try self.bindInt64(Int64(max(0, limit)), at: start, to: statement)
+            try self.bindInt64(Int64(max(0, offset)), at: start + 1, to: statement)
+        }
+        return try readIdentifierColumn(statement, capacity: limit)
+    }
+
+    private func readUnsortedCount(
+        matching filter: SlideshowFilter,
+        onReader: Bool
+    ) throws -> Int {
+        let statement = try prepareFiltered(
+            """
+            SELECT COUNT(*)
+            FROM asset_index
+            WHERE album_count = 0 AND (\(filter.sqlWhere))
+            """,
+            filter: filter,
+            onReader: onReader
+        )
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw databaseError()
+        }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    /// The number of filtered assets that sort *ahead* of `assetID` in the
+    /// Unsorted order (`creation_date DESC, asset_id DESC`), i.e. the offset
+    /// that makes "play from this photo" start on this photo. A row-value
+    /// comparison expresses "sorts ahead of" directly, so the ordering is
+    /// written once and cannot disagree with `readUnsortedIdentifiers`.
+    private func readUnsortedRank(
+        of assetID: String,
+        matching filter: SlideshowFilter,
+        onReader: Bool
+    ) throws -> Int {
+        let statement = try prepareFiltered(
+            """
+            SELECT COUNT(*)
+            FROM asset_index
+            WHERE album_count = 0 AND (\(filter.sqlWhere))
+              AND (creation_date, asset_id) > (
+                    SELECT creation_date, asset_id
+                    FROM asset_index
+                    WHERE asset_id = ?
+                  )
+            """,
+            filter: filter,
+            onReader: onReader
+        ) { statement, start in
+            try self.bindText(assetID, at: start, to: statement)
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw databaseError()
+        }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    /// How many unassigned assets a slideshow filter keeps. Pure metadata:
+    /// no image, video or iCloud request is made.
+    func unsortedCount(
+        matching filter: SlideshowFilter,
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        readWithFallback(
+            { try $0.readUnsortedCount(matching: filter, onReader: true) },
+            { try $0.readUnsortedCount(matching: filter, onReader: false) },
+            completion: completion
+        )
+    }
+
+    /// One page of the filtered Unsorted order, in the same order the grid
+    /// shows, so a slideshow walks the sequence the user just saw.
+    func unsortedIdentifiers(
+        matching filter: SlideshowFilter,
+        limit: Int,
+        offset: Int,
+        completion: @escaping (Result<[String], Error>) -> Void
+    ) {
+        readWithFallback(
+            {
+                try $0.readUnsortedIdentifiers(
+                    matching: filter,
+                    limit: limit,
+                    offset: offset,
+                    onReader: true
+                )
+            },
+            {
+                try $0.readUnsortedIdentifiers(
+                    matching: filter,
+                    limit: limit,
+                    offset: offset,
+                    onReader: false
+                )
+            },
+            completion: completion
+        )
+    }
+
+    /// The 0-based position of `assetID` in the filtered Unsorted order.
+    func unsortedRank(
+        of assetID: String,
+        matching filter: SlideshowFilter,
+        completion: @escaping (Result<Int, Error>) -> Void
+    ) {
+        readWithFallback(
+            { try $0.readUnsortedRank(of: assetID, matching: filter, onReader: true) },
+            { try $0.readUnsortedRank(of: assetID, matching: filter, onReader: false) },
+            completion: completion
+        )
+    }
+
     private func readUnsortedIdentifiersOnReadConnection(limit: Int, offset: Int) throws -> [String] {
         let statement = try prepareRead("""
             SELECT asset_id
@@ -1143,7 +1350,9 @@ final class PhotoIndexStore: @unchecked Sendable {
                 media_type INTEGER NOT NULL DEFAULT 0,
                 media_subtype INTEGER NOT NULL DEFAULT 0,
                 favorite INTEGER NOT NULL DEFAULT 0,
-                album_count INTEGER NOT NULL DEFAULT 0
+                album_count INTEGER NOT NULL DEFAULT 0,
+                pixel_width INTEGER NOT NULL DEFAULT 0,
+                pixel_height INTEGER NOT NULL DEFAULT 0
             )
             """)
         try execute("""
@@ -1261,9 +1470,18 @@ final class PhotoIndexStore: @unchecked Sendable {
         try bindInt64(Int64(asset.mediaType.rawValue), at: 4, to: statement)
         try bindInt64(Int64(asset.mediaSubtypes.rawValue), at: 5, to: statement)
         try bindInt64(asset.isFavorite ? 1 : 0, at: 6, to: statement)
+        // The two insert statements differ in one placeholder: the incremental
+        // one carries an extra `(SELECT album_count … WHERE asset_id = ?)`
+        // between `favorite` and the dimensions, so everything after position 6
+        // shifts by one there. Binding a dimension into that slot used to write
+        // the asset id into `pixel_height` — which silently made every
+        // orientation filter match nothing after the first incremental sync.
         if includeExistingID {
             try bindText(asset.localIdentifier, at: 7, to: statement)
         }
+        let dimensionIndex: Int32 = includeExistingID ? 8 : 7
+        try bindInt64(Int64(asset.pixelWidth), at: dimensionIndex, to: statement)
+        try bindInt64(Int64(asset.pixelHeight), at: dimensionIndex + 1, to: statement)
     }
 
     private func bindText(_ value: String, at index: Int32, to statement: OpaquePointer) throws {

@@ -137,6 +137,23 @@
 - 幻灯片切换样式要统一使用设置中的样式，不能让图片加载回调额外触发另一种淡入效果。
 - 页面退出、进入后台、暂停播放时取消幻灯片预取和低优先级请求；重新进入时从当前索引建立新的邻居窗口。
 
+### 播放前的设置面板（`SlideshowOptionsSheet`）
+
+- 点“播放”不再直接开始，而是先弹设置面板：图库页/相册网格页/未整理页的工具栏播放按钮、**以及两套详情页底部操作栏的 `viewer-slideshow` 按钮**，全部走同一个 `SlideshowOptionsSheet`。面板是唯一配置幻灯片的地方，播放器里的“全屏/随机”按钮和面板共用 `@AppStorage` 键（`SlideshowPlaybackSettings`），不允许出现两套状态。
+- 播放内容 `SlideshowContentFilter`：全部/横屏/竖屏/方形/全景/高清。**命名只说“留下什么”，不说“排除什么”**，用户点到的字就是筛选断言的内容。全部照片（默认）与旧行为完全一致，走不枚举的快速路径，所以“点播放立刻能播”没有退化。
+- 进一步筛选 `SlideshowRefinements`（排除截屏/仅收藏/只播照片）与内容筛选正交，默认全关——不静默改变用户已有的播放结果。方形判定是 `abs(w-h)*20 <= max(w,h)`（5% 容差，且 `w>0 && h>0`）；“高清”是“不需要放大”而不是“比屏幕更大”：`pixelWidth >= 屏幕宽 || pixelHeight >= 屏幕高`（1920×1080 在 1206×2622 屏上按宽度缩小，算高清，必须留下）。屏幕尺寸按**设备像素**取（`SlideshowDisplayMetrics.screenPixelSize`），不能用 point。
+- 面板底部“开始播放”用 `safeAreaInset` **常驻**，不做成 Form 最后一行：手机上 Form 比屏幕长，主操作不能要求用户滚动去找；同时把“将播放 N 张”一起钉在按钮上方，改筛选立刻能看到张数变化。
+- 🔴 **筛选判定必须两份且必须一致**：普通/相册/搜索走内存 `SlideshowFilter.matches(PHAsset)`，未整理走 SQL（`SlideshowFilter.sqlWhere` + `sqlBindings`），二者由 `--pv-slideshow-filter-probe` 在真机/模拟器上逐条比对（数量 + 从某张照片开播的起始位置），结果写 `slideshow_filter_probe_result failures=N`。新增筛选条件**必须同时**加这两处并跑探针，不允许只改一边。
+- 🔴 **“从这张开始播”的实现规则**：筛选后起点 = 排在它前面的“通过筛选的照片数”。序列路径是 `SlideshowPlaylistBuilder.resolve` 里按 `startingIndex` 数 `indices`；未整理路径是 `PhotoIndexStore.unsortedRank`（行值比较 `(creation_date, asset_id) > (…)`，和 `readUnsortedIdentifiers` 的排序只写一遍）。两条路径必须同规则——探针断言的就是它。未筛选时起点就是用户当前所在的偏移量。
+- 未整理索引库版本已升到 **`schemaVersion "4"`**（`asset_index` 增加 `pixel_width`/`pixel_height`；v4 修的是绑定错位，见下）：老装机升级会触发**一次性全量重建**，重建期间筛选后的张数为 0。这是“筛选不需要枚举图库”的代价，不要为了省这次重建把画幅筛选退回内存过滤。
+- 🔴 **两条 INSERT 的占位符不一样，绑定必须跟着位移**：全量重建的 `INSERT INTO asset_index … VALUES (?,?,?,?,?,?, 0, ?, ?)` 里 `pixel_width/pixel_height` 在第 7/8 位；增量同步那条多了 `COALESCE((SELECT album_count FROM asset_index WHERE asset_id = ?), 0)`，于是 `asset_id` 落在第 7 位、尺寸顺延到第 8/9 位。`bindAsset` 原来固定按 7/8/9 绑，增量路径就会把 `asset_id` 写进 `pixel_height`（SQLite 的 INTEGER 列按亲和性照样存字符串），**全量重建后一切正常、下一次增量同步后所有画幅筛选静默变成 0 张**。改这段 SQL 或 `bindAsset` 时先数占位符。
+- 因此 `--pv-slideshow-filter-probe` 要在**走过增量同步的那次启动**上再跑一遍（第二次启动即可）：它比对的是「内存筛选」与「索引当前内容」，只跑首次全量重建那一轮看不出这条错位。
+- 详情页开播：两套详情页都传自己的 `startingIndex/startingOffset`。普通详情页关闭幻灯片后按 `onSourceIndexChanged` 回到**最后播放到的那张**（不是进入时那张）；未整理详情页用 `onAssetChanged` 记下资产，关闭后按**未筛选**排序求 rank 再回写 `currentIndex`（筛选后的播放位置不能直接当索引）。
+- 🔴 **先关面板再开覆盖页**：`pendingSlideshow` 暂存启动参数，`.onChange(of: isShowingSlideshowOptions)` 里等面板关闭后才把 `slideshowLaunch` 置上再 `fullScreenCover`；直接同时触发会被系统丢掉 cover。
+- 文件夹相册（`LANFolderSlideshowScreen`）只有播放方式，`source` 传 `nil`：它是 `[URL]` 支撑的，画幅/分辨率要解码每个文件才知道，面板上明确写“画幅筛选不适用”。“填充满画面”在文件夹幻灯片里同样生效（透传给 `LANFolderImageView(fillsContainer:)`）。
+- UI 回归在 `PhotoVaultUITests/SlideshowOptionsUITests`：图库页开面板→开播→从第 1 张起；详情页开播→从当前这张（**当前正在看的那张**，不写死第 3 张——点击可能落在相邻 cell 上）起；未整理详情页选“横屏照片”→走 SQL 统计→从筛选后第 1 张起。测试通过 UserDefaults 参数域把间隔钉成 12 秒，避免和自动播放抢时间；点工具栏“播放”会重试，因为网格工具栏在启动窗口/相册扫描发布期间会重建，XCUITest 先解析再点击可能落到旁边的“选择”上。
+- ⚠️ **`-Key value` 启动参数（参数域）会盖住 `@AppStorage` 且不可写**：面板会记住用户上次选的筛选，所以测试之间会互相影响（上一个用例选了“横屏照片”，下一个用例的“从当前这张开始”就会因为筛选后起点不同而失败）。解决办法是给“不会自己改这一项”的用例把 `-PhotoVault.slideshow.contentFilter` 钉成 `all`；但**要改筛选的用例绝对不能钉**——参数域优先级最高，picker 写入会被静默忽略，表现为“点了没反应”。
+
 ## 诊断日志
 
 - Debug 构建中的 `PagerDiagnostics` 同时写 `OSLog` 和 App 沙盒的 `Library/Caches/PhotoVault/PagerDiagnostics.log`，文件限制约 512 KB。

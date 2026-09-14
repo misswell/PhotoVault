@@ -497,6 +497,59 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         limit: Int,
         completion: @escaping @MainActor (Result<[PHAsset], Error>) -> Void
     ) {
+        loadUnsortedAssets(
+            matching: nil,
+            offset: offset,
+            limit: limit,
+            completion: completion
+        )
+    }
+
+    /// The same page, restricted to what a slideshow filter keeps. The
+    /// filtering happens in SQLite against the index columns, so a filtered
+    /// slideshow never has to enumerate the library to find its photos.
+    func fetchUnsortedAssets(
+        matching filter: SlideshowFilter,
+        offset: Int,
+        limit: Int,
+        completion: @escaping @MainActor (Result<[PHAsset], Error>) -> Void
+    ) {
+        loadUnsortedAssets(
+            matching: filter,
+            offset: offset,
+            limit: limit,
+            completion: completion
+        )
+    }
+
+    /// How many unsorted photos a slideshow filter keeps.
+    func unsortedSlideshowCount(matching filter: SlideshowFilter) async throws -> Int {
+        try await withCheckedThrowingContinuation { continuation in
+            indexStore.unsortedCount(matching: filter) { result in
+                continuation.resume(with: result)
+            }
+        }
+    }
+
+    /// The position `assetID` occupies in the filtered unsorted order, so
+    /// "play from this photo" starts on the photo the user was looking at.
+    func unsortedSlideshowRank(
+        of assetID: String,
+        matching filter: SlideshowFilter
+    ) async throws -> Int {
+        try await withCheckedThrowingContinuation { continuation in
+            indexStore.unsortedRank(of: assetID, matching: filter) { result in
+                continuation.resume(with: result)
+            }
+        }
+    }
+
+    private func loadUnsortedAssets(
+        matching filter: SlideshowFilter?,
+        offset: Int,
+        limit: Int,
+        completion: @escaping @MainActor (Result<[PHAsset], Error>) -> Void
+    ) {
         guard canReadPhotos else {
             photoVaultTrace(
                 "store unsorted-fetch failed reason=no-permission offset=\(offset) limit=\(limit)"
@@ -508,12 +561,9 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         let generation = indexGeneration
         photoVaultTrace(
             "store unsorted-fetch start offset=\(offset) limit=\(limit) "
-                + "generation=\(generation)"
+                + "filter=\(filter?.summary ?? "all") generation=\(generation)"
         )
-        indexStore.unsortedIdentifiers(
-            limit: max(0, limit),
-            offset: max(0, offset)
-        ) { [weak self] result in
+        let handleIdentifiers: (Result<[String], Error>) -> Void = { [weak self] result in
             guard let self else {
                 photoVaultTrace(
                     "store unsorted-fetch drop offset=\(offset) reason=store-gone "
@@ -578,6 +628,21 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                     }
                 }
             }
+        }
+
+        if let filter {
+            indexStore.unsortedIdentifiers(
+                matching: filter,
+                limit: max(0, limit),
+                offset: max(0, offset),
+                completion: handleIdentifiers
+            )
+        } else {
+            indexStore.unsortedIdentifiers(
+                limit: max(0, limit),
+                offset: max(0, offset),
+                completion: handleIdentifiers
+            )
         }
     }
 

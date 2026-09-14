@@ -1351,6 +1351,13 @@ struct PhotoViewerView: View {
     @State private var viewportSize = CGSize(width: 390, height: 844)
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
+    @State private var isShowingSlideshowOptions = false
+    @State private var pendingSlideshow: SlideshowLaunch?
+    @State private var slideshowLaunch: SlideshowLaunch?
+    /// The photo the slideshow was showing when it was closed, so the viewer
+    /// comes back on what the user actually last looked at instead of on the
+    /// photo they started from.
+    @State private var slideshowLastRetarget = 0
     @State private var alert: PhotoVaultAlert?
     @StateObject private var neighborPrefetch = ViewerNeighborPrefetch()
 
@@ -1489,6 +1496,40 @@ struct PhotoViewerView: View {
                     }
                 )
             }
+        }
+        .sheet(isPresented: $isShowingSlideshowOptions) {
+            SlideshowOptionsSheet(
+                title: "幻灯片",
+                source: .sequence(assets, startingIndex: currentIndex),
+                onStart: { launch in
+                    pendingSlideshow = launch
+                    isShowingSlideshowOptions = false
+                }
+            )
+        }
+        .fullScreenCover(
+            isPresented: Binding(
+                get: { slideshowLaunch != nil },
+                set: { if !$0 { slideshowLaunch = nil } }
+            ),
+            onDismiss: applySlideshowRetarget
+        ) {
+            if case .sequence(let assets, let indices, let start, _) = slideshowLaunch {
+                SlideshowView(
+                    title: titleForSlideshow,
+                    assets: assets,
+                    indices: indices,
+                    initialIndex: start,
+                    onSourceIndexChanged: { offset in
+                        slideshowLastRetarget = offset
+                    }
+                )
+            }
+        }
+        .onChange(of: isShowingSlideshowOptions) { _, isShowing in
+            guard !isShowing, let launch = pendingSlideshow else { return }
+            pendingSlideshow = nil
+            slideshowLaunch = launch
         }
         .alert(item: $alert) { alert in
             Alert(
@@ -1783,6 +1824,17 @@ struct PhotoViewerView: View {
             Spacer()
 
             viewerBarAction {
+                isShowingSlideshowOptions = true
+            } label: {
+                Image(systemName: "play.rectangle")
+            }
+            .disabled(assets.count == 0)
+            .accessibilityLabel("播放幻灯片")
+            .accessibilityIdentifier("viewer-slideshow")
+
+            Spacer()
+
+            viewerBarAction {
                 guard !isPreparingShare, assets.count > 0 else { return }
                 isPreparingShare = true
                 store.requestShareItems(for: [assets.object(at: currentIndex)]) { items, temporaryURLs in
@@ -1828,6 +1880,17 @@ struct PhotoViewerView: View {
         for url in urls {
             try? FileManager.default.removeItem(at: url)
         }
+    }
+
+    private var titleForSlideshow: String {
+        album?.title ?? "幻灯片"
+    }
+
+    /// Follow the slideshow: closing it returns to the photo it was showing,
+    /// not to the one it started from.
+    private func applySlideshowRetarget() {
+        guard assets.count > 0 else { return }
+        currentIndex = min(max(0, slideshowLastRetarget), assets.count - 1)
     }
 
     private func removeCurrentFromAlbum() {
@@ -3057,6 +3120,12 @@ struct IndexedPhotoViewerView: View {
     @State private var viewportSize = CGSize(width: 390, height: 844)
     @State private var isFullScreen = false
     @State private var isShowingAlbumPicker = false
+    @State private var isShowingSlideshowOptions = false
+    @State private var pendingSlideshow: SlideshowLaunch?
+    @State private var slideshowLaunch: SlideshowLaunch?
+    /// The photo the slideshow was showing when it was closed; the viewer
+    /// returns to it instead of to the photo it started from.
+    @State private var slideshowLastAsset: PHAsset?
     @State private var alert: PhotoVaultAlert?
     @StateObject private var neighborPrefetch = ViewerNeighborPrefetch()
 
@@ -3197,6 +3266,45 @@ struct IndexedPhotoViewerView: View {
                     }
                 )
             }
+        }
+        .sheet(isPresented: $isShowingSlideshowOptions) {
+            SlideshowOptionsSheet(
+                title: "\(title)幻灯片",
+                source: .indexed(
+                    store,
+                    startingOffset: currentIndex,
+                    startingAssetID: currentAsset?.localIdentifier
+                ),
+                onStart: { launch in
+                    pendingSlideshow = launch
+                    isShowingSlideshowOptions = false
+                }
+            )
+        }
+        .fullScreenCover(
+            isPresented: Binding(
+                get: { slideshowLaunch != nil },
+                set: { if !$0 { slideshowLaunch = nil } }
+            ),
+            onDismiss: applySlideshowRetarget
+        ) {
+            if case .indexed(let store, let filter, let start, let count) = slideshowLaunch {
+                IndexedSlideshowView(
+                    title: title,
+                    totalCount: count,
+                    store: store,
+                    filter: filter,
+                    initialIndex: start,
+                    onAssetChanged: { asset in
+                        slideshowLastAsset = asset
+                    }
+                )
+            }
+        }
+        .onChange(of: isShowingSlideshowOptions) { _, isShowing in
+            guard !isShowing, let launch = pendingSlideshow else { return }
+            pendingSlideshow = nil
+            slideshowLaunch = launch
         }
         .alert(item: $alert) { alert in
             Alert(
@@ -3469,6 +3577,17 @@ struct IndexedPhotoViewerView: View {
             Spacer()
 
             viewerBarAction {
+                isShowingSlideshowOptions = true
+            } label: {
+                Image(systemName: "play.rectangle")
+            }
+            .disabled(currentAsset == nil || store.unsortedCount == 0)
+            .accessibilityLabel("播放幻灯片")
+            .accessibilityIdentifier("viewer-slideshow")
+
+            Spacer()
+
+            viewerBarAction {
                 guard !isPreparingShare, let currentAsset else { return }
                 isPreparingShare = true
                 store.requestShareItems(for: [currentAsset]) { items, temporaryURLs in
@@ -3514,6 +3633,21 @@ struct IndexedPhotoViewerView: View {
         }
     }
 
+    /// Follow the slideshow back into the Unsorted sequence. A filtered
+    /// slideshow plays in filtered positions, so the asset's *unfiltered*
+    /// rank is what the grid and this viewer index by.
+    private func applySlideshowRetarget() {
+        guard let asset = slideshowLastAsset else { return }
+        let identifier = asset.localIdentifier
+        Task { @MainActor in
+            guard let rank = try? await store.unsortedSlideshowRank(
+                of: identifier,
+                matching: SlideshowFilter()
+            ) else { return }
+            currentIndex = min(max(0, rank), max(0, totalCount - 1))
+        }
+    }
+
     private func handle(_ result: Result<Void, Error>) {
         if case .failure(let error) = result {
             alert = PhotoVaultAlert(title: "操作失败", message: error.localizedDescription)
@@ -3527,7 +3661,11 @@ struct IndexedPhotoViewerView: View {
 /// The current asset is still kept at full display size while only two small
 /// neighbors are prefetched.
 private struct SlideshowAssetPager: View {
-    let assets: PHFetchResult<PHAsset>
+    let assets: ViewerAssets
+    /// `nil` plays `assets` as it is; otherwise `indices[position]` is the
+    /// offset into `assets` of that playlist position. The content filter is
+    /// the only thing that produces a map.
+    let indices: [Int]?
     @Binding var currentIndex: Int
     let targetSize: CGSize
     let contentMode: PHImageContentMode
@@ -3540,13 +3678,25 @@ private struct SlideshowAssetPager: View {
     @State private var isZooming = false
     @State private var transitionDirection = 1
 
+    private var playlistCount: Int {
+        indices?.count ?? assets.count
+    }
+
     private var safeIndex: Int {
-        min(max(0, currentIndex), max(0, assets.count - 1))
+        min(max(0, currentIndex), max(0, playlistCount - 1))
+    }
+
+    /// The asset behind a *playlist* position, which is what every index in
+    /// this view means. Playback order and the filter stay in one place, so
+    /// the counter, the prefetch window and the swipe all agree.
+    private func asset(at position: Int) -> PHAsset? {
+        guard position >= 0, position < playlistCount else { return nil }
+        let offset = indices.map { $0[position] } ?? position
+        return assets.object(at: offset)
     }
 
     private var currentAsset: PHAsset? {
-        guard assets.count > 0 else { return nil }
-        return assets.object(at: safeIndex)
+        asset(at: safeIndex)
     }
 
     private var currentAssetID: String {
@@ -3644,10 +3794,10 @@ private struct SlideshowAssetPager: View {
     }
 
     private func updatePrefetch() {
-        guard assets.count > 0 else { return }
+        guard playlistCount > 0 else { return }
         let neighborIndexes = [safeIndex - 1, safeIndex + 1]
-            .filter { $0 >= 0 && $0 < assets.count }
-        let neighbors = neighborIndexes.map { assets.object(at: $0) }
+            .filter { $0 >= 0 && $0 < playlistCount }
+        let neighbors = neighborIndexes.compactMap { asset(at: $0) }
 
         let desiredPrefetchKeys = Set(
             neighbors.map { prefetchKey(for: $0) }
@@ -3688,6 +3838,9 @@ private struct SlideshowAssetPager: View {
 private struct IndexedSlideshowAssetPager: View {
     let totalCount: Int
     let store: PhotoLibraryStore
+    /// Pages are LIMIT/OFFSET over the *filtered* order, so the page offsets
+    /// here are playlist positions and the SQL does the filtering.
+    let filter: SlideshowFilter
     @Binding var currentIndex: Int
     @Binding var assetsByIndex: [Int: PHAsset]
     let targetSize: CGSize
@@ -3861,7 +4014,7 @@ private struct IndexedSlideshowAssetPager: View {
 
         let limit = min(pageSize, totalCount - offset)
         let generation = loadGeneration
-        store.fetchUnsortedAssets(offset: offset, limit: limit) { result in
+        store.fetchUnsortedAssets(matching: filter, offset: offset, limit: limit) { result in
             loadingOffsets.remove(offset)
             guard isVisible, loadGeneration == generation else { return }
             switch result {
@@ -3939,33 +4092,79 @@ private struct IndexedSlideshowAssetPager: View {
 
 struct SlideshowView: View {
     let title: String
-    let assets: PHFetchResult<PHAsset>
+    let assets: ViewerAssets
+    /// `nil` plays `assets` as it is; otherwise `indices[position]` is the
+    /// offset into `assets` of that playlist position (the content filter's
+    /// result). Playback, the counter and the neighbor prefetch all count
+    /// *positions*, never raw offsets.
+    let indices: [Int]?
+    /// Reports the *source* offset (into `assets`) of the photo currently on
+    /// screen, so a viewer that launched the slideshow can follow along and
+    /// come back on the last photo the user actually saw.
+    var onSourceIndexChanged: ((Int) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.displayScale) private var displayScale
-    @State private var currentIndex = 0
+    @State private var currentIndex: Int
     @State private var controlsVisible = true
     @State private var isPaused = false
     @AppStorage(SlideshowSettings.intervalStorageKey)
     private var interval: TimeInterval = SlideshowSettings.defaultInterval
-    @State private var isShuffled = false
+    @AppStorage(SlideshowPlaybackSettings.shufflesKey)
+    private var isShuffled = SlideshowPlaybackSettings.defaultShuffles
     @AppStorage(SlideshowSettings.loopsStorageKey)
     private var loops = SlideshowSettings.defaultLoops
     @State private var stoppedAtEnd = false
     @State private var mediaReady = false
     @State private var previousIdleTimerDisabled = false
-    @State private var isFullScreen = false
+    /// Backed by the same preference the launch sheet writes, so "填充满画面"
+    /// chosen before starting and the in-player full-screen button are one
+    /// state instead of two that disagree.
+    @AppStorage(SlideshowPlaybackSettings.fillsScreenKey)
+    private var isFullScreen = SlideshowPlaybackSettings.defaultFillsScreen
     @AppStorage(SlideshowTransitionStyle.storageKey)
     private var transitionStyleRawValue = SlideshowTransitionStyle.fade.rawValue
+
+    init(
+        title: String,
+        assets: ViewerAssets,
+        indices: [Int]? = nil,
+        initialIndex: Int = 0,
+        onSourceIndexChanged: ((Int) -> Void)? = nil
+    ) {
+        self.title = title
+        self.assets = assets
+        self.indices = indices
+        self.onSourceIndexChanged = onSourceIndexChanged
+        let count = indices?.count ?? assets.count
+        _currentIndex = State(
+            initialValue: min(max(0, initialIndex), max(0, count - 1))
+        )
+    }
 
     private var transitionStyle: SlideshowTransitionStyle {
         SlideshowTransitionStyle(rawValue: transitionStyleRawValue) ?? .fade
     }
 
+    private var playlistCount: Int {
+        indices?.count ?? assets.count
+    }
+
+    private func asset(at position: Int) -> PHAsset? {
+        guard position >= 0, position < playlistCount else { return nil }
+        let offset = indices.map { $0[position] } ?? position
+        return assets.object(at: offset)
+    }
+
     private var currentAsset: PHAsset? {
-        guard currentIndex >= 0, currentIndex < assets.count else { return nil }
-        return assets.object(at: currentIndex)
+        asset(at: currentIndex)
+    }
+
+    /// Playlist position -> offset into the source sequence.
+    private func sourceOffset(forPosition position: Int) -> Int? {
+        guard position >= 0, position < playlistCount else { return nil }
+        return indices.map { $0[position] } ?? position
     }
 
     var body: some View {
@@ -3976,6 +4175,7 @@ struct SlideshowView: View {
             GeometryReader { proxy in
                 SlideshowAssetPager(
                     assets: assets,
+                    indices: indices,
                     currentIndex: $currentIndex,
                     targetSize: slideshowTargetSize(for: proxy.size),
                     contentMode: slideshowContentMode,
@@ -4006,6 +4206,8 @@ struct SlideshowView: View {
                                 .frame(width: 36, height: 36)
                                 .glassEffect(.regular.interactive(), in: Circle())
                         }
+                        .accessibilityLabel("关闭幻灯片")
+                        .accessibilityIdentifier("slideshow-close")
 
                         Text(title)
                             .font(.headline)
@@ -4086,9 +4288,10 @@ struct SlideshowView: View {
                                 .font(.caption)
                                 .foregroundStyle(.white.opacity(0.76))
                             Spacer()
-                            Text("\(currentIndex + 1) / \(assets.count)")
+                            Text("\(currentIndex + 1) / \(playlistCount)")
                                 .font(.caption.weight(.medium))
                                 .monospacedDigit()
+                                .accessibilityIdentifier("slideshow-counter")
                         }
                     }
                     .foregroundStyle(.white)
@@ -4110,6 +4313,10 @@ struct SlideshowView: View {
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = previousIdleTimerDisabled
         }
+        .onChange(of: currentIndex) { _, position in
+            guard let offset = sourceOffset(forPosition: position) else { return }
+            onSourceIndexChanged?(offset)
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 UIApplication.shared.isIdleTimerDisabled = true
@@ -4124,7 +4331,7 @@ struct SlideshowView: View {
         .task(id: slideshowTaskID) {
             guard scenePhase == .active,
                   !isPaused,
-                  assets.count > 1
+                  playlistCount > 1
             else { return }
             while !Task.isCancelled {
                 do {
@@ -4161,21 +4368,21 @@ struct SlideshowView: View {
     }
 
     private func showPrevious() {
-        guard assets.count > 1 else { return }
+        guard playlistCount > 1 else { return }
         stoppedAtEnd = false
-        currentIndex = currentIndex == 0 ? assets.count - 1 : currentIndex - 1
+        currentIndex = currentIndex == 0 ? playlistCount - 1 : currentIndex - 1
     }
 
     private func showNext() {
-        guard assets.count > 1 else { return }
+        guard playlistCount > 1 else { return }
         if isShuffled {
             stoppedAtEnd = false
             var nextIndex = currentIndex
             while nextIndex == currentIndex {
-                nextIndex = Int.random(in: 0..<assets.count)
+                nextIndex = Int.random(in: 0..<playlistCount)
             }
             currentIndex = nextIndex
-        } else if currentIndex == assets.count - 1 {
+        } else if currentIndex == playlistCount - 1 {
             if loops {
                 stoppedAtEnd = false
                 isPaused = false
@@ -4212,27 +4419,57 @@ struct SlideshowView: View {
 /// unassigned result.
 struct IndexedSlideshowView: View {
     let title: String
+    /// The number of photos *after* filtering: this is the playlist length,
+    /// not `store.unsortedCount`, because the pages below are read from the
+    /// filtered order.
     let totalCount: Int
     @ObservedObject var store: PhotoLibraryStore
+    /// Applied in SQL against the index, so a filtered Unsorted slideshow
+    /// pages straight through its matches instead of enumerating the library.
+    let filter: SlideshowFilter
+    /// Reports the photo on screen so a viewer that launched the slideshow can
+    /// come back on the last photo the user actually saw.
+    var onAssetChanged: ((PHAsset) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.displayScale) private var displayScale
-    @State private var currentIndex = 0
+    @State private var currentIndex: Int
     @State private var assetsByIndex: [Int: PHAsset] = [:]
     @State private var mediaReady = false
     @State private var controlsVisible = true
     @State private var isPaused = false
     @AppStorage(SlideshowSettings.intervalStorageKey)
     private var interval: TimeInterval = SlideshowSettings.defaultInterval
-    @State private var isShuffled = false
+    @AppStorage(SlideshowPlaybackSettings.shufflesKey)
+    private var isShuffled = SlideshowPlaybackSettings.defaultShuffles
     @AppStorage(SlideshowSettings.loopsStorageKey)
     private var loops = SlideshowSettings.defaultLoops
     @State private var stoppedAtEnd = false
     @State private var previousIdleTimerDisabled = false
-    @State private var isFullScreen = false
+    /// Same preference the launch sheet writes; see `SlideshowView`.
+    @AppStorage(SlideshowPlaybackSettings.fillsScreenKey)
+    private var isFullScreen = SlideshowPlaybackSettings.defaultFillsScreen
     @AppStorage(SlideshowTransitionStyle.storageKey)
     private var transitionStyleRawValue = SlideshowTransitionStyle.fade.rawValue
+
+    init(
+        title: String,
+        totalCount: Int,
+        store: PhotoLibraryStore,
+        filter: SlideshowFilter = SlideshowFilter(),
+        initialIndex: Int = 0,
+        onAssetChanged: ((PHAsset) -> Void)? = nil
+    ) {
+        self.title = title
+        self.totalCount = totalCount
+        self.store = store
+        self.filter = filter
+        self.onAssetChanged = onAssetChanged
+        _currentIndex = State(
+            initialValue: min(max(0, initialIndex), max(0, totalCount - 1))
+        )
+    }
 
     private var transitionStyle: SlideshowTransitionStyle {
         SlideshowTransitionStyle(rawValue: transitionStyleRawValue) ?? .fade
@@ -4250,6 +4487,7 @@ struct IndexedSlideshowView: View {
                 IndexedSlideshowAssetPager(
                     totalCount: totalCount,
                     store: store,
+                    filter: filter,
                     currentIndex: $currentIndex,
                     assetsByIndex: $assetsByIndex,
                     targetSize: slideshowTargetSize(for: proxy.size),
@@ -4277,6 +4515,8 @@ struct IndexedSlideshowView: View {
                                 .frame(width: 36, height: 36)
                                 .glassEffect(.regular.interactive(), in: Circle())
                         }
+                        .accessibilityLabel("关闭幻灯片")
+                        .accessibilityIdentifier("slideshow-close")
 
                         Text(title)
                             .font(.headline)
@@ -4346,6 +4586,7 @@ struct IndexedSlideshowView: View {
                             Text("\(min(currentIndex + 1, max(1, totalCount))) / \(totalCount)")
                                 .font(.caption.weight(.medium))
                                 .monospacedDigit()
+                                .accessibilityIdentifier("slideshow-counter")
                         }
                     }
                     .foregroundStyle(.white)
@@ -4375,6 +4616,9 @@ struct IndexedSlideshowView: View {
         }
         .onChange(of: currentIndex) { _, _ in
             mediaReady = false
+            if let currentAsset {
+                onAssetChanged?(currentAsset)
+            }
         }
         .task(id: timerTaskID) {
             guard scenePhase == .active,

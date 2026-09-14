@@ -275,6 +275,126 @@ enum SlideshowSettings {
     static let intervalValues: [TimeInterval] = [3, 5, 8, 12]
 }
 
+/// What a slideshow is allowed to play.
+///
+/// The launch sheet offers one of these; `all` is the plain "play everything
+/// in the order it is already in" behaviour the app had before the sheet
+/// existed, so it stays first and stays the default. Every other case is a
+/// filter *by picture*, never by metadata the viewer would have to download:
+/// width/height, media subtype and the favourite flag are all local metadata,
+/// which is what keeps "play only landscapes" instant on a 100k library.
+///
+/// Names say what is **kept**, never what is dropped, so the label the user
+/// taps is the same thing the filter asserts.
+enum SlideshowContentFilter: String, CaseIterable, Identifiable {
+    case all = "all"
+    case landscape = "landscape"
+    case portrait = "portrait"
+    case square = "square"
+    case panorama = "panorama"
+    case highQuality = "highQuality"
+
+    static let storageKey = "PhotoVault.slideshow.contentFilter"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all: return "全部照片"
+        case .landscape: return "横屏照片"
+        case .portrait: return "竖屏照片"
+        case .square: return "方形照片"
+        case .panorama: return "全景照片"
+        case .highQuality: return "高清照片"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .all:
+            return "按图库顺序播放全部内容，照片和视频都会出现。"
+        case .landscape:
+            return "只播放宽大于高的照片，适合横着看。"
+        case .portrait:
+            return "只播放高大于宽的照片。"
+        case .square:
+            return "只播放长短边接近的照片。"
+        case .panorama:
+            return "只播放系统标记的全景照片。"
+        case .highQuality:
+            return "只播放像素不低于屏幕的照片，铺满全屏也不会糊。"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .all: return "photo.stack"
+        case .landscape: return "rectangle"
+        case .portrait: return "rectangle.portrait"
+        case .square: return "square"
+        case .panorama: return "pano"
+        case .highQuality: return "sparkles"
+        }
+    }
+}
+
+/// Independent switches applied *on top of* the content filter. They are not
+/// part of it because they combine with every case: "landscapes, camera
+/// shots only, favourites only" is a legitimate thing to ask for.
+struct SlideshowRefinements: Equatable {
+    var skipsScreenshots = false
+    var onlyFavorites = false
+    var photosOnly = false
+
+    static let skipsScreenshotsKey = "PhotoVault.slideshow.skipsScreenshots"
+    static let onlyFavoritesKey = "PhotoVault.slideshow.onlyFavorites"
+    static let photosOnlyKey = "PhotoVault.slideshow.photosOnly"
+
+    var isDefault: Bool { !skipsScreenshots && !onlyFavorites && !photosOnly }
+}
+
+/// How the slideshow plays, as opposed to what it plays. `interval` and
+/// `loops` already existed in the settings panel; `fillsScreen` and `shuffles`
+/// moved here so the launch sheet is the single place a slideshow is set up.
+enum SlideshowPlaybackSettings {
+    static let fillsScreenKey = "PhotoVault.slideshow.fillsScreen"
+    static let shufflesKey = "PhotoVault.slideshow.shuffles"
+    static let defaultFillsScreen = false
+    static let defaultShuffles = false
+}
+
+/// A content filter with everything it needs to decide. The screen size is
+/// captured when the slideshow is set up: "higher resolution than the screen"
+/// is only meaningful against a concrete display.
+struct SlideshowFilter: Equatable {
+    var content: SlideshowContentFilter = .all
+    var refinements = SlideshowRefinements()
+    var screenPixelSize: CGSize = .zero
+
+    /// True when nothing is filtered out, which lets a slideshow play a
+    /// `PHFetchResult` directly instead of materialising an index map.
+    var keepsEverything: Bool {
+        content == .all && refinements.isDefault
+    }
+
+    var summary: String {
+        var parts: [String] = []
+        if content != .all {
+            parts.append(content.title)
+        }
+        if refinements.skipsScreenshots {
+            parts.append("不含截屏")
+        }
+        if refinements.onlyFavorites {
+            parts.append("仅收藏")
+        }
+        if refinements.photosOnly {
+            parts.append("仅照片")
+        }
+        return parts.isEmpty ? "全部照片" : parts.joined(separator: " · ")
+    }
+}
+
 /// The page that should be selected when the app creates its root view.
 /// Album destinations store the PhotoKit local identifier rather than the
 /// localized title so renaming an album does not invalidate the preference.
@@ -313,7 +433,11 @@ struct PhotoViewerRequest: Identifiable {
     let assetIdentifier: String
     let previewImage: UIImage?
 
-    init(index: Int, assetIdentifier: String, previewImage: UIImage?) {
+    init(
+        index: Int,
+        assetIdentifier: String,
+        previewImage: UIImage?
+    ) {
         self.index = index
         self.assetIdentifier = assetIdentifier
         self.previewImage = previewImage

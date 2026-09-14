@@ -358,3 +358,284 @@ final class PhotoViewerDismissUITests: XCTestCase {
         assertGridIsAlive(after: app)
     }
 }
+
+
+/// Slideshow launch options: the sheet is the single place a slideshow is set
+/// up, and it can be opened from the grid toolbar ("play everything in view")
+/// or from the detail page ("start here, on this photo").
+///
+/// The interval is pinned through the UserDefaults argument domain so the
+/// assertions do not race autoplay: reading "3 / 33" a second later would
+/// otherwise be "4 / 33".
+@MainActor
+final class SlideshowOptionsUITests: XCTestCase {
+
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+    }
+
+    private func launchToGrid() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments += [
+            "-PhotoVault.slideshow.interval", "12",
+            "-PhotoVault.slideshow.fillsScreen", "NO",
+            "-PhotoVault.slideshow.shuffles", "NO",
+            // The launch sheet persists what the user last chose, and the
+            // argument domain outranks it. Without this the content filter
+            // leaks in from whatever a previous run selected — and a filtered
+            // playlist legitimately starts on a *different* position, which
+            // would make this class order-dependent. Only safe where the test
+            // does not itself change the filter: the argument domain is
+            // read-only, so a picker write there is silently ignored.
+            "-PhotoVault.slideshow.contentFilter", "all",
+            "-PhotoVault.slideshow.skipsScreenshots", "NO",
+            "-PhotoVault.slideshow.onlyFavorites", "NO",
+            "-PhotoVault.slideshow.photosOnly", "NO",
+        ]
+        app.launch()
+
+        let grid = app.collectionViews["photo-grid"]
+        if grid.waitForExistence(timeout: 15) { return app }
+
+        let libraryRow = app.staticTexts["图库"].firstMatch
+        if libraryRow.waitForExistence(timeout: 5) { libraryRow.tap() }
+        XCTAssertTrue(grid.waitForExistence(timeout: 20), "图库网格应加载出照片")
+        return app
+    }
+
+    /// Waits until an element is both present and hittable.
+    ///
+    /// The grid toolbar is rebuilt whenever the launch window or the album scan
+    /// publishes, and XCUITest resolves an element *before* it taps it: a tap
+    /// aimed at "播放" can land on its neighbour "选择" instead. Waiting for
+    /// hittable (rather than merely existing) removes most of that window.
+    private func waitUntilHittable(
+        _ element: XCUIElement,
+        timeout: TimeInterval = 10
+    ) -> Bool {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true"),
+            object: element
+        )
+        return XCTWaiter().wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    /// Opens the slideshow sheet from the grid toolbar, retrying the tap.
+    private func openSlideshowOptions(fromGrid app: XCUIApplication) {
+        let play = app.buttons["播放"]
+        XCTAssertTrue(play.waitForExistence(timeout: 20), "图库页应有播放按钮")
+
+        for attempt in 1...3 {
+            XCTAssertTrue(waitUntilHittable(play), "播放按钮应可点击")
+            play.tap()
+            if app.buttons["slideshow-start"].waitForExistence(timeout: 6) { return }
+
+            if app.buttons["完成"].waitForExistence(timeout: 0.5) {
+                // The tap landed on 选择: leave selection mode and try again.
+                app.buttons["完成"].tap()
+            }
+            if attempt == 3 {
+                XCTFail("点播放后应弹出幻灯片设置面板")
+            }
+        }
+    }
+
+    /// Opens 未整理 (the SQLite-index paged grid) and taps into its viewer.
+    ///
+    /// In compact width the sidebar starts collapsed, so the unsorted list is
+    /// behind the leading navigation-bar button.
+    private func openUnsortedViewer() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments += [
+            "-PhotoVault.slideshow.interval", "12",
+            "-PhotoVault.slideshow.fillsScreen", "NO",
+            "-PhotoVault.slideshow.shuffles", "NO",
+        ]
+        app.launch()
+
+        XCTAssertTrue(
+            app.cells.firstMatch.waitForExistence(timeout: 20),
+            "图库网格应加载出照片"
+        )
+
+        let sidebarToggle = app.navigationBars.buttons.firstMatch
+        XCTAssertTrue(sidebarToggle.waitForExistence(timeout: 5), "应有侧栏按钮")
+        sidebarToggle.tap()
+
+        let unsortedRow = app.staticTexts["未整理"].firstMatch
+        XCTAssertTrue(unsortedRow.waitForExistence(timeout: 8), "侧栏应有未整理入口")
+        unsortedRow.tap()
+
+        let firstCell = app.cells.firstMatch
+        XCTAssertTrue(firstCell.waitForExistence(timeout: 20), "未整理网格应加载出照片")
+        firstCell.tap()
+        XCTAssertTrue(
+            app.buttons["关闭"].waitForExistence(timeout: 10),
+            "未整理查看器应打开"
+        )
+        return app
+    }
+
+    /// The viewer's "current / total" label, e.g. `3 / 33` -> 3.
+    ///
+    /// Same snapshot rule as the slideshow counter: settle the app before
+    /// resolving `.label`.
+    private func viewerIndex(in app: XCUIApplication) -> Int? {
+        let counter = app.staticTexts["viewer-counter"]
+        guard counter.waitForExistence(timeout: 10) else { return nil }
+        return Int(
+            counter.label
+                .split(separator: "/")
+                .first?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+        )
+    }
+
+    /// The slideshow's "current / total" label, e.g. `3 / 33` -> 3.
+    ///
+    /// Same snapshot rule as the viewer counter: settle the app before
+    /// resolving `.label`, otherwise XCTest fails the test instead of
+    /// returning a value.
+    private func slideshowIndex(in app: XCUIApplication) -> Int? {
+        let counter = app.staticTexts["slideshow-counter"]
+        guard counter.waitForExistence(timeout: 10) else { return nil }
+        return Int(
+            counter.label
+                .split(separator: "/")
+                .first?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+        )
+    }
+
+    func testLibraryPlaybackSheetStartsSlideshow() {
+        let app = launchToGrid()
+
+        openSlideshowOptions(fromGrid: app)
+        // The options the user asked for must be on the sheet, named for what
+        // they keep rather than what they drop.
+        XCTAssertTrue(app.staticTexts["图库幻灯片"].exists, "面板标题应是图库幻灯片")
+        XCTAssertTrue(app.staticTexts["播放内容"].exists, "面板应有播放内容分组")
+        XCTAssertTrue(app.switches["排除截屏"].exists, "面板应有排除截屏开关")
+        XCTAssertTrue(app.switches["填充满画面"].exists, "面板应有填充满画面开关")
+
+        // The status line is the sheet's own proof that it resolved the real
+        // sequence (and not an empty fallback) before offering to start.
+        let status = app.staticTexts
+            .matching(NSPredicate(format: "label BEGINSWITH %@", "将播放"))
+            .firstMatch
+        XCTAssertTrue(status.waitForExistence(timeout: 10), "面板应统计出将播放的张数")
+
+        app.buttons["slideshow-start"].tap()
+
+        XCTAssertEqual(
+            slideshowIndex(in: app),
+            1,
+            "从图库播放应从第一张开始"
+        )
+
+        app.buttons["slideshow-close"].tap()
+        XCTAssertTrue(
+            app.collectionViews["photo-grid"].waitForExistence(timeout: 10),
+            "关闭幻灯片后应回到图库网格"
+        )
+    }
+
+    func testDetailSlideshowStartsFromTheCurrentPhoto() {
+        let app = launchToGrid()
+
+        let cell = app.cells["photo-cell-2"]
+        XCTAssertTrue(cell.waitForExistence(timeout: 20), "第 2 个 cell 应存在")
+        cell.tap()
+        XCTAssertTrue(
+            app.buttons["关闭"].waitForExistence(timeout: 10),
+            "点按 cell 后详情页应打开"
+        )
+
+        // Which cell the tap actually landed on is not the point of this test;
+        // that the slideshow starts on the photo the viewer is showing is. Read
+        // the viewer's own index instead of assuming the tap hit cell 2.
+        guard let openedAt = viewerIndex(in: app) else {
+            XCTFail("详情页应显示当前第几张")
+            return
+        }
+
+        let slideshowButton = app.buttons["viewer-slideshow"]
+        XCTAssertTrue(
+            waitUntilHittable(slideshowButton, timeout: 5),
+            "详情页底部操作栏应有播放幻灯片按钮"
+        )
+        slideshowButton.tap()
+
+        XCTAssertTrue(
+            app.buttons["slideshow-start"].waitForExistence(timeout: 5),
+            "详情页点播放幻灯片后应弹出设置面板"
+        )
+        app.buttons["slideshow-start"].tap()
+
+        XCTAssertEqual(
+            slideshowIndex(in: app),
+            openedAt,
+            "从详情页播放幻灯片应从当前这张（第 \(openedAt) 张）开始"
+        )
+
+        app.buttons["slideshow-close"].tap()
+        XCTAssertTrue(
+            app.buttons["关闭"].waitForExistence(timeout: 10),
+            "关闭幻灯片后应回到详情页"
+        )
+    }
+
+    /// 未整理详情页：筛选走 SQLite 索引，播放顺序是过滤后的顺序。
+    func testUnsortedDetailSlideshowHonoursContentFilter() {
+        let app = openUnsortedViewer()
+
+        let slideshowButton = app.buttons["viewer-slideshow"]
+        XCTAssertTrue(
+            waitUntilHittable(slideshowButton, timeout: 5),
+            "未整理详情页应有播放幻灯片按钮"
+        )
+        slideshowButton.tap()
+
+        XCTAssertTrue(
+            app.buttons["slideshow-start"].waitForExistence(timeout: 8),
+            "未整理详情页点播放后应弹出设置面板"
+        )
+        // Reset to the first option first: the sheet persists the last choice,
+        // and tapping the already-selected row would not prove the picker (or
+        // the SQL recount behind it) actually responds.
+        let allPhotos = app.buttons["全部照片"]
+        XCTAssertTrue(allPhotos.waitForExistence(timeout: 5), "面板应有全部照片选项")
+        allPhotos.tap()
+
+        let landscape = app.buttons["横屏照片"]
+        XCTAssertTrue(landscape.waitForExistence(timeout: 5), "面板应有横屏照片选项")
+        landscape.tap()
+
+        let status = app.staticTexts
+            .matching(NSPredicate(
+                format: "label BEGINSWITH %@ AND label CONTAINS %@",
+                "将播放",
+                "横屏照片"
+            ))
+            .firstMatch
+        if !status.waitForExistence(timeout: 15) {
+            XCTFail(
+                "面板应显示横屏筛选后的张数（此时统计来自索引）；"
+                    + "texts=\(app.staticTexts.allElementsBoundByIndex.map { $0.label })"
+            )
+        }
+
+        app.buttons["slideshow-start"].tap()
+        XCTAssertEqual(
+            slideshowIndex(in: app),
+            1,
+            "从网格播放应从筛选后的第一张开始"
+        )
+
+        app.buttons["slideshow-close"].tap()
+        XCTAssertTrue(
+            app.buttons["关闭"].waitForExistence(timeout: 10),
+            "关闭幻灯片后应回到未整理详情页"
+        )
+    }
+}

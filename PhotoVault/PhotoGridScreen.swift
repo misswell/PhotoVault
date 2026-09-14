@@ -15,7 +15,12 @@ struct PhotoGridScreen: View {
     @State private var selectedAssets: [String: PHAsset] = [:]
     @State private var viewerRequest: PhotoViewerRequest?
     @State private var isViewerTransitioning = false
-    @State private var isShowingSlideshow = false
+    /// The slideshow is set up in a sheet first (content filter + playback
+    /// options), then presented once that sheet is out of the way: presenting
+    /// a cover while the sheet is still up would drop the cover.
+    @State private var isShowingSlideshowOptions = false
+    @State private var pendingSlideshow: SlideshowLaunch?
+    @State private var slideshowLaunch: SlideshowLaunch?
     @State private var isShowingAlbumPicker = false
     // Assets the album picker will operate on: the selection-mode batch or a
     // single asset chosen through the grid's context menu.
@@ -48,7 +53,7 @@ struct PhotoGridScreen: View {
                     PhotoGridView(
                         assets: assets,
                         isActive: !isViewerTransitioning
-                            && !isShowingSlideshow,
+                            && slideshowLaunch == nil,
                         selectionMode: selectionMode,
                         selectedIDs: Set(selectedAssets.keys),
                         transitionCoordinator: transitionCoordinator,
@@ -106,6 +111,16 @@ struct PhotoGridScreen: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         )
         .navigationTitle(title)
+        #if DEBUG
+        // Runs the memory-vs-SQL filter parity check when the app is launched
+        // with `--pv-slideshow-filter-probe`, once the index has something in
+        // it. The viewer transition has its own probe, driven from
+        // `PhotoViewerPresentationBridge`.
+        .task(id: assets?.count ?? 0) {
+            guard assets != nil else { return }
+            await SlideshowFilterProbe.runIfRequested(store: store)
+        }
+        #endif
         .onAppear {
             photoVaultTrace("grid screen appear title=\(title)")
         }
@@ -144,7 +159,7 @@ struct PhotoGridScreen: View {
 
                 if !selectionMode, let assets, assets.count > 0 {
                     Button {
-                        isShowingSlideshow = true
+                        isShowingSlideshowOptions = true
                     } label: {
                         Label("播放", systemImage: "play.fill")
                     }
@@ -202,10 +217,38 @@ struct PhotoGridScreen: View {
                 }
             }
         }
-        .fullScreenCover(isPresented: $isShowingSlideshow) {
-            if let assets {
-                SlideshowView(title: title, assets: assets)
+        .sheet(isPresented: $isShowingSlideshowOptions) {
+            SlideshowOptionsSheet(
+                title: "\(title)幻灯片",
+                source: .sequence(
+                    .fetch(assets ?? PHFetchResult<PHAsset>()),
+                    startingIndex: 0
+                ),
+                onStart: { launch in
+                    pendingSlideshow = launch
+                    isShowingSlideshowOptions = false
+                }
+            )
+        }
+        .fullScreenCover(
+            isPresented: Binding(
+                get: { slideshowLaunch != nil },
+                set: { if !$0 { slideshowLaunch = nil } }
+            )
+        ) {
+            if case .sequence(let assets, let indices, let start, _) = slideshowLaunch {
+                SlideshowView(
+                    title: title,
+                    assets: assets,
+                    indices: indices,
+                    initialIndex: start
+                )
             }
+        }
+        .onChange(of: isShowingSlideshowOptions) { _, isShowing in
+            guard !isShowing, let launch = pendingSlideshow else { return }
+            pendingSlideshow = nil
+            slideshowLaunch = launch
         }
         .sheet(isPresented: $isShowingAlbumPicker) {
             AlbumPickerSheet(
@@ -430,7 +473,12 @@ struct UnsortedPhotosScreen: View {
     /// while the previous zoom-out was still running.
     @State private var viewerRequest: PhotoViewerRequest?
     @State private var isViewerTransitioning = false
-    @State private var isShowingSlideshow = false
+    /// The slideshow is set up in a sheet first (content filter + playback
+    /// options), then presented once that sheet is out of the way: presenting
+    /// a cover while the sheet is still up would drop the cover.
+    @State private var isShowingSlideshowOptions = false
+    @State private var pendingSlideshow: SlideshowLaunch?
+    @State private var slideshowLaunch: SlideshowLaunch?
     @State private var isShowingAlbumPicker = false
     // Assets the album picker will operate on: the selection-mode batch or a
     // single asset chosen through the grid's context menu.
@@ -502,7 +550,7 @@ struct UnsortedPhotosScreen: View {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 if !selectionMode, store.unsortedCount > 0 {
                     Button {
-                        isShowingSlideshow = true
+                        isShowingSlideshowOptions = true
                     } label: {
                         Label("播放", systemImage: "play.fill")
                     }
@@ -546,12 +594,40 @@ struct UnsortedPhotosScreen: View {
                 }
             }
         }
-        .fullScreenCover(isPresented: $isShowingSlideshow) {
-            IndexedSlideshowView(
-                title: "未整理",
-                totalCount: store.unsortedCount,
-                store: store
+        .sheet(isPresented: $isShowingSlideshowOptions) {
+            SlideshowOptionsSheet(
+                title: "未整理幻灯片",
+                source: .indexed(
+                    store,
+                    startingOffset: 0,
+                    startingAssetID: nil
+                ),
+                onStart: { launch in
+                    pendingSlideshow = launch
+                    isShowingSlideshowOptions = false
+                }
             )
+        }
+        .fullScreenCover(
+            isPresented: Binding(
+                get: { slideshowLaunch != nil },
+                set: { if !$0 { slideshowLaunch = nil } }
+            )
+        ) {
+            if case .indexed(let store, let filter, let start, let count) = slideshowLaunch {
+                IndexedSlideshowView(
+                    title: "未整理",
+                    totalCount: count,
+                    store: store,
+                    filter: filter,
+                    initialIndex: start
+                )
+            }
+        }
+        .onChange(of: isShowingSlideshowOptions) { _, isShowing in
+            guard !isShowing, let launch = pendingSlideshow else { return }
+            pendingSlideshow = nil
+            slideshowLaunch = launch
         }
         .sheet(isPresented: $isShowingAlbumPicker) {
             AlbumPickerSheet(
@@ -609,7 +685,7 @@ struct UnsortedPhotosScreen: View {
                 totalCount: store.unsortedCount,
                 store: store,
                 isActive: !isViewerTransitioning
-                    && !isShowingSlideshow,
+                    && slideshowLaunch == nil,
                 selectionMode: selectionMode,
                 selectedIDs: Set(selectedAssets.keys),
                 transitionCoordinator: transitionCoordinator,
