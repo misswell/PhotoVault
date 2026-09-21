@@ -1051,7 +1051,7 @@ final class PhotoIndexStore: @unchecked Sendable {
     /// edge case, see `unsortedIdentifiers`). Duplicated here rather than
     /// inlined three times: a reader-side failure must never stall the
     /// Unsorted screen, the detail viewer *or* a slideshow.
-    private func readWithFallback<T>(
+    private func readWithFallback<T: Sendable>(
         _ readOnReader: @escaping (PhotoIndexStore) throws -> T,
         _ readOnWriter: @escaping (PhotoIndexStore) throws -> T,
         completion: @escaping (Result<T, Error>) -> Void

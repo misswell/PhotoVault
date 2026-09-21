@@ -147,7 +147,7 @@ struct PhotoSearchConfiguration: Equatable, Sendable {
 // ---------------------------------------------------------------------------
 // MARK: - Engine
 
-final class PhotoSearchEngine {
+final class PhotoSearchEngine: Sendable {
 
     /// Score carried by a metadata-only hit. Not a similarity: it exists so the
     /// result type needs no optional, and `isMetadataOnly` is what callers check.

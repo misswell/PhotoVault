@@ -347,6 +347,85 @@ private struct ViewerMediaView: View {
     }
 }
 
+/// Resolves downward intent before the horizontal scroll view starts paging.
+/// This recognizer only arbitrates; UIKit's zoom gesture still owns every pixel
+/// of the dismissal. No replacement scroll-view delegate or failure dependency.
+private final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognizerDelegate {
+    weak var pagingPan: UIGestureRecognizer?
+    var canReserveDownwardDrag: (() -> Bool)?
+    private var origin: CGPoint?
+
+    init(pagingPan: UIGestureRecognizer) {
+        self.pagingPan = pagingPan
+        super.init(target: nil, action: nil)
+        delegate = self
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard origin == nil, touches.count == 1,
+              event.allTouches?.count == 1,
+              canReserveDownwardDrag?() == true,
+              let touch = touches.first else {
+            state = state == .possible ? .failed : .cancelled
+            return
+        }
+        origin = touch.location(in: view)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard let origin, let touch = touches.first else { return }
+        if state == .began || state == .changed {
+            state = .changed
+            return
+        }
+        guard state == .possible else { return }
+        let location = touch.location(in: view)
+        let dx = location.x - origin.x
+        let dy = location.y - origin.y
+        guard hypot(dx, dy) >= 6 else { return }
+        // A slightly diagonal pull remains a dismissal. Clearly horizontal
+        // motion and upward drags immediately leave the pager alone.
+        state = dy > 0 && dy >= abs(dx) ? .began : .failed
+        if state == .began { photoVaultTrace("viewer_downward_intent") }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        switch state {
+        case .possible: state = .failed
+        case .began, .changed: state = .ended
+        default: break
+        }
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        if state == .possible { state = .failed }
+        else if state == .began || state == .changed { state = .cancelled }
+    }
+
+    override func reset() {
+        super.reset()
+        origin = nil
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
+        preventedGestureRecognizer === pagingPan
+    }
+
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+        false
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        otherGestureRecognizer !== pagingPan
+    }
+}
+
 /// UIKit's page controller owns the interactive transition from beginning to
 /// end. SwiftUI's TabView is convenient for a static pager, but resetting its
 /// selection while its internal UIPageViewController is still animating can
@@ -431,6 +510,7 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
     final class Coordinator: NSObject, UIPageViewControllerDataSource,
         UIPageViewControllerDelegate {
         private weak var pageController: UIPageViewController?
+        private var downwardIntentGesture: ViewerDownwardIntentGesture?
         private var pageCount = 0
         private var displayedIndex: Int?
         private var assetProvider: ((Int) -> PHAsset?) = { _ in nil }
@@ -461,6 +541,16 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
 
         func attach(controller: UIPageViewController) {
             pageController = controller
+            guard let scrollView = controller.view.subviews.compactMap({ $0 as? UIScrollView }).first
+            else { return }
+            let intent = ViewerDownwardIntentGesture(pagingPan: scrollView.panGestureRecognizer)
+            intent.canReserveDownwardDrag = { [weak self] in
+                guard let self else { return false }
+                return !self.isZooming && !self.isManualTransitionInProgress
+                    && !self.isScrubbing && self.pendingProgrammaticIndex == nil
+            }
+            scrollView.addGestureRecognizer(intent)
+            downwardIntentGesture = intent
         }
 
         func invalidate() {
@@ -473,23 +563,32 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
             // still finishing a horizontal transition. Detach the delegates
             // before releasing the hosted pages so a late UIKit callback
             // cannot write into the screen that is already going away.
+            if let downwardIntentGesture {
+                downwardIntentGesture.view?.removeGestureRecognizer(downwardIntentGesture)
+            }
+            downwardIntentGesture = nil
             pageController?.dataSource = nil
             pageController?.delegate = nil
             pageController?.view.isUserInteractionEnabled = false
             pages.removeAll()
             pendingProgrammaticIndex = nil
             displayedIndex = nil
-            if isZooming {
-                isZooming = false
-                onZoomingChanged?(false)
-            }
-            if isManualTransitionInProgress {
-                isManualTransitionInProgress = false
-                onPagingChanged?(false)
-            }
+
+            // The SwiftUI owner may be in the middle of removing this
+            // representable. Publishing the final zoom/paging values here
+            // re-enters its @State setters from UIKit's animation callback
+            // and can trip Swift's exclusivity checker. Once the pager is
+            // being dismantled, no consumer can act on these values anyway;
+            // sever callbacks before clearing the local flags.
             onMediaReady = nil
             onZoomingChanged = nil
             onPagingChanged = nil
+            if isZooming {
+                isZooming = false
+            }
+            if isManualTransitionInProgress {
+                isManualTransitionInProgress = false
+            }
             assetProvider = { _ in nil }
             pageController = nil
         }
@@ -1715,6 +1814,7 @@ struct PhotoViewerView: View {
                     .frame(width: 46, height: 46)
                     .contentShape(Rectangle())
             }
+            .accessibilityIdentifier("viewer-close")
 
             Spacer()
 
@@ -3480,6 +3580,7 @@ struct IndexedPhotoViewerView: View {
                     .frame(width: 46, height: 46)
                     .contentShape(Rectangle())
             }
+            .accessibilityIdentifier("viewer-close")
 
             Spacer()
 

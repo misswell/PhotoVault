@@ -24,8 +24,9 @@ final class PhotoViewerDismissUITests: XCTestCase {
     /// Launches the app and waits for the library grid. On compact width the
     /// sidebar can start expanded, in which case the grid is one tap away.
     @discardableResult
-    private func launchToGrid() -> XCUIApplication {
+    private func launchToGrid(arguments: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
+        app.launchArguments += arguments
         app.launch()
 
         let grid = app.collectionViews["photo-grid"]
@@ -42,7 +43,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         XCTAssertTrue(cell.waitForExistence(timeout: 20), "第 \(index) 个 cell 应存在")
         cell.tap()
         XCTAssertTrue(
-            app.buttons["关闭"].waitForExistence(timeout: 10),
+            app.buttons["viewer-close"].waitForExistence(timeout: 10),
             "点按 cell \(index) 后查看器应打开"
         )
     }
@@ -96,7 +97,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         )
         firstCell.tap()
         XCTAssertTrue(
-            app.buttons["关闭"].waitForExistence(timeout: 10),
+            app.buttons["viewer-close"].waitForExistence(timeout: 10),
             "退出后网格必须仍可交互：再点照片应重新打开查看器"
         )
     }
@@ -107,9 +108,9 @@ final class PhotoViewerDismissUITests: XCTestCase {
     func testCloseButtonDismissesAndGridResponds() throws {
         let app = launchToGrid()
         openViewer(at: 0, in: app)
-        app.buttons["关闭"].tap()
+        app.buttons["viewer-close"].tap()
         XCTAssertFalse(
-            app.buttons["关闭"].waitForExistence(timeout: 3),
+            app.buttons["viewer-close"].waitForExistence(timeout: 3),
             "关闭按钮应让查看器消失"
         )
         assertGridIsAlive(after: app)
@@ -129,9 +130,61 @@ final class PhotoViewerDismissUITests: XCTestCase {
         start.press(forDuration: 0.08, thenDragTo: end)
 
         XCTAssertFalse(
-            app.buttons["关闭"].waitForExistence(timeout: 3),
+            app.buttons["viewer-close"].waitForExistence(timeout: 3),
             "下拉提交后查看器应消失"
         )
+        assertGridIsAlive(after: app)
+    }
+
+    func testOpenAndDismissTransitionsAcceptReplacementRequest() throws {
+        let app = launchToGrid(arguments: ["-viewer-interruption-probe"])
+        let cell = app.cells["photo-cell-0"]
+        XCTAssertTrue(cell.waitForExistence(timeout: 20))
+        cell.tap()
+        expectViewerIndex(3, in: app, "动画中的第二次请求必须打开第 3 张")
+        app.swipeLeft()
+        expectViewerIndex(4, in: app, "旧会话完成回调不得关闭或阻塞新查看器")
+        app.buttons["viewer-close"].tap()
+        assertGridIsAlive(after: app)
+    }
+
+    /// Predominantly downward motion must not become a page turn because of
+    /// a small horizontal component. Exercise both directions from mid-library.
+    func testDiagonalDownwardDragsDismissInsteadOfPaging() throws {
+        let app = launchToGrid()
+        for dx in [-0.18, 0.18] {
+            openViewer(at: 2, in: app)
+            let window = app.windows.firstMatch
+            let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3))
+            let end = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5 + dx, dy: 0.88))
+            start.press(forDuration: 0.05, thenDragTo: end)
+            XCTAssertTrue(app.buttons["viewer-close"].waitForNonExistence(timeout: 5))
+            XCTAssertTrue(app.cells["photo-cell-2"].isHittable)
+        }
+    }
+
+    func testMostlyHorizontalDiagonalDragStillPages() throws {
+        let app = launchToGrid()
+        openViewer(at: 0, in: app)
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.85, dy: 0.4))
+        let end = window.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.47))
+        start.press(forDuration: 0.05, thenDragTo: end)
+        expectViewerIndex(2, in: app)
+        XCTAssertTrue(app.buttons["viewer-close"].exists)
+    }
+
+    func testZoomedPhotoPanDoesNotDismiss() throws {
+        let app = launchToGrid()
+        openViewer(at: 0, in: app)
+        app.pinch(withScale: 2, velocity: 1)
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35))
+        let end = window.coordinate(withNormalizedOffset: CGVector(dx: 0.58, dy: 0.7))
+        start.press(forDuration: 0.05, thenDragTo: end)
+        expectViewerIndex(1, in: app, "放大后的下滑应平移照片，不应退出或翻页")
+        XCTAssertTrue(app.buttons["viewer-close"].exists)
+        app.buttons["viewer-close"].tap()
         assertGridIsAlive(after: app)
     }
 
@@ -149,7 +202,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         start.press(forDuration: 0.08, thenDragTo: end)
 
         XCTAssertTrue(
-            app.buttons["关闭"].waitForExistence(timeout: 3),
+            app.buttons["viewer-close"].waitForExistence(timeout: 3),
             "短下拉应取消退出，查看器留在原地"
         )
         // 取消后查看器必须完全可用：左右翻页仍走 pager。
@@ -165,9 +218,9 @@ final class PhotoViewerDismissUITests: XCTestCase {
         app.swipeLeft()
         expectViewerIndex(3, in: app, "两次左滑后应到第 3 张")
 
-        app.buttons["关闭"].tap()
+        app.buttons["viewer-close"].tap()
         XCTAssertFalse(
-            app.buttons["关闭"].waitForExistence(timeout: 3),
+            app.buttons["viewer-close"].waitForExistence(timeout: 3),
             "翻页后关闭应消失"
         )
         assertGridIsAlive(after: app)
@@ -195,7 +248,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         openViewer(at: 0, in: app)
         expectViewerIndex(1, in: app, "应先打开第 1 张")
 
-        app.buttons["关闭"].tap()
+        app.buttons["viewer-close"].tap()
         waitForViewerToReleaseTouches(in: app)
         targetCoordinate.tap()
 
@@ -225,7 +278,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
             "第一张应可见"
         )
         openViewer(at: 0, in: app)
-        app.buttons["关闭"].tap()
+        app.buttons["viewer-close"].tap()
 
         // 跨整屏取样：残留的透明遮罩往往只盖住一部分，只查 firstMatch 会漏。
         for index in [0, 5, 15] {
@@ -252,7 +305,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         in app: XCUIApplication,
         timeout: TimeInterval = 3
     ) {
-        let close = app.buttons["关闭"]
+        let close = app.buttons["viewer-close"]
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if !close.exists || !close.isHittable { return }
@@ -275,7 +328,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
                 in: app,
                 "第 \(round + 1) 轮应打开第 \(index + 1) 张"
             )
-            app.buttons["关闭"].tap()
+            app.buttons["viewer-close"].tap()
         }
 
         // 收尾：网格仍能正常开查看器，说明没有卡在 transitioning。
@@ -290,8 +343,8 @@ final class PhotoViewerDismissUITests: XCTestCase {
         let app = launchToGrid()
         openViewer(at: 0, in: app)
         Thread.sleep(forTimeInterval: 2.5)
-        XCTAssertTrue(app.buttons["关闭"].exists, "静止期查看器应保持在场")
-        app.buttons["关闭"].tap()
+        XCTAssertTrue(app.buttons["viewer-close"].exists, "静止期查看器应保持在场")
+        app.buttons["viewer-close"].tap()
         XCTAssertTrue(app.cells.firstMatch.waitForExistence(timeout: 10))
     }
 
@@ -338,7 +391,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         }
         firstCell.tap()
         XCTAssertTrue(
-            app.buttons["关闭"].waitForExistence(timeout: 10),
+            app.buttons["viewer-close"].waitForExistence(timeout: 10),
             "未整理查看器应打开"
         )
 
@@ -352,7 +405,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         start.press(forDuration: 0.08, thenDragTo: end)
 
         XCTAssertFalse(
-            app.buttons["关闭"].waitForExistence(timeout: 3),
+            app.buttons["viewer-close"].waitForExistence(timeout: 3),
             "未整理查看器下拉后应消失"
         )
         assertGridIsAlive(after: app)
@@ -473,7 +526,7 @@ final class SlideshowOptionsUITests: XCTestCase {
         XCTAssertTrue(firstCell.waitForExistence(timeout: 20), "未整理网格应加载出照片")
         firstCell.tap()
         XCTAssertTrue(
-            app.buttons["关闭"].waitForExistence(timeout: 10),
+            app.buttons["viewer-close"].waitForExistence(timeout: 10),
             "未整理查看器应打开"
         )
         return app
@@ -635,7 +688,7 @@ final class SlideshowOptionsUITests: XCTestCase {
         XCTAssertTrue(cell.waitForExistence(timeout: 20), "第 2 个 cell 应存在")
         cell.tap()
         XCTAssertTrue(
-            app.buttons["关闭"].waitForExistence(timeout: 10),
+            app.buttons["viewer-close"].waitForExistence(timeout: 10),
             "点按 cell 后详情页应打开"
         )
 
@@ -668,7 +721,7 @@ final class SlideshowOptionsUITests: XCTestCase {
 
         app.buttons["slideshow-close"].tap()
         XCTAssertTrue(
-            app.buttons["关闭"].waitForExistence(timeout: 10),
+            app.buttons["viewer-close"].waitForExistence(timeout: 10),
             "关闭幻灯片后应回到详情页"
         )
     }
@@ -722,7 +775,7 @@ final class SlideshowOptionsUITests: XCTestCase {
 
         app.buttons["slideshow-close"].tap()
         XCTAssertTrue(
-            app.buttons["关闭"].waitForExistence(timeout: 10),
+            app.buttons["viewer-close"].waitForExistence(timeout: 10),
             "关闭幻灯片后应回到未整理详情页"
         )
     }
