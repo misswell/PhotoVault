@@ -353,6 +353,11 @@ private struct ViewerMediaView: View {
 private final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognizerDelegate {
     weak var pagingPan: UIGestureRecognizer?
     var canReserveDownwardDrag: (() -> Bool)?
+    /// The viewer's live dismissal state. The recognizer stays out of the way
+    /// while a pull-back is still bouncing, because the arbitration itself is
+    /// harmless then but the *reservation* is not: blocking the pager for a
+    /// dismissal UIKit cannot start swallows the whole touch.
+    weak var transitionState: PhotoViewerTransitionState?
     private var origin: CGPoint?
 
     init(pagingPan: UIGestureRecognizer) {
@@ -364,12 +369,32 @@ private final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureR
         delaysTouchesEnded = false
     }
 
+    /// Whether this touch may reserve the downward direction.
+    ///
+    /// The shared dismissal state is the same value the presentation bridge
+    /// writes, so the pager can never believe the viewer is at rest while the
+    /// bridge is still inside a cancelled transition.
+    private var mayReserveDownwardDrag: Bool {
+        guard canReserveDownwardDrag?() == true else { return false }
+        guard let transitionState else { return true }
+        return transitionState.canBeginDownwardIntent
+    }
+
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        guard origin == nil, touches.count == 1,
-              event.allTouches?.count == 1,
-              canReserveDownwardDrag?() == true,
-              let touch = touches.first else {
-            state = state == .possible ? .failed : .cancelled
+        // A recognition cycle that did not settle is the recognizer's own
+        // problem; forcing a state here would fight UIKit's reset. Only a
+        // fresh cycle may decide anything.
+        guard state == .possible else { return }
+        let allowed = mayReserveDownwardDrag
+        let dismissState = transitionState.map { $0.interactiveDismissState.label } ?? "none"
+        let touch = touches.count == 1 && event.allTouches?.count == 1
+            ? touches.first : nil
+        photoVaultTrace(
+            "viewer_downward_intent reserve=\(allowed && touch != nil) "
+                + "dismissState=\(dismissState) fingers=\(event.allTouches?.count ?? -1)"
+        )
+        guard allowed, origin == nil, let touch else {
+            state = .failed
             return
         }
         origin = touch.location(in: view)
@@ -389,7 +414,7 @@ private final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureR
         // A slightly diagonal pull remains a dismissal. Clearly horizontal
         // motion and upward drags immediately leave the pager alone.
         state = dy > 0 && dy >= abs(dx) ? .began : .failed
-        if state == .began { photoVaultTrace("viewer_downward_intent") }
+        if state == .began { photoVaultTrace("viewer_downward_intent reserved") }
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
@@ -401,21 +426,35 @@ private final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureR
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
-        if state == .possible { state = .failed }
-        else if state == .began || state == .changed { state = .cancelled }
+        switch state {
+        case .possible: state = .failed
+        case .began, .changed: state = .cancelled
+        default: break
+        }
     }
 
     override func reset() {
         super.reset()
         origin = nil
+        #if DEBUG
+        photoVaultTrace("viewer_downward_intent_reset")
+        #endif
     }
 
     override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
         preventedGestureRecognizer === pagingPan
     }
 
+    /// Only the pager's pan may not preempt this arbitration recognizer.
+    ///
+    /// Answering `false` across the board made the recognizer unpreventable by
+    /// *anything*, which puts it above UIKit's own zoom dismissal gesture — and
+    /// this recognizer is nothing but an arbiter between the pager and that
+    /// gesture. When a cancelled pull-back was still settling, the system
+    /// gesture could not take over, this one still reserved the drag, and the
+    /// whole touch was dropped by both.
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
-        false
+        preventingGestureRecognizer !== pagingPan
     }
 
     func gestureRecognizer(
@@ -435,6 +474,10 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
     let pageCount: Int
     @Binding var currentIndex: Int
     var isScrubbing: Bool = false
+    /// The live viewer session's dismissal state, consulted by the downward
+    /// intent recognizer. nil means "no system dismissal to arbitrate against"
+    /// and leaves the pager alone.
+    var transitionState: PhotoViewerTransitionState? = nil
     let assetProvider: (Int) -> PHAsset?
     let targetSize: CGSize
     let contentMode: PHImageContentMode
@@ -448,7 +491,10 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
 
     func makeCoordinator() -> Coordinator {
         PagerDiagnostics.beginSession()
-        return Coordinator(currentIndex: $currentIndex)
+        return Coordinator(
+            currentIndex: $currentIndex,
+            transitionState: transitionState
+        )
     }
 
     func makeUIViewController(context: Context) -> UIPageViewController {
@@ -511,6 +557,10 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         UIPageViewControllerDelegate {
         private weak var pageController: UIPageViewController?
         private var downwardIntentGesture: ViewerDownwardIntentGesture?
+        /// Held weakly: the session's state belongs to the grid's transition
+        /// coordinator, and a pager outliving that session must not keep a
+        /// stale gate alive — a released reference simply means "no gate".
+        private weak var transitionState: PhotoViewerTransitionState?
         private var pageCount = 0
         private var displayedIndex: Int?
         private var assetProvider: ((Int) -> PHAsset?) = { _ in nil }
@@ -534,8 +584,9 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
         private var lastPageContentSignature = ""
         private var isManualTransitionInProgress = false
 
-        init(currentIndex: Binding<Int>) {
+        init(currentIndex: Binding<Int>, transitionState: PhotoViewerTransitionState?) {
             currentIndexBinding = currentIndex
+            self.transitionState = transitionState
             PagerDiagnostics.log("coordinator init index=\(currentIndex.wrappedValue)")
         }
 
@@ -549,6 +600,11 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                 return !self.isZooming && !self.isManualTransitionInProgress
                     && !self.isScrubbing && self.pendingProgrammaticIndex == nil
             }
+            // The bridge's live dismissal state, consulted per touch: while a
+            // pull-back is still bouncing this recognizer must not reserve the
+            // direction, because the system gesture cannot take over yet and
+            // the drag would be claimed by neither.
+            intent.transitionState = transitionState
             scrollView.addGestureRecognizer(intent)
             downwardIntentGesture = intent
         }
@@ -1205,6 +1261,8 @@ private struct AssetPager: View {
     // True while the user is scrubbing the filmstrip: transitions become
     // instant swaps so the main photo tracks the strip in real time.
     let isScrubbing: Bool
+    /// Live dismissal state, forwarded to the pager's arbitration recognizer.
+    let transitionState: PhotoViewerTransitionState?
 
     @State private var isZooming = false
     @State private var customDirection = 1
@@ -1224,7 +1282,8 @@ private struct AssetPager: View {
         onZoomingChanged: ((Bool) -> Void)? = nil,
         onPagingChanged: ((Bool) -> Void)? = nil,
         onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)? = nil,
-        isScrubbing: Bool = false
+        isScrubbing: Bool = false,
+        transitionState: PhotoViewerTransitionState? = nil
     ) {
         self.assets = assets
         _currentIndex = currentIndex
@@ -1238,6 +1297,7 @@ private struct AssetPager: View {
         self.onPagingChanged = onPagingChanged
         self.onDismissDragEnded = onDismissDragEnded
         self.isScrubbing = isScrubbing
+        self.transitionState = transitionState
     }
 
     private var swipeStyle: PhotoSwipeStyle {
@@ -1280,6 +1340,7 @@ private struct AssetPager: View {
             pageCount: assets.count,
             currentIndex: $currentIndex,
             isScrubbing: isScrubbing,
+            transitionState: transitionState,
             assetProvider: { index in
                 guard index >= 0, index < assets.count else { return nil }
                 return assets.object(at: index)
@@ -1509,7 +1570,8 @@ struct PhotoViewerView: View {
                             },
                             onPagingChanged: handlePagingChanged,
                             onDismissDragEnded: handleDismissDragEnded,
-                            isScrubbing: isScrubbingFilmstrip
+                            isScrubbing: isScrubbingFilmstrip,
+                            transitionState: transitionState
                         )
                         .frame(width: proxy.size.width, height: proxy.size.height)
                         .contentShape(Rectangle())
@@ -2497,6 +2559,8 @@ private struct IndexedAssetPager: View {
     // Mirrors the store's indexing flag; when a sync finishes this pager
     // re-requests its window in case an in-flight page load was dropped.
     let isIndexingUnsorted: Bool
+    /// Live dismissal state, forwarded to the pager's arbitration recognizer.
+    let transitionState: PhotoViewerTransitionState?
 
     @State private var loadingOffsets = Set<Int>()
     @State private var loadedOffsets = Set<Int>()
@@ -2526,7 +2590,8 @@ private struct IndexedAssetPager: View {
         onPagingChanged: ((Bool) -> Void)? = nil,
         onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)? = nil,
         isScrubbing: Bool = false,
-        isIndexingUnsorted: Bool = false
+        isIndexingUnsorted: Bool = false,
+        transitionState: PhotoViewerTransitionState? = nil
     ) {
         self.totalCount = max(0, totalCount)
         self.store = store
@@ -2546,6 +2611,7 @@ private struct IndexedAssetPager: View {
         self.onDismissDragEnded = onDismissDragEnded
         self.isScrubbing = isScrubbing
         self.isIndexingUnsorted = isIndexingUnsorted
+        self.transitionState = transitionState
     }
 
     private var swipeStyle: PhotoSwipeStyle {
@@ -2647,6 +2713,7 @@ private struct IndexedAssetPager: View {
             pageCount: totalCount,
             currentIndex: $currentIndex,
             isScrubbing: isScrubbing,
+            transitionState: transitionState,
             assetProvider: { index in
                 assetsByIndex[index]
             },
@@ -3283,7 +3350,8 @@ struct IndexedPhotoViewerView: View {
                             onPagingChanged: handlePagingChanged,
                             onDismissDragEnded: handleDismissDragEnded,
                             isScrubbing: isScrubbingFilmstrip,
-                            isIndexingUnsorted: store.isIndexingUnsorted
+                            isIndexingUnsorted: store.isIndexingUnsorted,
+                            transitionState: transitionState
                         )
                         .frame(width: proxy.size.width, height: proxy.size.height)
                         .contentShape(Rectangle())

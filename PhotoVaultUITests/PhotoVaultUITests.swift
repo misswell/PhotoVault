@@ -210,6 +210,117 @@ final class PhotoViewerDismissUITests: XCTestCase {
         expectViewerIndex(2, in: app, "取消退出后应能继续翻页到第 2 张")
     }
 
+    /// 短下拉取消之后**马上**再来一次长下拉：必须仍能退出。
+    ///
+    /// 回归的是"UIKit 刚决定取消就被当成 transition 已结束"。那一瞬间系统还在
+    /// 跑回弹动画，状态机却已经回到 idle，于是第二次下拉被 downward intent
+    /// recognizer 占住、系统 Zoom dismissal 又起不来——整笔触摸两边都不认，
+    /// 既不退出也不翻页。
+    ///
+    /// 启动参数让 App 内探针在这次真实的取消回弹上核对闸门：回弹期间必须关、
+    /// 结束后必须开，违反即 DEBUG `assert` 崩溃（表现为本用例失败）。两次下拉
+    /// 之间不 sleep，就是为了落在回弹还没结束的那段窗口里。
+    func testSecondPullDownImmediatelyAfterCancelledDismissStillWorks() throws {
+        let app = launchToGrid(arguments: ["-viewer-cancel-reentry-probe"])
+        openViewer(at: 0, in: app)
+        let window = app.windows.firstMatch
+
+        // 短下拉：远不到提交阈值，UIKit 会决定回弹。
+        pullDown(in: window, from: 0.45, to: 0.50, holdFor: 0.05)
+        XCTAssertTrue(
+            app.buttons["viewer-close"].exists,
+            "第一次短下拉应留在查看器里（探针日志 stage=cancelling 是它的凭据）"
+        )
+
+        // 不等回弹播完，直接再拉：这一段就是原来会被吞掉的触摸。
+        pullDown(in: window, from: 0.30, to: 0.92, holdFor: 0.08)
+        XCTAssertTrue(
+            app.buttons["viewer-close"].waitForNonExistence(timeout: 5),
+            "取消回弹期间发起的第二次下拉必须仍能退出查看器"
+        )
+        assertGridIsAlive(after: app)
+    }
+
+    /// 场景 C：连续 5 次短下拉，每一次都要能回弹（查看器仍在场），最后一次
+    /// 拉过阈值必须正常退出。中途任何一次"完全没反应"都会让收尾的长下拉失败。
+    func testRepeatedShortPullDownsKeepBouncingBack() throws {
+        let app = launchToGrid(arguments: ["-viewer-cancel-reentry-probe"])
+        openViewer(at: 0, in: app)
+        guard let openedAt = viewerIndex(in: app) else {
+            XCTFail("详情页应显示当前第几张")
+            return
+        }
+        let window = app.windows.firstMatch
+
+        for round in 1...5 {
+            pullDown(in: window, from: 0.45, to: 0.50, holdFor: 0.05)
+            XCTAssertTrue(
+                app.buttons["viewer-close"].exists,
+                "第 \(round) 次短下拉应留在查看器里"
+            )
+        }
+        // 等回弹结束再核对：仍停在同一张，说明五次都是真回弹而不是攒出来的退出。
+        Thread.sleep(forTimeInterval: 1.5)
+        expectViewerIndex(openedAt, in: app, "连续短下拉后查看器应停在原处")
+
+        pullDown(in: window, from: 0.30, to: 0.92, holdFor: 0.05)
+        XCTAssertTrue(
+            app.buttons["viewer-close"].waitForNonExistence(timeout: 5),
+            "连续短下拉之后拉长下拉仍应退出"
+        )
+        assertGridIsAlive(after: app)
+    }
+
+    /// 场景 E：取消退出后马上右滑，仍要正常翻回上一张。
+    ///
+    /// 左滑那一条由 `testShortPullDownCancelsAndKeepsViewer` 覆盖；右滑单独
+    /// 测是因为取消回弹期间被错误占住的正是分页 pan 的触摸方向。
+    func testSwipeRightAfterCancelledPullDownStillPages() throws {
+        let app = launchToGrid(arguments: ["-viewer-cancel-reentry-probe"])
+        openViewer(at: 1, in: app)
+        guard let openedAt = viewerIndex(in: app) else {
+            XCTFail("详情页应显示当前第几张")
+            return
+        }
+        app.swipeLeft()
+        expectViewerIndex(openedAt + 1, in: app, "左滑应到下一张")
+
+        let window = app.windows.firstMatch
+        pullDown(in: window, from: 0.45, to: 0.50, holdFor: 0.05)
+        // 等这一次回弹真正结束再翻页：这里要证的是"回弹结束后一切恢复"，
+        // 回弹过程中的那一次触摸由上一条用例负责。
+        Thread.sleep(forTimeInterval: 1.5)
+        expectViewerIndex(
+            openedAt + 1,
+            in: app,
+            "短下拉应取消退出并停在原处"
+        )
+
+        app.swipeRight()
+        expectViewerIndex(
+            openedAt,
+            in: app,
+            "取消退出后的右滑必须翻回上一张，而不是被回弹中的转场吃掉"
+        )
+        XCTAssertTrue(app.buttons["viewer-close"].exists)
+    }
+
+    /// Drags straight down from `fromY` to `toY` (normalized screen heights).
+    ///
+    /// ⚠️ 提交阈值按照片的**实际显示高度**算，不是按屏幕：同一笔 13% 屏幕高度
+    /// 的下拉，在竖屏截图上是回弹，在横屏照片上（letterbox 后更矮）就是退出。
+    /// 这里要"只回弹"的下拉一律压在 5% 屏幕高度以内。
+    private func pullDown(
+        in window: XCUIElement,
+        from fromY: CGFloat,
+        to toY: CGFloat,
+        holdFor: TimeInterval
+    ) {
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: fromY))
+        let end = window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: toY))
+        start.press(forDuration: holdFor, thenDragTo: end)
+    }
+
     /// 打开 A → 连续左滑翻页 → 关闭 → 网格仍可交互（索引已同步到当前照片）。
     func testPagingThenCloseKeepsGridAlive() throws {
         let app = launchToGrid()
