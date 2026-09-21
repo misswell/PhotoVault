@@ -153,18 +153,18 @@ enum AppIconPreference: String, CaseIterable, Identifiable {
         case .light:
             return "亮色"
         case .dark:
-            return "暗色"
+            return "黑色背景"
         }
     }
 
     var detail: String {
         switch self {
         case .system:
-            return "外观切换时自动使用亮色或暗色图标。"
+            return "外观切换时自动使用亮色或黑色背景图标。"
         case .light:
             return "始终使用亮色图标。"
         case .dark:
-            return "始终使用暗色图标。"
+            return "始终使用黑色背景图标。"
         }
     }
 
