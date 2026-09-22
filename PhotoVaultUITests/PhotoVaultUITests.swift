@@ -42,9 +42,18 @@ final class PhotoViewerDismissUITests: XCTestCase {
         let cell = app.cells["photo-cell-\(index)"]
         XCTAssertTrue(cell.waitForExistence(timeout: 20), "第 \(index) 个 cell 应存在")
         cell.tap()
-        XCTAssertTrue(
-            app.buttons["viewer-close"].waitForExistence(timeout: 10),
-            "点按 cell \(index) 后查看器应打开"
+        let close = app.buttons["viewer-close"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10), "点按 cell \(index) 后查看器应打开")
+        // Existence is true during the zoom-in. The next synthetic pull must
+        // start after UIKit has finished registering the new presentation.
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND hittable == true"),
+            object: close
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [ready], timeout: 10),
+            .completed,
+            "详情页的关闭控件应在呈现完成后可命中"
         )
     }
 
@@ -146,6 +155,56 @@ final class PhotoViewerDismissUITests: XCTestCase {
         expectViewerIndex(4, in: app, "旧会话完成回调不得关闭或阻塞新查看器")
         app.buttons["viewer-close"].tap()
         assertGridIsAlive(after: app)
+    }
+
+    private func longPullDown(in app: XCUIApplication) {
+        let window = app.windows.firstMatch
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35))
+            .press(forDuration: 0.08, thenDragTo: window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.92)))
+    }
+
+    private func verifyRapidReopen(closeButton: Bool) {
+        let app = launchToGrid(arguments: ["-viewer-cancel-reentry-probe"])
+        for round in 0..<10 {
+            openViewer(at: round % 4, in: app)
+            if closeButton { app.buttons["viewer-close"].tap() }
+            else { longPullDown(in: app) }
+            let cell = app.cells["photo-cell-\((round + 1) % 4)"]
+            XCTAssertTrue(cell.waitForExistence(timeout: 10))
+            XCTAssertTrue(cell.isHittable)
+            cell.tap()
+            expectViewerIndex((round + 1) % 4 + 1, in: app)
+            longPullDown(in: app)
+            XCTAssertTrue(app.buttons["viewer-close"].waitForNonExistence(timeout: 10), "重开第 \(round + 1) 轮必须仍可下拉退出")
+        }
+    }
+
+    // XCTest waits for idle; the in-app interruption probe covers animation-time queuing.
+    func testRapidDismissReopenKeepsPullDownWorking() { verifyRapidReopen(closeButton: false) }
+    func testRapidCloseReopenKeepsPullDownWorking() { verifyRapidReopen(closeButton: true) }
+
+    func testReopenedViewerStillDismissesAfterThreeSeconds() {
+        let app = launchToGrid()
+        openViewer(at: 0, in: app)
+        longPullDown(in: app)
+        openViewer(at: 2, in: app)
+        // Test the reported stable-for-seconds failure; not a production delay.
+        Thread.sleep(forTimeInterval: 3)
+        longPullDown(in: app)
+        XCTAssertTrue(app.buttons["viewer-close"].waitForNonExistence(timeout: 10))
+    }
+
+    func testFilmstripScrubThenPullDownStillWorks() {
+        let app = launchToGrid()
+        openViewer(at: 0, in: app)
+        let filmstrip = app.collectionViews["viewer-filmstrip"]
+        XCTAssertTrue(filmstrip.waitForExistence(timeout: 10))
+        let initial = app.staticTexts["viewer-counter"].label
+        filmstrip.swipeLeft()
+        let changed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label != %@", initial), object: app.staticTexts["viewer-counter"])
+        XCTAssertEqual(XCTWaiter().wait(for: [changed], timeout: 10), .completed)
+        longPullDown(in: app)
+        XCTAssertTrue(app.buttons["viewer-close"].waitForNonExistence(timeout: 10))
     }
 
     /// Predominantly downward motion must not become a page turn because of
@@ -427,8 +486,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
 
         for round in 0..<10 {
             let index = round % 4
-            // 上一轮关闭的动画可能还在跑，这里的 tap 正好落在动画中间 ——
-            // 正是要压的那条路径。
+            // XCTest 等 idle；动画内排队由 interruption probe 单独验证。
             openViewer(at: index, in: app)
             expectViewerIndex(
                 index + 1,

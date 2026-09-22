@@ -45,7 +45,32 @@ func shouldBeginViewerInteractiveDismiss(
     willBegin: Bool, velocityX: CGFloat, velocityY: CGFloat, vetoed: Bool
 ) -> Bool {
     guard !vetoed else { return false }
-    return willBegin || (velocityY > 0 && velocityY >= abs(velocityX) * 1.15)
+    return willBegin
+}
+
+enum ViewerPresentationPhase: Equatable {
+    case empty
+    case presenting(UUID)
+    case presented(UUID)
+    case dismissing(UUID)
+}
+
+func mayPresentViewer(presentationPhase: ViewerPresentationPhase, hasPresentedController: Bool) -> Bool {
+    presentationPhase == .empty && !hasPresentedController
+}
+
+struct ViewerPendingRequests<Request> {
+    var latest: Request?
+
+    mutating func take(phase: ViewerPresentationPhase, hasPresentedController: Bool) -> Request? {
+        guard mayPresentViewer(presentationPhase: phase, hasPresentedController: hasPresentedController) else { return nil }
+        defer { latest = nil }
+        return latest
+    }
+}
+
+enum DownwardArbitrationState {
+    case reserve, track, blocked
 }
 
 // MARK: - Presentation input
@@ -133,6 +158,7 @@ private final class ViewerTouchDeliveryProbe: UIGestureRecognizer {
 /// zoom-out land on the right grid cell.
 @MainActor
 final class PhotoViewerTransitionState {
+    var sessionID: UUID?
     private(set) var currentIndex: Int
     private(set) var currentAssetIdentifier: String?
 
@@ -180,22 +206,13 @@ final class PhotoViewerTransitionState {
 
     private(set) var interactiveDismissState: InteractiveDismissState = .idle
 
-    /// Whether a touch that is already travelling may keep arbitrating a
-    /// downward pull.
-    ///
-    /// `.cancelling` answers **yes**. All this gate can ever do is take a drag
-    /// away from the pager's *horizontal* pan, and a downward drag never pages
-    /// it — so answering “no” cannot redirect the touch to anything useful, it
-    /// can only make the pull-down disappear. It is also the wrong instant to
-    /// decide: UIKit's bounce-back outlives the finger's first sampled points,
-    /// and a recognizer that reports `.failed` at touch-down is finished for
-    /// that whole touch sequence even after the bounce settles. That is the
-    /// “cancel a pull-down, immediately pull down again, nothing happens” bug.
-    ///
-    /// `.dragging` and `.committed` answer no: there the system already owns
-    /// the drag, or the viewer is on its way out.
-    var mayArbitrateDownwardDrag: Bool {
-        interactiveDismissState == .idle || interactiveDismissState == .cancelling
+    /// Reverse animation keeps the touch alive without claiming the pager.
+    var downwardArbitrationState: DownwardArbitrationState {
+        switch interactiveDismissState {
+        case .idle: return .reserve
+        case .cancelling: return .track
+        case .dragging, .committed: return .blocked
+        }
     }
 
     func setInteractiveDismissState(_ state: InteractiveDismissState) {
@@ -241,8 +258,7 @@ final class PhotoGridTransitionCoordinator: ObservableObject {
     )
 
     func beginViewerSession(index: Int, assetIdentifier: String?) {
-        // Outgoing and incoming viewers may coexist during a system zoom.
-        // Their callbacks must never clear or retarget each other's state.
+        // Each serialized presentation owns fresh gesture and asset state.
         viewerTransitionState = PhotoViewerTransitionState(
             index: index, assetIdentifier: assetIdentifier
         )
@@ -416,6 +432,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
     /// The viewer session with this id finished dismissing. A screen can
     /// ignore the callback when a newer open request superseded it.
     var onDismissed: ((UUID?) -> Void)?
+    var onPresentationBegan: (() -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -433,6 +450,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         context.coordinator.onDismissed = onDismissed
         context.coordinator.onDismissalCommitted = onDismissalCommitted
         context.coordinator.onDismissalCancelled = onDismissalCancelled
+        context.coordinator.onPresentationBegan = onPresentationBegan
         context.coordinator.sync(
             presenter: presenter,
             request: request,
@@ -523,6 +541,9 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// An interactive pull-down passed the commit threshold: the zoom-out
         /// will finish, so the grid can come back while it plays.
         var onDismissTransitionCommitted: ((UInt64?) -> Void)?
+        var onDismissTransitionFinished: ((UInt64?) -> Void)?
+        var viewerSessionID: UUID?
+        private var awaitsDismissTransitionCompletion = false
         /// DEBUG: lets the bridge ask the hit-test question from inside the
         /// transition's own animation block, rather than before it starts.
         var onTransitionAnimationStep: (() -> Void)?
@@ -631,6 +652,20 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                 }
             }, completion: nil)
 
+            awaitsDismissTransitionCompletion = coordinator.animate(alongsideTransition: nil) { [weak self] context in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.awaitsDismissTransitionCompletion = false
+                    if context.isCancelled {
+                        if let observedGeneration {
+                            self.reportCancellationSettled(generation: observedGeneration)
+                        }
+                    } else {
+                        self.onDismissTransitionFinished?(observedGeneration)
+                    }
+                }
+            }
+
             guard interactive else {
                 // Close button and every programmatic exit: not cancellable, so
                 // the dismissal is committed the moment it starts.
@@ -659,12 +694,6 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                 }
             }
 
-            coordinator.animate(alongsideTransition: nil) { [weak self] context in
-                MainActor.assumeIsolated {
-                    guard let self, context.isCancelled else { return }
-                    self.reportCancellationSettled(generation: observedGeneration)
-                }
-            }
         }
 
         override func viewDidAppear(_ animated: Bool) {
@@ -687,7 +716,9 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             if let probe = touchDeliveryProbe { probe.view?.removeGestureRecognizer(probe) }
             touchDeliveryProbe = nil
             #endif
-            onVanishedWithoutCallback?(self)
+            if !awaitsDismissTransitionCompletion {
+                onVanishedWithoutCallback?(self)
+            }
         }
     }
 
@@ -739,18 +770,23 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
 
         private weak var presenter: UIViewController?
         private weak var hosted: UIViewController?
-        /// The current session. A committed outgoing session moves into
-        /// retiringSessions when a new tap arrives, allowing UIKit to overlap
-        /// the two zooms without letting old callbacks settle the new viewer.
+        private typealias PresentationPhase = ViewerPresentationPhase
+        private var presentationPhase: PresentationPhase = .empty
+        /// Retained until UIKit finishes the old dismissal.
         private var presentedRequestID: UUID?
         private var generation = 0
         private var activeInteractiveDismissGeneration: UInt64?
+        private var committedInteractiveDismissGeneration: UInt64?
         #if DEBUG
         private var isVerifyingDismissLogic = false
         private var didRunInterruptionProbe = false
         private var debugReentryProbeFailures = 0
         #endif
-        private var pendingRequest: PhotoViewerRequest?
+        private var pendingRequests = ViewerPendingRequests<PhotoViewerRequest>()
+        private var pendingRequest: PhotoViewerRequest? {
+            get { pendingRequests.latest }
+            set { pendingRequests.latest = newValue }
+        }
         /// A dismissal the screen asked for while `dismissIfNeeded` had to
         /// refuse it, because a pull-down was still being dragged or bounced
         /// back. Issued by `dismissTransitionCancelled()` the moment the
@@ -767,7 +803,6 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                 }
             }
         }
-        private var retiringSessions: [UUID: (controller: UIViewController, interactionRoot: UIView?)] = [:]
         /// The highest ancestor that belongs to the viewer alone and was
         /// therefore safe to take out of hit testing. Never the grid, its
         /// ancestors, the window or the shared transition root.
@@ -778,6 +813,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// the screen can ignore the callback when a newer open request has
         /// already superseded it.
         var onDismissed: ((UUID?) -> Void)?
+        var onPresentationBegan: (() -> Void)?
         /// The dismissal transition committed: the zoom-out now runs over a
         /// live grid, so the screen can re-enable scrolling and taps while
         /// the animation finishes.
@@ -803,10 +839,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             dismissalPhase = .idle
             makeViewer = nil
             restoreViewerInteraction()
-            for session in retiringSessions.values {
-                session.interactionRoot?.isUserInteractionEnabled = true
-            }
-            retiringSessions.removeAll()
+            presentationPhase = .empty
         }
 
         func sync(
@@ -833,49 +866,40 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             } else if request.id != presentedRequestID,
                       dismissalPhase != .idle {
                 pendingRequest = request
-                if dismissalPhase == .committed, let hosted,
-                   hosted.isBeingDismissed, let presentedRequestID {
-                    // UIKit's zoom can accept a new presentation during the
-                    // outgoing zoom. Do not serialize taps behind its completion.
-                    // UIKit may reuse the transition container for the new
-                    // viewer. Only the outgoing view remains disabled now.
-                    restoreViewerInteraction()
-                    hosted.view.isUserInteractionEnabled = false
-                    retiringSessions[presentedRequestID] = (hosted, hosted.view)
-                    self.hosted = nil
-                    self.presentedRequestID = nil
-                    activeInteractiveDismissGeneration = nil
-                    dismissalPhase = .idle
-                    photoVaultTraceLaunch("viewer_reopen_during_dismissal")
-                    flushPendingRequest()
+                photoVaultTraceLaunch("viewer_request_queued old=\(presentedRequestID?.uuidString ?? "nil") new=\(request.id) viewer_reopen_queued_during_dismissal")
+                #if DEBUG
+                if debugQueuedReplacement {
+                    debugExpectedReplacement = request.id
+                    assert(presentationPhase == .dismissing(presentedRequestID!))
+                    photoVaultTraceLaunch("viewer_serial_presentation_probe queued=true overlap=false new=\(request.id)")
                 }
+                #endif
+                return
             }
             // A different request while a viewer is simply on screen
             // (phase == .idle) is ignored: the viewer is full-screen and owns
             // its own navigation.
         }
 
-        /// Presents on first open, a new tap during committed dismissal, or
-        /// lifecycle completion. No animation-completion gate or retry loop.
+        /// Only a completely released UIKit presentation can accept a viewer.
         private func flushPendingRequest() {
-            guard presentedRequestID == nil,
-                  let request = pendingRequest,
+            guard presentationPhase == .empty, presentedRequestID == nil,
+                  pendingRequest != nil,
                   let presenter,
                   let makeViewer,
                   let transitionCoordinator,
                   presenter.view.window != nil
             else { return }
 
-            guard presenter.presentedViewController == nil
-                || presenter.presentedViewController?.isBeingDismissed == true else {
-                // An unrelated live presentation still owns this presenter.
-                // A dismissing zoom is explicitly allowed through above.
-                photoVaultTrace("pending_viewer_request_deferred")
+            guard mayPresentViewer(presentationPhase: presentationPhase,
+                                   hasPresentedController: presenter.presentedViewController != nil) else {
+                photoVaultTraceLaunch("pending_viewer_request_waiting_for_presenter_release")
                 return
             }
 
-            pendingRequest = nil
-            photoVaultTrace("pending_viewer_request_presented")
+            guard let request = pendingRequests.take(phase: presentationPhase,
+                hasPresentedController: presenter.presentedViewController != nil) else { return }
+            photoVaultTraceLaunch("viewer_pending_present_begin session=\(request.id) viewer_reopen_presented_after_dismissal")
             present(
                 request: request,
                 presenter: presenter,
@@ -890,10 +914,24 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             makeViewer: @escaping (PhotoViewerRequest) -> PhotoViewerHostingController<Viewer>,
             transitionCoordinator: PhotoGridTransitionCoordinator
         ) {
+            photoVaultTraceLaunch("presenter_state phase=\(presentationPhase) presentedVC=\(String(describing: presenter.presentedViewController)) presentedIsBeingDismissed=\(presenter.presentedViewController?.isBeingDismissed ?? false) pendingRequest=\(String(describing: pendingRequest?.id)) currentSession=\(String(describing: presentedRequestID))")
+            assert(presenter.presentedViewController == nil, "禁止 overlapping viewer presentation")
+            assert(presentationPhase == .empty && presentedRequestID == nil)
+            #if DEBUG
+            if debugExpectedReplacement == request.id {
+                assert(debugFinishedOldSession)
+                photoVaultTraceLaunch("viewer_serial_presentation_probe queued=true overlap=false presentedAfterFinish=true session=\(request.id)")
+                debugExpectedReplacement = nil
+            }
+            #endif
+            presentationPhase = .presenting(request.id)
+            photoVaultTraceLaunch("viewer_session_present_begin session=\(request.id)")
             transitionCoordinator.beginViewerSession(
                 index: request.index, assetIdentifier: request.assetIdentifier
             )
+            transitionCoordinator.viewerTransitionState.sessionID = request.id
             let hosting = makeViewer(request)
+            hosting.viewerSessionID = request.id
             // Opaque black so the aspect-fit letterbox reads as a black
             // canvas at rest: the transition's dimming only covers the
             // animated and interactive phases, not the steady state. The
@@ -926,6 +964,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             #endif
             presentedRequestID = request.id
             activeInteractiveDismissGeneration = nil
+            committedInteractiveDismissGeneration = nil
             dismissalPhase = .idle
             // A fresh session inherits no debt from whatever closed the last
             // one; replaying a stale close here would dismiss the new viewer.
@@ -936,6 +975,8 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             // Install all lifecycle hooks before present: a downward drag can
             // interrupt zoom-in before its presentation completion is called.
             hosted = hosting
+            transitionCoordinator.setGridInteractionEnabled(false)
+            onPresentationBegan?()
             hosting.onVanishedWithoutCallback = { [weak self] controller in
                 self?.hostedViewDidVanish(controller: controller, sessionID: request.id)
             }
@@ -955,10 +996,18 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                 guard let self, self.presentedRequestID == request.id else { return }
                 self.dismissTransitionCommitted(generation: generation)
             }
+            hosting.onDismissTransitionFinished = { [weak self] generation in
+                guard let self, self.presentedRequestID == request.id,
+                      self.dismissalPhase == .committed,
+                      generation == self.committedInteractiveDismissGeneration else { return }
+                photoVaultTraceLaunch("viewer_session_dismiss_transition_complete session=\(request.id) generation=\(String(describing: generation))")
+                self.finishDismissal(sessionID: request.id, source: "transitionCompletion")
+            }
             #if DEBUG
             hosting.onTransitionAnimationStep = { [weak self] in
                 guard let self, self.presentedRequestID == request.id else { return }
                 self.debugProbeMidTransition()
+                self.debugQueueReplacementDuringDismissal()
             }
             #endif
 
@@ -966,31 +1015,40 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             presenter.present(hosting, animated: !reduceMotion) { [weak self] in
                 guard let self, self.generation == currentGeneration,
                       self.hosted === hosting else { return }
-                photoVaultTrace("viewer_present_complete")
+                guard self.presentationPhase == .presenting(request.id) else { return }
+                self.presentationPhase = .presented(request.id)
+                photoVaultTraceLaunch("viewer_session_present_complete session=\(request.id)")
                 Self.debugDumpTransitionGestures(
                     presentationController: hosting.presentationController
                 )
-            }
-            hosting.presentationController?.delegate = self
-            #if DEBUG
-            if !didRunInterruptionProbe,
-               ProcessInfo.processInfo.arguments.contains("-viewer-interruption-probe") {
-                didRunInterruptionProbe = true
-                // One-shot synthetic actions inside real UIKit transitions;
-                // XCUITest itself waits for animation idle before injecting input.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak hosting] in
-                    guard let self, let hosting, self.hosted === hosting else { return }
-                    photoVaultTraceLaunch("interruption_probe_open_active=\(hosting.transitionCoordinator != nil)")
-                    self.dismissIfNeeded()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, weak hosting] in
-                        guard let self, let hosting else { return }
-                        photoVaultTraceLaunch("interruption_probe_dismiss_active=\(hosting.isBeingDismissed && hosting.transitionCoordinator != nil)")
-                        self.transitionCoordinator?.debugSelectPhoto(at: 2)
+                #if DEBUG
+                if !self.didRunInterruptionProbe,
+                   ProcessInfo.processInfo.arguments.contains("-viewer-interruption-probe") {
+                    self.didRunInterruptionProbe = true
+                    Task { @MainActor [weak self] in
+                        await Task.yield()
+                        self?.dismissIfNeeded()
                     }
                 }
+                #endif
             }
-            #endif
+            hosting.presentationController?.delegate = self
         }
+
+        #if DEBUG
+        private var debugQueuedReplacement = false
+        private var debugExpectedReplacement: UUID?
+        private var debugFinishedOldSession = false
+        private func debugQueueReplacementDuringDismissal() {
+            guard didRunInterruptionProbe, !debugQueuedReplacement,
+                  dismissalPhase == .committed, let old = presentedRequestID,
+                  let transitionCoordinator else { return }
+            debugQueuedReplacement = true
+            transitionCoordinator.debugSelectPhoto(at: 2)
+            assert(presentedRequestID == old && presentationPhase == .dismissing(old))
+            assert(hosted != nil)
+        }
+        #endif
 
         private func traceDismiss(_ message: String) {
             #if DEBUG
@@ -1011,6 +1069,10 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// is a live drag and tracking it beats pretending the reversal is
         /// still in progress.
         private func dismissTransitionBegan(interactive: Bool, generation: UInt64?) {
+            if let id = presentedRequestID {
+                presentationPhase = .dismissing(id)
+                photoVaultTraceLaunch("viewer_session_dismiss_begin session=\(id)")
+            }
             guard interactive else {
                 activeInteractiveDismissGeneration = nil
                 return
@@ -1038,10 +1100,15 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                 traceDismiss("viewer_dismiss_stale_commit generation=\(generation) active=\(String(describing: activeInteractiveDismissGeneration))")
                 return
             }
-            activeInteractiveDismissGeneration = nil
             guard dismissalPhase != .committed else { return }
+            committedInteractiveDismissGeneration = generation
+            activeInteractiveDismissGeneration = nil
             traceDismiss("viewer_dismiss_committed generation=\(String(describing: generation))")
             dismissalPhase = .committed
+            if let id = presentedRequestID {
+                presentationPhase = .dismissing(id)
+                photoVaultTraceLaunch("viewer_session_dismiss_commit session=\(id)")
+            }
 
             // Re-enable the grid directly as well as through SwiftUI state:
             // the state update lands a frame later, and the whole point is that
@@ -1090,6 +1157,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             traceDismiss("viewer_dismiss_cancelled_settled generation=\(generation)")
             activeInteractiveDismissGeneration = nil
             dismissalPhase = .idle
+            if let id = presentedRequestID { presentationPhase = .presented(id) }
             restoreViewerInteraction()
             transitionCoordinator?.setGridInteractionEnabled(false)
             onDismissalCancelled?()
@@ -1166,8 +1234,8 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// second pull-down.
         private func debugCancelReentryProbe(from previous: DismissalPhase) {
             guard dismissalPhase != previous else { return }
-            let gate = transitionCoordinator?.viewerTransitionState
-                .mayArbitrateDownwardDrag ?? false
+            let arbitration = transitionCoordinator?.viewerTransitionState.downwardArbitrationState
+            let gate = arbitration == .reserve
             switch (previous, dismissalPhase) {
             case (.idle, .interactive):
                 photoVaultTraceLaunch(
@@ -1176,13 +1244,13 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             case (.cancelling, .interactive):
                 photoVaultTraceLaunch("viewer_cancel_reentry_probe stage=reentered generation=\(String(describing: activeInteractiveDismissGeneration))")
             case (.interactive, .cancelling):
-                if !gate { debugReentryProbeFailures += 1 }
+                if arbitration != .track { debugReentryProbeFailures += 1 }
                 ViewerDownwardIntentGesture.debugVerifyCancellationReentry()
                 photoVaultTraceLaunch(
                     "viewer_cancel_reentry_probe stage=cancelling gate=\(gate) "
-                        + "want=true failures=\(debugReentryProbeFailures)"
+                        + "want=track failures=\(debugReentryProbeFailures)"
                 )
-                assert(gate, "回弹期间封锁下拉仲裁，第二笔下拉会整笔失效")
+                assert(arbitration == .track, "回弹期间只追踪，不提前抢占 pager")
             case (.cancelling, .idle):
                 if !gate { debugReentryProbeFailures += 1 }
                 photoVaultTraceLaunch(
@@ -1300,11 +1368,10 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// an already-settled viewer must not tear down the one that replaced
         /// it.
         private func hostedViewDidVanish(controller: UIViewController, sessionID: UUID) {
-            guard hosted === controller
-                || retiringSessions[sessionID]?.controller === controller else { return }
+            guard hosted === controller, dismissalPhase == .committed else { return }
             photoVaultTrace("viewer_hosted_view_did_vanish")
             ViewerPerformanceTrace.viewerDismissStart()
-            finishDismissal(sessionID: sessionID)
+            finishDismissal(sessionID: sessionID, source: "viewDidDisappearFallback")
         }
 
         /// The single settle point of every dismissal. The programmatic
@@ -1312,32 +1379,37 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// the presentation-controller delegate all funnel here, and matching
         /// the session id makes it idempotent so the routes cannot fight each
         /// other.
-        private func finishDismissal(sessionID: UUID?) {
+        private func finishDismissal(sessionID: UUID?, source: String) {
             guard let sessionID else { return }
-            if let retired = retiringSessions.removeValue(forKey: sessionID) {
-                retired.interactionRoot?.isUserInteractionEnabled = true
-                photoVaultTraceLaunch("viewer_retired_dismiss_complete")
-                onDismissed?(sessionID)
-                return
-            }
             guard presentedRequestID == sessionID else { return }
-            photoVaultTrace("viewer_dismiss_complete")
-            presentedRequestID = nil
+            photoVaultTraceLaunch("viewer_session_finish session=\(sessionID) viewer_dismiss_finish_source=\(source)")
+            #if DEBUG
+            if debugQueuedReplacement { debugFinishedOldSession = true }
+            #endif
             // Always hand the viewer's touches back before dropping the last
             // reference to it: leaving a view disabled here would strand a live
             // viewer that nothing can reach.
             restoreViewerInteraction()
-            hosted = nil
             activeInteractiveDismissGeneration = nil
+            committedInteractiveDismissGeneration = nil
             dismissalPhase = .idle
+            hosted = nil
+            presentedRequestID = nil
+            presentationPhase = .empty
+            pendingDismissRequest = false
             generation &+= 1
             ViewerPerformanceTrace.viewerDismissEnd()
 
-            // Flush any request that arrived before UIKit marked the old
-            // controller as dismissing. Most replacement taps already took
-            // the immediate path in sync. Report only this session's ID.
-            flushPendingRequest()
             onDismissed?(sessionID)
+            flushPendingRequest()
+            // UIKit may clear presentedViewController after its animation
+            // completion callbacks. One event-scoped turn, never a retry loop.
+            if pendingRequest != nil, presenter?.presentedViewController != nil {
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    self?.flushPendingRequest()
+                }
+            }
         }
 
         private static func zoomTransition(
@@ -1348,9 +1420,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             let options = UIViewController.Transition.ZoomOptions()
             options.dimmingColor = .black
             if !reduceMotion {
-                // Preserve UIKit's normal decision and vetoes, but allow a
-                // clearly downward pull to grab an in-flight cancellation.
-                // Horizontal/zero velocity alone must never override willBegin.
+                // UIKit owns begin eligibility; the app can only veto it.
                 options.interactiveDismissShouldBegin = { context in
                     let vetoed = state.interactiveDismissVeto?() ?? false
                     let result = shouldBeginViewerInteractiveDismiss(
@@ -1360,7 +1430,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                         vetoed: vetoed
                     )
                     photoVaultTrace(
-                        "zoom_dismiss_should_begin willBegin=\(context.willBegin) "
+                        "zoom_dismiss_should_begin session=\(state.sessionID?.uuidString ?? "nil") willBegin=\(context.willBegin) "
                             + "velX=\(context.velocity.dx) velY=\(context.velocity.dy) "
                             + "state=\(state.interactiveDismissState.label) vetoed=\(vetoed) result=\(result)"
                     )
@@ -1399,10 +1469,11 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             }
             func dump(view: UIView, path: String) {
                 let recognizers = (view.gestureRecognizers ?? [])
-                    .map { "\($0.name ?? String(describing: type(of: $0)))" }
+                    .filter { $0.name?.contains("ZoomInteractiveDismiss") == true }
+                    .map { "name=\($0.name ?? String(describing: type(of: $0))) enabled=\($0.isEnabled) state=\($0.state.rawValue)" }
                     .joined(separator: ",")
                 if !recognizers.isEmpty {
-                    photoVaultTrace("gesture_dump \(path)<\(type(of: view))> [\(recognizers)]")
+                    photoVaultTraceLaunch("zoom_gesture_after_present \(path)<\(type(of: view))> [\(recognizers)]")
                 }
                 for subview in view.subviews {
                     dump(view: subview, path: path + "->")
@@ -1458,10 +1529,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                 photoVaultTrace("viewer_dismiss_no_target")
                 ViewerPerformanceTrace.viewerDismissStart()
                 ViewerPerformanceTrace.viewerDismissEnd()
-                presentedRequestID = nil
-                hosted = nil
-                flushPendingRequest()
-                onDismissed?(dismissedID)
+                finishDismissal(sessionID: dismissedID, source: "noTargetFallback")
                 return
             }
 
@@ -1471,7 +1539,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             // after it.
             dismissTransitionCommitted()
             target.dismiss(animated: !UIAccessibility.isReduceMotionEnabled) { [weak self] in
-                self?.finishDismissal(sessionID: dismissedID)
+                self?.finishDismissal(sessionID: dismissedID, source: "dismissCompletion")
             }
         }
 
@@ -1481,10 +1549,10 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             photoVaultTrace("viewer_presentation_controller_did_dismiss")
             // Ignore a stale controller: a presentation that already ended must
             // not settle the session that replaced it.
-            guard let hosted,
-                  presentationController.presentedViewController === hosted
-            else { return }
-            finishDismissal(sessionID: presentedRequestID)
+            if let old = presentationController.presentedViewController as? PhotoViewerHostingController<Viewer> {
+                finishDismissal(sessionID: old.viewerSessionID, source: "presentationControllerDidDismiss")
+            }
+            flushPendingRequest()
         }
     }
 }

@@ -358,6 +358,7 @@ final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognize
     weak var transitionState: PhotoViewerTransitionState?
     private var origin: CGPoint?
     private var didLogGating = false
+    private var didLogDownward = false
 
     init(pagingPan: UIGestureRecognizer) {
         self.pagingPan = pagingPan
@@ -377,7 +378,7 @@ final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognize
     private var mayReserveDownwardDrag: Bool {
         guard canReserveDownwardDrag?() == true else { return false }
         guard let transitionState else { return true }
-        return transitionState.mayArbitrateDownwardDrag
+        return transitionState.downwardArbitrationState == .reserve
     }
 
     /// Whether this landing finger should be tracked at all.
@@ -414,6 +415,20 @@ final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognize
     }
 
     private func moveTracking(to location: CGPoint) {
+        #if DEBUG
+        if !didLogDownward, decision(at: location) == .downward {
+            didLogDownward = true
+            var zoom: [String] = []
+            func scan(_ node: UIView) {
+                for gesture in node.gestureRecognizers ?? [] where gesture.name?.contains("ZoomInteractiveDismiss") == true {
+                    zoom.append("name=\(gesture.name ?? "") zoomState=\(gesture.state.rawValue) zoomEnabled=\(gesture.isEnabled)")
+                }
+                for child in node.subviews { scan(child) }
+            }
+            if let window = view?.window { scan(window) }
+            photoVaultTraceLaunch("viewer_downward_touch session=\(transitionState?.sessionID?.uuidString ?? "nil") phase=\(transitionState?.interactiveDismissState.label ?? "nil") intentState=\(state.rawValue) pagingState=\(pagingPan?.state.rawValue ?? -1) zoom=\(zoom.isEmpty ? "missing" : zoom.joined(separator: ";"))")
+        }
+        #endif
         if state == .began || state == .changed {
             state = .changed
             return
@@ -521,8 +536,8 @@ final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognize
                "第二笔下拉必须仍能识别出向下")
         assert(intent.decision(at: CGPoint(x: 12, y: 1)) == .away,
                "横向拖动必须交给分页器")
-        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .reserve,
-               "回弹期间的下拉必须仍能占住方向")
+        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .gated,
+               "回弹期间只追踪，不提前抢占 pager")
 
         // While the system already owns a drag, or is on its way out, the
         // recognizer must step aside without failing the touch.
@@ -564,6 +579,7 @@ final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognize
         super.reset()
         origin = nil
         didLogGating = false
+        didLogDownward = false
         #if DEBUG
         photoVaultTrace("viewer_downward_intent_reset")
         #endif
@@ -2232,6 +2248,7 @@ private struct ViewerFilmstrip: UIViewRepresentable {
 
         let collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         collectionView.backgroundColor = .clear
+        collectionView.accessibilityIdentifier = "viewer-filmstrip"
         collectionView.showsHorizontalScrollIndicator = false
         collectionView.alwaysBounceHorizontal = true
         collectionView.decelerationRate = .fast
@@ -3066,6 +3083,7 @@ private struct IndexedViewerFilmstrip: UIViewRepresentable {
 
         let collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
         collectionView.backgroundColor = .clear
+        collectionView.accessibilityIdentifier = "viewer-filmstrip"
         collectionView.showsHorizontalScrollIndicator = false
         collectionView.alwaysBounceHorizontal = true
         collectionView.decelerationRate = .fast

@@ -9,16 +9,31 @@ let tests = #"""
 func expect(_ result: Bool, _ message: String) { precondition(result, message) }
 let cases: [(Bool, CGFloat, CGFloat, Bool, Bool)] = [
     (true, 0, 300, false, true), (false, 500, 0, false, false),
-    (false, 20, 300, false, true), (true, 0, 300, true, false),
+    (false, 20, 300, false, false), (true, 0, 300, true, false),
     (false, 300, 100, false, false), (false, 0, 0, false, false),
-    (false, 0, -300, false, false), (false, 0, 0.01, false, true),
+    (false, 0, -300, false, false), (false, 0, 0.01, false, false),
     (false, -500, 0, false, false), (false, 20, 300, true, false),
-    (false, 100, 114, false, false), (false, 100, 116, false, true)
+    (false, 100, 114, false, false), (false, 100, 116, false, false)
 ]
 for (system, x, y, veto, wanted) in cases {
     expect(shouldBeginViewerInteractiveDismiss(willBegin: system, velocityX: x, velocityY: y, vetoed: veto) == wanted, "direction/veto regression")
 }
 var state = ViewerDismissInteraction()
+let session = UUID()
+var requests = ViewerPendingRequests<UUID>()
+let b = UUID(), c = UUID()
+requests.latest = b
+expect(requests.take(phase: .dismissing(session), hasPresentedController: true) == nil && requests.latest == b, "B stays queued while A dismisses")
+requests.latest = c
+expect(requests.take(phase: .dismissing(session), hasPresentedController: false) == nil && requests.latest == c, "C replaces B without ending A")
+expect(requests.take(phase: .empty, hasPresentedController: true) == nil && requests.latest == c, "completion cannot bypass UIKit ownership")
+expect(requests.take(phase: .empty, hasPresentedController: false) == c, "only newest request opens after release")
+expect(requests.take(phase: .empty, hasPresentedController: false) == nil, "request consumed exactly once")
+for phase: ViewerPresentationPhase in [.empty, .presenting(session), .presented(session), .dismissing(session)] {
+    for occupied in [false, true] {
+        expect(mayPresentViewer(presentationPhase: phase, hasPresentedController: occupied) == (phase == .empty && !occupied), "presentation must be serialized")
+    }
+}
 let first = state.begin()
 expect(state.cancel(first), "first cancel")
 let second = state.begin()
@@ -42,7 +57,7 @@ for _ in 0..<5 {
 let pending = state.begin()
 state.clear()
 expect(!state.cancel(pending) && !state.commit(pending) && !state.settle(pending), "vanished session invalidates callbacks")
-print("PASS: 12 direction/veto cases; stale cancel/commit/appearance, normal settle, 5 reentries, session cleanup")
+print("PASS: 12 veto cases, 8 presentation gates, pending/latest/exactly-once policy; stale callbacks, 5 reentries, cleanup")
 """#
 let temp = FileManager.default.temporaryDirectory.appendingPathComponent("photovault-dismiss-\(UUID().uuidString).swift")
 defer { try? FileManager.default.removeItem(at: temp) }

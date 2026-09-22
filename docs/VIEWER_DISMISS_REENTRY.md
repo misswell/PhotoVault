@@ -1,5 +1,7 @@
 # 详情页连续下拉修复与验证（2026-09-22）
 
+> 历史记录：本文件描述 8028bef 及此前的回弹修复，不是当前策略。最新实现见 [串行呈现修复](VIEWER_SERIAL_PRESENTATION.md)：已撤回 cancelling 直接 reserve、向下速度覆盖 willBegin，以及重叠呈现。以下旧测试结果不能作为新版本验收结果。
+
 ## 已确认的根因
 
 真机 BENG 连续三轮人工复现表明，仅放开方向仲裁、增加 generation、覆盖 `willBegin=false`，不足以解决这次无响应。

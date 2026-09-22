@@ -106,7 +106,8 @@ struct PhotoGridScreen: View {
                     // still on screen, so cover the grid again.
                     isViewerTransitioning = true
                 },
-                onDismissed: handleViewerDismissed
+                onDismissed: handleViewerDismissed,
+                onPresentationBegan: { isViewerTransitioning = true }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         )
@@ -408,7 +409,7 @@ struct PhotoGridScreen: View {
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            isViewerTransitioning = true
+            isViewerTransitioning = transitionCoordinator.viewerTransitionState.interactiveDismissState != .committed
             viewerRequest = PhotoViewerRequest(
                 index: context.index,
                 assetIdentifier: context.assetIdentifier,
@@ -515,7 +516,8 @@ struct UnsortedPhotosScreen: View {
                     // still on screen, so cover the grid again.
                     isViewerTransitioning = true
                 },
-                onDismissed: handleViewerDismissed
+                onDismissed: handleViewerDismissed,
+                onPresentationBegan: { isViewerTransitioning = true }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         )
@@ -716,7 +718,7 @@ struct UnsortedPhotosScreen: View {
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction) {
-            isViewerTransitioning = true
+            isViewerTransitioning = transitionCoordinator.viewerTransitionState.interactiveDismissState != .committed
             viewerRequest = PhotoViewerRequest(
                 index: index,
                 assetIdentifier: asset.localIdentifier,
