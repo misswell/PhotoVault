@@ -48,9 +48,10 @@ XCTest 注入手势会等待 idle，因此即使运行在真机，连续 UI 自�
 
 - 纯策略测试通过。
 - 初轮 interruption probe 在 presentation completion 内同步 dismiss，测试失败；改为单次 MainActor yield 后再触发 probe dismissal。保留首次失败，不作为产品修复通过记录。
-- 初轮模拟器 Close → Reopen → PullDown 十轮通过。
-- 真机 Debug 编译完成，但首次 XCTest runner 在建立连接前退出 code 74，日志为 `Exiting due to IDE disconnection`，没有执行测试，真机轮数仍为 0。
-- 后续最终回归和交付结果在下方追加。
+- 最终模拟器详情回归：20 项通过、0 失败（`/tmp/PhotoVault-full-final.xcresult`，662.075 秒）。包含 10 轮下拉重开、10 轮关闭重开、三秒稳定后下拉、胶片条 scrub 后下拉、未整理详情页、短拉取消、左右分页、放大平移和动画内排队。
+- 最终真机 Debug 构建成功（`/tmp/PhotoVault-final-device-build.log`），已安装并启动 BENG：`com.misswell.PhotoVault`，1.0（Build 34），当前进程 PID 21556。
+- 真机 XCTest 尝试仍在测试 runner 建立连接前退出 code 74（`Exiting due to IDE disconnection`，`/tmp/PhotoVault-device-stable.log`），因此不把它计为自动化通过或 30 轮人工验收。
+- 同一最终行为版本的 BENG 诊断日志记录了实际系统触摸和串行会话（交互 trace PID 21535；最后一行清理后的重装启动 PID 21556）：A commit 后连续收到多个新请求，均记录 `viewer_request_queued ... viewer_reopen_queued_during_dismissal`；A `viewer_session_finish` 后才记录 `presenter_state phase=empty presentedVC=nil` 和 B `viewer_session_present_begin`，随后 B 的 `viewer_downward_touch`、`zoom_dismiss_should_begin willBegin=true`、commit、finish 均成功。日志副本为 `/tmp/PhotoVault-final-device-diagnostics.log`。
 
 主要命令产物位于 `/tmp/PhotoVault-serial-*`，不会提交编译产物或照片。
 

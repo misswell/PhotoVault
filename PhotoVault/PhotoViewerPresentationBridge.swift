@@ -836,6 +836,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             pendingRequest = nil
             pendingDismissRequest = false
             activeInteractiveDismissGeneration = nil
+            committedInteractiveDismissGeneration = nil
             dismissalPhase = .idle
             makeViewer = nil
             restoreViewerInteraction()
