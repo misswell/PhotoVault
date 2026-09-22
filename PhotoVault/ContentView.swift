@@ -591,19 +591,32 @@ struct ContentView: View {
                 }
             )
             .id("home-detail")
+        // Every branch that can push the photo viewer gets its own
+        // NavigationStack. The viewer is a real navigation push, so on compact
+        // width it would otherwise land on the split view's *internal* stack —
+        // and popping it corrupts the split view's detail presentation, which
+        // is the same failure the LAN branch already guards against below.
+        // Same reason every branch carries a stable `.id`: switching sections
+        // must not reuse another branch's navigation state.
         case .library:
-            PhotoGridScreen(
-                title: "图库",
-                assets: store.allPhotos,
-                store: store
-            )
+            NavigationStack {
+                PhotoGridScreen(
+                    title: "图库",
+                    assets: store.allPhotos,
+                    store: store
+                )
+            }
             .id("library-detail")
         case .unsorted:
-            UnsortedPhotosScreen(store: store)
-                .id("unsorted-detail")
+            NavigationStack {
+                UnsortedPhotosScreen(store: store)
+            }
+            .id("unsorted-detail")
         case .smartSearch:
-            SmartSearchScreen(store: store)
-                .id("smart-search-detail")
+            NavigationStack {
+                SmartSearchScreen(store: store)
+            }
+            .id("smart-search-detail")
         case .lan:
             // The LAN home is the only detail screen that pushes a second
             // level (NavigationLink into a folder grid). On compact width
@@ -618,12 +631,14 @@ struct ContentView: View {
             .id("lan-detail")
         case .album(let id):
             if let album = store.album(withID: id) {
-                PhotoGridScreen(
-                    title: album.title,
-                    assets: store.assets(in: album),
-                    store: store,
-                    album: album
-                )
+                NavigationStack {
+                    PhotoGridScreen(
+                        title: album.title,
+                        assets: store.assets(in: album),
+                        store: store,
+                        album: album
+                    )
+                }
                 .id("album-detail-\(id)")
             } else {
                 ContentUnavailableView(
@@ -633,14 +648,19 @@ struct ContentView: View {
                 )
             }
         case .search(let query):
-            PhotoSearchResultsScreen(
-                query: query,
-                store: store,
-                onSelectAlbum: { album in
-                    selection = .album(album.id)
-                    searchText = album.title
-                }
-            )
+            // Search results can contain a photo grid, which can open the
+            // viewer — so this branch needs its own stack too.
+            NavigationStack {
+                PhotoSearchResultsScreen(
+                    query: query,
+                    store: store,
+                    onSelectAlbum: { album in
+                        selection = .album(album.id)
+                        searchText = album.title
+                    }
+                )
+            }
+            .id("search-detail-\(query)")
         }
     }
 }

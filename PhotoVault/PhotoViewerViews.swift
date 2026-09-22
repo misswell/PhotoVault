@@ -347,828 +347,6 @@ private struct ViewerMediaView: View {
     }
 }
 
-/// Resolves downward intent before the horizontal scroll view starts paging.
-/// This recognizer only arbitrates; UIKit's zoom gesture still owns every pixel
-/// of the dismissal. No replacement scroll-view delegate or failure dependency.
-final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognizerDelegate {
-    weak var pagingPan: UIGestureRecognizer?
-    var canReserveDownwardDrag: (() -> Bool)?
-    /// The viewer session's live dismissal state, read on every sampled move.
-    /// UIKit still owns the actual zoom transition.
-    weak var transitionState: PhotoViewerTransitionState?
-    private var origin: CGPoint?
-    private var didLogGating = false
-    private var didLogDownward = false
-
-    init(pagingPan: UIGestureRecognizer) {
-        self.pagingPan = pagingPan
-        super.init(target: nil, action: nil)
-        delegate = self
-        cancelsTouchesInView = false
-        delaysTouchesBegan = false
-        delaysTouchesEnded = false
-    }
-
-    /// Whether the pager may give up the downward direction right now.
-    ///
-    /// Live, and re-asked on every sampled move: the gate can flip while the
-    /// finger is still travelling (UIKit finishing a bounce-back being the
-    /// common case). Deciding it once at touch-down is what lost the whole
-    /// gesture, because `.failed` is terminal for that touch sequence.
-    private var mayReserveDownwardDrag: Bool {
-        guard canReserveDownwardDrag?() == true else { return false }
-        guard let transitionState else { return true }
-        return transitionState.downwardArbitrationState == .reserve
-    }
-
-    /// Whether this landing finger should be tracked at all.
-    ///
-    /// Deliberately says nothing about the dismissal state: the gate is
-    /// evaluated per move, so a touch that lands during a bounce-back can
-    /// still be reserved once the bounce settles under the finger.
-    private func shouldTrackAtTouchDown(fingers: Int, hasOrigin: Bool) -> Bool {
-        fingers == 1 && !hasOrigin
-    }
-
-    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
-        // A recognition cycle that did not settle is the recognizer's own
-        // problem; forcing a state here would fight UIKit's reset. Only a
-        // fresh cycle may decide anything.
-        guard state == .possible else { return }
-        let fingers = event.allTouches?.count ?? 0
-        // Multiple fingers mean pinch/zoom, never a pull-down.
-        guard shouldTrackAtTouchDown(fingers: fingers, hasOrigin: origin != nil),
-              let touch = touches.first else {
-            state = .failed
-            return
-        }
-        origin = touch.location(in: view)
-        photoVaultTrace(
-            "viewer_downward_intent began dismissState="
-                + (transitionState?.interactiveDismissState.label ?? "none")
-        )
-    }
-
-    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
-        guard let touch = touches.first else { return }
-        moveTracking(to: touch.location(in: view))
-    }
-
-    private func moveTracking(to location: CGPoint) {
-        #if DEBUG
-        if !didLogDownward, decision(at: location) == .downward {
-            didLogDownward = true
-            var zoom: [String] = []
-            func scan(_ node: UIView) {
-                for gesture in node.gestureRecognizers ?? [] where gesture.name?.contains("ZoomInteractiveDismiss") == true {
-                    zoom.append("name=\(gesture.name ?? "") zoomState=\(gesture.state.rawValue) zoomEnabled=\(gesture.isEnabled)")
-                }
-                for child in node.subviews { scan(child) }
-            }
-            if let window = view?.window { scan(window) }
-            photoVaultTraceLaunch("viewer_downward_touch session=\(transitionState?.sessionID?.uuidString ?? "nil") phase=\(transitionState?.interactiveDismissState.label ?? "nil") intentState=\(state.rawValue) pagingState=\(pagingPan?.state.rawValue ?? -1) zoom=\(zoom.isEmpty ? "missing" : zoom.joined(separator: ";"))")
-        }
-        #endif
-        if state == .began || state == .changed {
-            state = .changed
-            return
-        }
-        guard state == .possible else { return }
-        switch resolution(at: location) {
-        case .hold:
-            break
-        case .gated:
-            // Downward, but the gate is shut. Reported once per touch: this is
-            // the state that replaced "fail the touch", so a device log can
-            // tell a pull-down that is still alive from one that was dropped.
-            guard !didLogGating else { return }
-            didLogGating = true
-            photoVaultTrace(
-                "viewer_downward_intent gated dismissState="
-                    + (transitionState?.interactiveDismissState.label ?? "none")
-            )
-        case .release:
-            // Clearly horizontal or upward: hand the drag to the pager now
-            // rather than sitting on it until the finger lifts.
-            state = .failed
-            photoVaultTrace("viewer_downward_intent released to pager")
-        case .reserve:
-            state = .began
-            photoVaultTrace("viewer_downward_intent reserved")
-        }
-    }
-
-    private enum DownwardDecision {
-        /// Movement below the threshold that resolves a direction.
-        case tooClose
-        /// Far enough to have a direction, and that direction is downward.
-        case downward
-        /// Far enough, and the drag is leaving the pull-down (horizontal/up).
-        case away
-        /// No origin recorded, so nothing may be concluded.
-        case undecided
-    }
-
-    private func decision(at location: CGPoint) -> DownwardDecision {
-        guard let origin else { return .undecided }
-        let dx = location.x - origin.x
-        let dy = location.y - origin.y
-        guard hypot(dx, dy) >= 6 else { return .tooClose }
-        // A slightly diagonal pull remains a dismissal; clearly horizontal
-        // motion and upward drags immediately leave the pager alone.
-        return dy > 0 && dy >= abs(dx) ? .downward : .away
-    }
-
-    /// What a sampled point means for this touch: direction crossed with the
-    /// live dismissal gate.
-    ///
-    /// `.hold` and `.gated` both keep the recognizer `.possible`, which blocks
-    /// nothing — touches are delivered immediately (`delaysTouchesBegan/Ended`
-    /// are off) and this recognizer can only ever prevent the pager's pan,
-    /// never UIKit's own dismissal gesture. So waiting out the bounce-back
-    /// costs nothing, while failing the touch costs the gesture.
-    private enum DownwardResolution {
-        /// Nothing to conclude from this sample yet.
-        case hold
-        /// Downward, but the gate is shut; keep tracking and re-check.
-        case gated
-        /// Downward and the pager may give up the direction.
-        case reserve
-        /// Not a pull-down; leave the drag to the pager.
-        case release
-    }
-
-    private func resolution(at location: CGPoint) -> DownwardResolution {
-        switch decision(at: location) {
-        case .tooClose, .undecided:
-            return .hold
-        case .away:
-            return .release
-        case .downward:
-            return mayReserveDownwardDrag ? .reserve : .gated
-        }
-    }
-
-    #if DEBUG
-    /// Runs from the bridge's real cancelling phase on the same helpers touch
-    /// delivery uses, over a throwaway state object.
-    ///
-    /// It checks what a pull-down *concludes*. It never drives a recognizer
-    /// through UIKit's state machine: setting `.began` outside live touch
-    /// handling is what crashed the earlier version of this probe.
-    static func debugVerifyCancellationReentry() {
-        let pager = UIPanGestureRecognizer()
-        let intent = ViewerDownwardIntentGesture(pagingPan: pager)
-        // Strong local: `transitionState` is weak, and the probe owns the only
-        // reference to this throwaway session state.
-        let session = PhotoViewerTransitionState(index: 0, assetIdentifier: nil)
-        intent.transitionState = session
-        intent.canReserveDownwardDrag = { true }
-
-        // A second finger lands while UIKit is still bouncing the first back.
-        session.setInteractiveDismissState(.cancelling)
-        assert(intent.shouldTrackAtTouchDown(fingers: 1, hasOrigin: false),
-               "回弹没结束就放弃落指，会让第二笔下拉整笔失效")
-        assert(!intent.shouldTrackAtTouchDown(fingers: 2, hasOrigin: false),
-               "多指是缩放，不参与下拉仲裁")
-        intent.origin = .zero
-        assert(intent.decision(at: CGPoint(x: 1, y: 12)) == .downward,
-               "第二笔下拉必须仍能识别出向下")
-        assert(intent.decision(at: CGPoint(x: 12, y: 1)) == .away,
-               "横向拖动必须交给分页器")
-        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .gated,
-               "回弹期间只追踪，不提前抢占 pager")
-
-        // While the system already owns a drag, or is on its way out, the
-        // recognizer must step aside without failing the touch.
-        session.setInteractiveDismissState(.dragging)
-        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .gated,
-               "系统正在拖动时仲裁器必须让路")
-        session.setInteractiveDismissState(.committed)
-        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .gated,
-               "退出进行中必须让路")
-
-        // The same touch, once the bounce has settled: still reservable.
-        session.setInteractiveDismissState(.idle)
-        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .reserve,
-               "回弹结束后，同一笔触摸必须能占住下拉方向")
-
-        assert(intent.canPrevent(pager), "下拉方向不能交给横向分页器")
-        assert(!intent.canPrevent(UIPanGestureRecognizer()), "不得阻止系统退出手势")
-        photoVaultTraceLaunch("viewer_cancel_reentry_tracking passed=true")
-    }
-    #endif
-
-    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
-        switch state {
-        case .possible: state = .failed
-        case .began, .changed: state = .ended
-        default: break
-        }
-    }
-
-    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
-        switch state {
-        case .possible: state = .failed
-        case .began, .changed: state = .cancelled
-        default: break
-        }
-    }
-
-    override func reset() {
-        super.reset()
-        origin = nil
-        didLogGating = false
-        didLogDownward = false
-        #if DEBUG
-        photoVaultTrace("viewer_downward_intent_reset")
-        #endif
-    }
-
-    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
-        preventedGestureRecognizer === pagingPan
-    }
-
-    /// Only the pager's pan may not preempt this arbitration recognizer.
-    ///
-    /// Answering `false` across the board made the recognizer unpreventable by
-    /// *anything*, which puts it above UIKit's own zoom dismissal gesture — and
-    /// this recognizer is nothing but an arbiter between the pager and that
-    /// gesture. When a cancelled pull-back was still settling, the system
-    /// gesture could not take over, this one still reserved the drag, and the
-    /// whole touch was dropped by both.
-    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
-        preventingGestureRecognizer !== pagingPan
-    }
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        otherGestureRecognizer !== pagingPan
-    }
-}
-
-/// UIKit's page controller owns the interactive transition from beginning to
-/// end. SwiftUI's TabView is convenient for a static pager, but resetting its
-/// selection while its internal UIPageViewController is still animating can
-/// make the next swipe a no-op. This wrapper keeps one controller per nearby
-/// asset and lets the delegate report the completed page exactly once.
-private struct NativePhotoPager: UIViewControllerRepresentable {
-    let pageCount: Int
-    @Binding var currentIndex: Int
-    var isScrubbing: Bool = false
-    /// The live viewer session's dismissal state, consulted by the downward
-    /// intent recognizer. nil means "no system dismissal to arbitrate against"
-    /// and leaves the pager alone.
-    var transitionState: PhotoViewerTransitionState? = nil
-    let assetProvider: (Int) -> PHAsset?
-    let targetSize: CGSize
-    let contentMode: PHImageContentMode
-    let neighborPriority: PhotoRequestPriority
-    /// First-frame seed for exactly one page: the asset the viewer opened on.
-    let initialPreviewImage: UIImage?
-    let initialAssetIdentifier: String?
-    let onMediaReady: ((Bool) -> Void)?
-    let onZoomingChanged: ((Bool) -> Void)?
-    let onPagingChanged: ((Bool) -> Void)?
-
-    func makeCoordinator() -> Coordinator {
-        PagerDiagnostics.beginSession()
-        return Coordinator(
-            currentIndex: $currentIndex,
-            transitionState: transitionState
-        )
-    }
-
-    func makeUIViewController(context: Context) -> UIPageViewController {
-        let controller = UIPageViewController(
-            transitionStyle: .scroll,
-            navigationOrientation: .horizontal,
-            options: [
-                UIPageViewController.OptionsKey.interPageSpacing: 0
-            ]
-        )
-        controller.dataSource = context.coordinator
-        controller.delegate = context.coordinator
-        context.coordinator.attach(controller: controller)
-        context.coordinator.update(
-            pageCount: pageCount,
-            currentIndex: currentIndex,
-            isScrubbing: isScrubbing,
-            assetProvider: assetProvider,
-            targetSize: targetSize,
-            contentMode: contentMode,
-            neighborPriority: neighborPriority,
-            initialPreviewImage: initialPreviewImage,
-            initialAssetIdentifier: initialAssetIdentifier,
-            onMediaReady: onMediaReady,
-            onZoomingChanged: onZoomingChanged,
-            onPagingChanged: onPagingChanged
-        )
-        return controller
-    }
-
-    func updateUIViewController(
-        _ controller: UIPageViewController,
-        context: Context
-    ) {
-        context.coordinator.update(
-            pageCount: pageCount,
-            currentIndex: currentIndex,
-            isScrubbing: isScrubbing,
-            assetProvider: assetProvider,
-            targetSize: targetSize,
-            contentMode: contentMode,
-            neighborPriority: neighborPriority,
-            initialPreviewImage: initialPreviewImage,
-            initialAssetIdentifier: initialAssetIdentifier,
-            onMediaReady: onMediaReady,
-            onZoomingChanged: onZoomingChanged,
-            onPagingChanged: onPagingChanged
-        )
-    }
-
-    static func dismantleUIViewController(
-        _ uiViewController: UIPageViewController,
-        coordinator: Coordinator
-    ) {
-        coordinator.invalidate()
-    }
-
-    @MainActor
-    final class Coordinator: NSObject, UIPageViewControllerDataSource,
-        UIPageViewControllerDelegate {
-        private weak var pageController: UIPageViewController?
-        private var downwardIntentGesture: ViewerDownwardIntentGesture?
-        /// Held weakly: the session's state belongs to the grid's transition
-        /// coordinator, and a pager outliving that session must not keep a
-        /// stale gate alive — a released reference simply means "no gate".
-        private weak var transitionState: PhotoViewerTransitionState?
-        private var pageCount = 0
-        private var displayedIndex: Int?
-        private var assetProvider: ((Int) -> PHAsset?) = { _ in nil }
-        private var targetSize = CGSize.zero
-        private var contentMode: PHImageContentMode = .aspectFit
-        private var neighborPriority: PhotoRequestPriority = .slideshow
-        private var initialPreviewImage: UIImage?
-        private var initialAssetIdentifier: String?
-        private var onMediaReady: ((Bool) -> Void)?
-        private var onZoomingChanged: ((Bool) -> Void)?
-        private var onPagingChanged: ((Bool) -> Void)?
-        private var isZooming = false
-        private var pages: [Int: PhotoPagerPageController] = [:]
-        /// The content identity currently rendered by each page's hosting
-        /// controller, so an unchanged page is never rebuilt.
-        private var pageIdentities: [Int: String] = [:]
-        private var currentIndexBinding: Binding<Int>
-        private var pendingProgrammaticIndex: Int?
-        private var isScrubbing = false
-        private var lastUpdateSignature = ""
-        private var lastPageContentSignature = ""
-        private var isManualTransitionInProgress = false
-
-        init(currentIndex: Binding<Int>, transitionState: PhotoViewerTransitionState?) {
-            currentIndexBinding = currentIndex
-            self.transitionState = transitionState
-            PagerDiagnostics.log("coordinator init index=\(currentIndex.wrappedValue)")
-        }
-
-        func attach(controller: UIPageViewController) {
-            pageController = controller
-            guard let scrollView = controller.view.subviews.compactMap({ $0 as? UIScrollView }).first
-            else { return }
-            let intent = ViewerDownwardIntentGesture(pagingPan: scrollView.panGestureRecognizer)
-            intent.canReserveDownwardDrag = { [weak self] in
-                guard let self else { return false }
-                return !self.isZooming && !self.isManualTransitionInProgress
-                    && !self.isScrubbing && self.pendingProgrammaticIndex == nil
-            }
-            // Keep downward direction arbitration alive during reversal as well.
-            // Failing here hands the second drag to the horizontal pager for
-            // its entire touch sequence, even after the bounce has settled.
-            intent.transitionState = transitionState
-            scrollView.addGestureRecognizer(intent)
-            downwardIntentGesture = intent
-        }
-
-        func invalidate() {
-            guard pageController != nil || !pages.isEmpty else { return }
-            PagerDiagnostics.log(
-                "coordinator invalidate displayed=\(displayedIndex.map(String.init) ?? "none")"
-            )
-
-            // A cover can begin its dismissal while UIPageViewController is
-            // still finishing a horizontal transition. Detach the delegates
-            // before releasing the hosted pages so a late UIKit callback
-            // cannot write into the screen that is already going away.
-            if let downwardIntentGesture {
-                downwardIntentGesture.view?.removeGestureRecognizer(downwardIntentGesture)
-            }
-            downwardIntentGesture = nil
-            pageController?.dataSource = nil
-            pageController?.delegate = nil
-            pageController?.view.isUserInteractionEnabled = false
-            pages.removeAll()
-            pendingProgrammaticIndex = nil
-            displayedIndex = nil
-
-            // The SwiftUI owner may be in the middle of removing this
-            // representable. Publishing the final zoom/paging values here
-            // re-enters its @State setters from UIKit's animation callback
-            // and can trip Swift's exclusivity checker. Once the pager is
-            // being dismantled, no consumer can act on these values anyway;
-            // sever callbacks before clearing the local flags.
-            onMediaReady = nil
-            onZoomingChanged = nil
-            onPagingChanged = nil
-            if isZooming {
-                isZooming = false
-            }
-            if isManualTransitionInProgress {
-                isManualTransitionInProgress = false
-            }
-            assetProvider = { _ in nil }
-            pageController = nil
-        }
-
-        func update(
-            pageCount: Int,
-            currentIndex: Int,
-            isScrubbing: Bool,
-            assetProvider: @escaping (Int) -> PHAsset?,
-            targetSize: CGSize,
-            contentMode: PHImageContentMode,
-            neighborPriority: PhotoRequestPriority,
-            initialPreviewImage: UIImage?,
-            initialAssetIdentifier: String?,
-            onMediaReady: ((Bool) -> Void)?,
-            onZoomingChanged: ((Bool) -> Void)?,
-            onPagingChanged: ((Bool) -> Void)?
-        ) {
-            self.pageCount = max(0, pageCount)
-            self.assetProvider = assetProvider
-            self.targetSize = targetSize
-            self.contentMode = contentMode
-            self.neighborPriority = neighborPriority
-            // Set once, from the opening request. Never refreshed afterwards:
-            // the seed belongs to the asset the viewer was opened on, and a
-            // later update carrying a different preview must not re-seed an
-            // unrelated page.
-            if self.initialAssetIdentifier == nil {
-                self.initialPreviewImage = initialPreviewImage
-                self.initialAssetIdentifier = initialAssetIdentifier
-            }
-            self.onMediaReady = onMediaReady
-            self.onZoomingChanged = onZoomingChanged
-            self.onPagingChanged = onPagingChanged
-            self.isScrubbing = isScrubbing
-
-            guard self.pageCount > 0,
-                  let pageController
-            else { return }
-
-            let clampedIndex = min(
-                max(0, currentIndex),
-                self.pageCount - 1
-            )
-
-            let displayed = self.displayedIndex.map(String.init) ?? "none"
-            let pending = self.pendingProgrammaticIndex.map(String.init) ?? "none"
-            let updateSignature = "count=\(self.pageCount) current=\(clampedIndex) displayed=\(displayed) pending=\(pending)"
-            if updateSignature != lastUpdateSignature {
-                lastUpdateSignature = updateSignature
-                PagerDiagnostics.log("update \(updateSignature)")
-            }
-
-            guard let displayedIndex else {
-                setInitialPage(to: clampedIndex)
-                return
-            }
-
-            let pageContentSignature = makePageContentSignature(around: clampedIndex)
-            if pageContentSignature != lastPageContentSignature {
-                lastPageContentSignature = pageContentSignature
-                if isManualTransitionInProgress || pendingProgrammaticIndex != nil {
-                    // The completed transition refreshes the stable pages.
-                    // Never replace a hosting controller's root view while
-                    // UIPageViewController is tracking an interactive scroll.
-                } else {
-                    refreshPages(around: clampedIndex)
-                }
-            }
-
-            if displayedIndex != clampedIndex {
-                // Filmstrip scrubbing produces a burst of index changes per
-                // gesture. Animated transitions would queue behind the
-                // pending guard and lag behind the finger, so scrub steps
-                // swap pages instantly instead.
-                if isScrubbing {
-                    if let targetPage = page(at: clampedIndex) {
-                        let direction: UIPageViewController.NavigationDirection =
-                            clampedIndex > displayedIndex ? .forward : .reverse
-                        PagerDiagnostics.log(
-                            "scrub transition from=\(displayedIndex) to=\(clampedIndex)"
-                        )
-                        pageController.setViewControllers(
-                            [targetPage],
-                            direction: direction,
-                            animated: false
-                        )
-                        self.displayedIndex = clampedIndex
-                        if isZooming {
-                            isZooming = false
-                            onZoomingChanged?(false)
-                        }
-                        // `refreshPages(around:)` already ran above with this
-                        // same `clampedIndex`; the second call only rebuilt
-                        // three full-screen pages per scrub frame.
-                    }
-                    return
-                }
-
-                // SwiftUI may call updateUIViewController more than once while
-                // the destination page is downloading. Do not restart the same
-                // UIKit transition on every asset/cache update.
-                if pendingProgrammaticIndex == clampedIndex {
-                    return
-                }
-                guard pendingProgrammaticIndex == nil else { return }
-
-                // A filmstrip tap or another external control can change the
-                // binding without going through the page controller delegate.
-                // Move directly to that asset and leave the controller centered
-                // there; there is no selection value to reset afterward.
-                guard let visiblePage = pageController.viewControllers?
-                    .first as? PhotoPagerPageController
-                else { return }
-
-                let direction: UIPageViewController.NavigationDirection =
-                    clampedIndex > visiblePage.index ? .forward : .reverse
-                guard let targetPage = page(at: clampedIndex) else { return }
-                pendingProgrammaticIndex = clampedIndex
-                let directionName = direction == .forward ? "forward" : "reverse"
-                PagerDiagnostics.log(
-                    "external transition from=\(visiblePage.index) to=\(clampedIndex) direction=\(directionName)"
-                )
-                pageController.setViewControllers(
-                    [targetPage],
-                    direction: direction,
-                    animated: true
-                ) { [weak self] _ in
-                    guard let self else { return }
-                    self.pendingProgrammaticIndex = nil
-                    self.displayedIndex = clampedIndex
-                    if self.isZooming {
-                        self.isZooming = false
-                        self.onZoomingChanged?(false)
-                    }
-                    PagerDiagnostics.log("external transition completed=\(clampedIndex)")
-                    self.refreshPages(around: clampedIndex)
-                }
-            }
-        }
-
-        func pageViewController(
-            _ pageViewController: UIPageViewController,
-            willTransitionTo pendingViewControllers: [UIViewController]
-        ) {
-            isManualTransitionInProgress = true
-            onPagingChanged?(true)
-            let target = (pendingViewControllers.first as? PhotoPagerPageController)?.index
-            PagerDiagnostics.log(
-                "transition began target=\(target.map(String.init) ?? "none")"
-            )
-        }
-
-        func pageViewController(
-            _ pageViewController: UIPageViewController,
-            viewControllerBefore viewController: UIViewController
-        ) -> UIViewController? {
-            guard !isZooming,
-                  let photoPage = viewController as? PhotoPagerPageController
-            else { return nil }
-            PagerDiagnostics.log(
-                "data source before page=\(photoPage.index) target=\(photoPage.index - 1) zoom=\(isZooming)"
-            )
-            return page(at: photoPage.index - 1)
-        }
-
-        func pageViewController(
-            _ pageViewController: UIPageViewController,
-            viewControllerAfter viewController: UIViewController
-        ) -> UIViewController? {
-            guard !isZooming,
-                  let photoPage = viewController as? PhotoPagerPageController
-            else { return nil }
-            PagerDiagnostics.log(
-                "data source after page=\(photoPage.index) target=\(photoPage.index + 1) zoom=\(isZooming)"
-            )
-            return page(at: photoPage.index + 1)
-        }
-
-        func pageViewController(
-            _ pageViewController: UIPageViewController,
-            didFinishAnimating finished: Bool,
-            previousViewControllers: [UIViewController],
-            transitionCompleted completed: Bool
-        ) {
-            let visibleIndex = (pageViewController.viewControllers?.first as? PhotoPagerPageController)
-                .map { String($0.index) } ?? "none"
-            PagerDiagnostics.log(
-                "transition finished=\(finished) completed=\(completed) visible=\(visibleIndex)"
-            )
-            isManualTransitionInProgress = false
-            onPagingChanged?(false)
-
-            if finished,
-               completed,
-               let visiblePage = pageViewController.viewControllers?
-                .first as? PhotoPagerPageController {
-                let newIndex = visiblePage.index
-                pendingProgrammaticIndex = nil
-                displayedIndex = newIndex
-                lastPageContentSignature = makePageContentSignature(around: newIndex)
-                if isZooming {
-                    isZooming = false
-                    onZoomingChanged?(false)
-                }
-
-                if currentIndexBinding.wrappedValue != newIndex {
-                    currentIndexBinding.wrappedValue = newIndex
-                }
-            }
-
-            if let stableIndex = displayedIndex {
-                refreshPages(around: stableIndex)
-            }
-        }
-
-        private func setInitialPage(to index: Int) {
-            guard let pageController else { return }
-            guard let initialPage = page(at: index) else { return }
-            PagerDiagnostics.log("set initial page=\(index)")
-            pageController.setViewControllers(
-                [initialPage],
-                direction: .forward,
-                animated: false
-            )
-            displayedIndex = index
-            lastPageContentSignature = makePageContentSignature(around: index)
-            refreshPages(around: index)
-            if isZooming {
-                isZooming = false
-                onZoomingChanged?(false)
-            }
-        }
-
-        private func page(at index: Int) -> PhotoPagerPageController? {
-            guard index >= 0, index < pageCount else { return nil }
-
-            if let existing = pages[index] {
-                return existing
-            }
-
-            PagerDiagnostics.log("create page=\(index)")
-            let page = PhotoPagerPageController(
-                index: index,
-                rootView: makePageView(for: index)
-            )
-            pages[index] = page
-            return page
-        }
-
-        private func makePageContentSignature(around index: Int) -> String {
-            let assetIDs = ((index - 1)...(index + 1)).map { candidate -> String in
-                guard candidate >= 0, candidate < pageCount else { return "edge" }
-                return assetProvider(candidate)?.localIdentifier ?? "pending"
-            }
-            return [
-                String(pageCount),
-                String(Int(targetSize.width.rounded())),
-                String(Int(targetSize.height.rounded())),
-                String(contentMode.rawValue),
-                String(neighborPriority.rawValue),
-                assetIDs.joined(separator: ",")
-            ].joined(separator: "|")
-        }
-
-        private func makePageView(for index: Int) -> AnyView {
-            guard index >= 0, index < pageCount,
-                  let asset = assetProvider(index)
-            else {
-                return AnyView(
-                    ZStack {
-                        Color.black
-                        ProgressView("正在读取照片…")
-                            .tint(.white)
-                            .foregroundStyle(.white)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                )
-            }
-
-            return AnyView(
-                ViewerMediaView(
-                    asset: asset,
-                    targetSize: targetSize,
-                    contentMode: contentMode,
-                    requestPriority: displayedIndex == index
-                        ? .viewer
-                        : neighborPriority,
-                    initialImage: asset.localIdentifier == initialAssetIdentifier
-                        ? initialPreviewImage
-                        : nil,
-                    transparentCanvas: true,
-                    onReady: { [weak self] ready in
-                        guard let self,
-                              self.displayedIndex == index
-                        else { return }
-                        PagerDiagnostics.log(
-                            "media ready index=\(index) ready=\(ready)"
-                        )
-                        self.onMediaReady?(ready)
-                    },
-                    onZoomingChanged: { [weak self] zooming in
-                        guard let self,
-                              self.displayedIndex == index
-                        else { return }
-                        self.isZooming = zooming
-                        self.onZoomingChanged?(zooming)
-                        PagerDiagnostics.log(
-                            "zoom index=\(index) active=\(zooming)"
-                        )
-                    }
-                )
-                .id("native-viewer-\(asset.localIdentifier)")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            )
-        }
-
-        private func refreshPages(around index: Int) {
-            let nearbyIndexes = Set(
-                [index - 1, index, index + 1]
-                    .filter { $0 >= 0 && $0 < pageCount }
-            )
-
-            for nearbyIndex in nearbyIndexes {
-                let identity = makePageIdentity(for: nearbyIndex)
-                if let existing = pages[nearbyIndex] {
-                    // Reassigning `rootView` replaces the hosting controller's
-                    // whole SwiftUI tree and drops the decoded image state.
-                    // Only do it when the page's actual content changed.
-                    guard pageIdentities[nearbyIndex] != identity else { continue }
-                    pageIdentities[nearbyIndex] = identity
-                    existing.rootView = makePageView(for: nearbyIndex)
-                } else {
-                    pageIdentities[nearbyIndex] = identity
-                    _ = page(at: nearbyIndex)
-                }
-            }
-
-            // Remove evicted keys individually; rebuilding the whole dictionary
-            // with `filter` on every filmstrip scrub step was pure churn.
-            for key in pages.keys where !nearbyIndexes.contains(key) {
-                pages.removeValue(forKey: key)
-                pageIdentities.removeValue(forKey: key)
-            }
-        }
-
-        /// Everything that must change a page's rendered content *except* the
-        /// request priority. Priority flips on every swipe and is applied to
-        /// new requests through the view struct; it is not worth rebuilding
-        /// three full-screen pages for.
-        private func makePageIdentity(for index: Int) -> String {
-            let assetID = assetProvider(index)?.localIdentifier ?? "pending"
-            return [
-                assetID,
-                String(Int(targetSize.width.rounded())),
-                String(Int(targetSize.height.rounded())),
-                String(contentMode.rawValue)
-            ].joined(separator: "|")
-        }
-    }
-}
-
-@MainActor
-private final class PhotoPagerPageController: UIHostingController<AnyView> {
-    let index: Int
-
-    init(index: Int, rootView: AnyView) {
-        self.index = index
-        super.init(rootView: rootView)
-        // Clear: the zoom transition's dimming layer provides the black
-        // backdrop, and an opaque page background would make the zoom-out
-        // shrink a full-screen rectangle instead of the photo.
-        view.backgroundColor = .clear
-    }
-
-    @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-}
-
 private struct LivePhotoAssetViewer: View {
     let asset: PHAsset
     let targetSize: CGSize
@@ -1401,11 +579,9 @@ private struct AssetPager: View {
     // viewer can decide whether it clears the dismiss threshold. The default
     // system style hands pull-down to the zoom transition instead.
     let onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)?
-    // True while the user is scrubbing the filmstrip: transitions become
-    // instant swaps so the main photo tracks the strip in real time.
+    // True while the user is scrubbing the filmstrip: the pager follows index
+    // changes without animating so the main photo tracks the strip in real time.
     let isScrubbing: Bool
-    /// Live dismissal state, forwarded to the pager's arbitration recognizer.
-    let transitionState: PhotoViewerTransitionState?
 
     @State private var isZooming = false
     @State private var customDirection = 1
@@ -1425,8 +601,7 @@ private struct AssetPager: View {
         onZoomingChanged: ((Bool) -> Void)? = nil,
         onPagingChanged: ((Bool) -> Void)? = nil,
         onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)? = nil,
-        isScrubbing: Bool = false,
-        transitionState: PhotoViewerTransitionState? = nil
+        isScrubbing: Bool = false
     ) {
         self.assets = assets
         _currentIndex = currentIndex
@@ -1440,7 +615,6 @@ private struct AssetPager: View {
         self.onPagingChanged = onPagingChanged
         self.onDismissDragEnded = onDismissDragEnded
         self.isScrubbing = isScrubbing
-        self.transitionState = transitionState
     }
 
     private var swipeStyle: PhotoSwipeStyle {
@@ -1478,21 +652,62 @@ private struct AssetPager: View {
         }
     }
 
+    /// The default (system swipe) pager: a paging `UICollectionView`. It claims
+    /// a drag only when the motion is clearly horizontal, so UIKit's zoom
+    /// dismissal owns the vertical direction outright — no third recognizer and
+    /// no dismissal-phase arbitration between them.
     private var nativePager: some View {
-        NativePhotoPager(
+        ViewerPagingCollectionRepresentable(
             pageCount: assets.count,
-            currentIndex: $currentIndex,
+            currentIndex: currentIndex,
             isScrubbing: isScrubbing,
-            transitionState: transitionState,
             assetProvider: { index in
                 guard index >= 0, index < assets.count else { return nil }
                 return assets.object(at: index)
+            },
+            pageIdentity: { index in
+                let assetID = (index >= 0 && index < assets.count)
+                    ? assets.object(at: index).localIdentifier
+                    : "pending"
+                return [
+                    assetID,
+                    String(Int(targetSize.width.rounded())),
+                    String(Int(targetSize.height.rounded())),
+                    String(contentMode.rawValue)
+                ].joined(separator: "|")
+            },
+            pageRootView: { index, isCurrent, _, onReady, onZooming in
+                guard index >= 0, index < assets.count else {
+                    return AnyView(Color.black)
+                }
+                let asset = assets.object(at: index)
+                return AnyView(
+                    ViewerMediaView(
+                        asset: asset,
+                        targetSize: targetSize,
+                        contentMode: contentMode,
+                        requestPriority: isCurrent ? .viewer : neighborPriority,
+                        initialImage: asset.localIdentifier == initialAssetIdentifier
+                            ? initialPreviewImage
+                            : nil,
+                        transparentCanvas: true,
+                        onReady: onReady,
+                        onZoomingChanged: onZooming
+                    )
+                    .id("viewer-page-\(asset.localIdentifier)")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                )
             },
             targetSize: targetSize,
             contentMode: contentMode,
             neighborPriority: neighborPriority,
             initialPreviewImage: initialPreviewImage,
             initialAssetIdentifier: initialAssetIdentifier,
+            onIndexChanged: { newIndex in
+                guard currentIndex != newIndex else { return }
+                PagerDiagnostics.log("pager index \(currentIndex)->\(newIndex)")
+                currentIndex = newIndex
+            },
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
             onPagingChanged: onPagingChanged
@@ -1633,11 +848,14 @@ struct PhotoViewerView: View {
     /// only for the opening asset; every other page loads through PhotoKit.
     let initialPreviewImage: UIImage?
     let initialAssetIdentifier: String?
+    /// This session's own state, owned by the navigator that pushed the viewer.
     /// Kept in sync with the displayed photo so the system zoom transition can
     /// resolve the current grid cell at dismissal time.
-    let transitionState: PhotoViewerTransitionState?
+    let transitionState: PhotoViewerTransitionState
     @ObservedObject var store: PhotoLibraryStore
     let album: PhotoAlbum?
+    /// Asks the navigator to pop. The zoom-out itself is the navigation
+    /// transition; there is nothing for the viewer to animate.
     let onDismissRequested: (() -> Void)?
 
     @Environment(\.displayScale) private var displayScale
@@ -1673,7 +891,7 @@ struct PhotoViewerView: View {
         album: PhotoAlbum? = nil,
         initialPreviewImage: UIImage? = nil,
         initialAssetIdentifier: String? = nil,
-        transitionState: PhotoViewerTransitionState? = nil,
+        transitionState: PhotoViewerTransitionState,
         onDismissRequested: (() -> Void)? = nil
     ) {
         self.assets = assets
@@ -1713,8 +931,7 @@ struct PhotoViewerView: View {
                             },
                             onPagingChanged: handlePagingChanged,
                             onDismissDragEnded: handleDismissDragEnded,
-                            isScrubbing: isScrubbingFilmstrip,
-                            transitionState: transitionState
+                            isScrubbing: isScrubbingFilmstrip
                         )
                         .frame(width: proxy.size.width, height: proxy.size.height)
                         .contentShape(Rectangle())
@@ -1847,7 +1064,7 @@ struct PhotoViewerView: View {
         .onChange(of: currentIndex) { _, newIndex in
             guard assets.count > 0 else { return }
             isFavorite = assets.object(at: newIndex).isFavorite
-            transitionState?.update(
+            transitionState.update(
                 index: newIndex,
                 assetIdentifier: assets.object(at: newIndex).localIdentifier
             )
@@ -1856,18 +1073,23 @@ struct PhotoViewerView: View {
         .onAppear {
             isDismissing = false
             isPaging = false
-            transitionState?.update(
+            transitionState.update(
                 index: currentIndex,
                 assetIdentifier: currentAsset?.localIdentifier
             )
             // The zoom transition consults these for the whole time the
             // viewer is on screen: the veto keeps pull-down from stealing
-            // drags that belong to the zoomed photo or the pager, and the
+            // drags that belong to the zoomed photo or a page turn, and the
             // alignment rect makes the morph land on the photo itself.
-            transitionState?.interactiveDismissVeto = { [self] in
-                isZooming || isPaging
+            //
+            // `isPaging` is now only ever raised by a horizontal pan — the
+            // pager rejects vertical drags outright — so it can no longer
+            // swallow a pull-down. Filmstrip scrubbing is vetoed too: the main
+            // photo is following the strip, and a pull-down there is a misread.
+            transitionState.interactiveDismissVeto = { [self] in
+                isZooming || isPaging || isScrubbingFilmstrip
             }
-            transitionState?.zoomAlignmentRectProvider = { [self] containerSize in
+            transitionState.zoomAlignmentRectProvider = { [self] containerSize in
                 mediaAlignmentRect(in: containerSize)
             }
             PagerDiagnostics.log(
@@ -1879,8 +1101,8 @@ struct PhotoViewerView: View {
             PagerDiagnostics.log(
                 "viewer disappear kind=fetch index=\(currentIndex) dismissing=\(isDismissing)"
             )
-            transitionState?.interactiveDismissVeto = nil
-            transitionState?.zoomAlignmentRectProvider = nil
+            transitionState.interactiveDismissVeto = nil
+            transitionState.zoomAlignmentRectProvider = nil
             neighborPrefetch.stop()
         }
     }
@@ -1984,18 +1206,14 @@ struct PhotoViewerView: View {
     }
 
     /// Single dismissal entry point for the close button, the custom-style
-    /// pull-down and every other exit path. The visual zoom-out itself is
-    /// owned by the system transition; this only locks interaction and hands
-    /// over to the presentation bridge immediately.
+    /// pull-down and every other exit path. The zoom-out is the navigation
+    /// pop's own transition; this only tells the navigator to pop.
+    ///
+    /// The `isDismissing` guard is a duplicate-action guard for this viewer, not
+    /// an animation gate: it never delays a *new* viewer, and a system pull-down
+    /// (which cancels and re-runs freely) never sets it.
     private func requestDismiss(reason: String) {
-        guard !isDismissing, !isPaging else {
-            if isPaging {
-                PagerDiagnostics.log(
-                    "viewer dismiss ignored kind=fetch reason=\(reason) paging=true index=\(currentIndex)"
-                )
-            }
-            return
-        }
+        guard !isDismissing else { return }
         isDismissing = true
         PagerDiagnostics.log(
             "viewer dismiss requested kind=fetch reason=\(reason) index=\(currentIndex)"
@@ -2688,9 +1906,6 @@ private struct IndexedAssetPager: View {
     /// First-frame seed for the opening asset only.
     let initialPreviewImage: UIImage?
     let initialAssetIdentifier: String?
-    /// Index of the page the seed belongs to. The pager may jump elsewhere
-    /// while the opening metadata page loads, and the seed must not follow.
-    private let initialPreviewIndex: Int?
     let onMediaReady: ((Bool) -> Void)?
     let onZoomingChanged: ((Bool) -> Void)?
     let onPagingChanged: ((Bool) -> Void)?
@@ -2703,8 +1918,6 @@ private struct IndexedAssetPager: View {
     // Mirrors the store's indexing flag; when a sync finishes this pager
     // re-requests its window in case an in-flight page load was dropped.
     let isIndexingUnsorted: Bool
-    /// Live dismissal state, forwarded to the pager's arbitration recognizer.
-    let transitionState: PhotoViewerTransitionState?
 
     @State private var loadingOffsets = Set<Int>()
     @State private var loadedOffsets = Set<Int>()
@@ -2714,6 +1927,10 @@ private struct IndexedAssetPager: View {
     @State private var isZooming = false
     @State private var customDirection = 1
     @State private var customDragAxis: ViewerDragAxis = .undecided
+    /// Index the tapped thumbnail belongs to, captured once when the pager
+    /// first appears. Resolving it from the live `currentIndex` would let the
+    /// seed follow the user to whatever page they swiped to.
+    @State private var seedIndex: Int?
     @AppStorage(PhotoSwipeStyle.storageKey)
     private var swipeStyleRawValue = PhotoSwipeStyle.system.rawValue
 
@@ -2734,8 +1951,7 @@ private struct IndexedAssetPager: View {
         onPagingChanged: ((Bool) -> Void)? = nil,
         onDismissDragEnded: ((ViewerDismissDrag, Bool) -> Void)? = nil,
         isScrubbing: Bool = false,
-        isIndexingUnsorted: Bool = false,
-        transitionState: PhotoViewerTransitionState? = nil
+        isIndexingUnsorted: Bool = false
     ) {
         self.totalCount = max(0, totalCount)
         self.store = store
@@ -2746,16 +1962,12 @@ private struct IndexedAssetPager: View {
         self.neighborPriority = neighborPriority
         self.initialPreviewImage = initialPreviewImage
         self.initialAssetIdentifier = initialAssetIdentifier
-        self.initialPreviewIndex = initialPreviewImage == nil
-            ? nil
-            : currentIndex.wrappedValue
         self.onMediaReady = onMediaReady
         self.onZoomingChanged = onZoomingChanged
         self.onPagingChanged = onPagingChanged
         self.onDismissDragEnded = onDismissDragEnded
         self.isScrubbing = isScrubbing
         self.isIndexingUnsorted = isIndexingUnsorted
-        self.transitionState = transitionState
     }
 
     private var swipeStyle: PhotoSwipeStyle {
@@ -2781,6 +1993,9 @@ private struct IndexedAssetPager: View {
         }
         .onAppear {
             isVisible = true
+            if seedIndex == nil, initialPreviewImage != nil {
+                seedIndex = currentIndex
+            }
             loadGeneration &+= 1
             PagerDiagnostics.beginSession()
             PagerDiagnostics.log(
@@ -2852,24 +2067,90 @@ private struct IndexedAssetPager: View {
         }
     }
 
+    /// Same collection-view pager as the library viewer. Only the asset
+    /// resolution differs (SQLite pages instead of a `PHFetchResult`); the
+    /// paging, direction arbitration and index reporting are shared.
     private var nativePager: some View {
-        NativePhotoPager(
+        ViewerPagingCollectionRepresentable(
             pageCount: totalCount,
-            currentIndex: $currentIndex,
+            currentIndex: currentIndex,
             isScrubbing: isScrubbing,
-            transitionState: transitionState,
             assetProvider: { index in
                 assetsByIndex[index]
+            },
+            pageIdentity: { index in
+                let assetID = assetsByIndex[index]?.localIdentifier ?? pagePlaceholderIdentity(index)
+                return [
+                    assetID,
+                    String(Int(targetSize.width.rounded())),
+                    String(Int(targetSize.height.rounded())),
+                    String(contentMode.rawValue)
+                ].joined(separator: "|")
+            },
+            pageRootView: { index, isCurrent, isSeedPage, onReady, onZooming in
+                if let asset = assetsByIndex[index] {
+                    return AnyView(
+                        ViewerMediaView(
+                            asset: asset,
+                            targetSize: targetSize,
+                            contentMode: contentMode,
+                            requestPriority: isCurrent ? .viewer : neighborPriority,
+                            initialImage: asset.localIdentifier == initialAssetIdentifier
+                                ? initialPreviewImage
+                                : nil,
+                            transparentCanvas: true,
+                            onReady: onReady,
+                            onZoomingChanged: onZooming
+                        )
+                        .id("indexed-viewer-page-\(asset.localIdentifier)")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    )
+                }
+                if isSeedPage, let initialPreviewImage {
+                    // The unsorted pager loads metadata page by page, so the
+                    // opening asset may not have arrived yet. Show the tapped
+                    // thumbnail instead of a spinner while the page resolves.
+                    return AnyView(
+                        Color.clear
+                            .overlay {
+                                Image(uiImage: initialPreviewImage)
+                                    .resizable()
+                                    .scaledToFit()
+                            }
+                            .clipped()
+                    )
+                }
+                return AnyView(
+                    ZStack {
+                        Color.black
+                        ProgressView("正在读取照片…")
+                            .tint(.white)
+                            .foregroundStyle(.white)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                )
             },
             targetSize: targetSize,
             contentMode: contentMode,
             neighborPriority: neighborPriority,
             initialPreviewImage: initialPreviewImage,
             initialAssetIdentifier: initialAssetIdentifier,
+            onIndexChanged: { newIndex in
+                guard currentIndex != newIndex else { return }
+                PagerDiagnostics.log("indexed pager index \(currentIndex)->\(newIndex)")
+                currentIndex = newIndex
+            },
             onMediaReady: onMediaReady,
             onZoomingChanged: onZoomingChanged,
             onPagingChanged: onPagingChanged
         )
+    }
+
+    /// Identity for an unresolved page. The index alone would be a lie once a
+    /// preceding photo is deleted, so it is tagged with the total count — the
+    /// same signal the pager already uses to reload its pages.
+    private func pagePlaceholderIdentity(_ index: Int) -> String {
+        "pending-\(index)-of-\(totalCount)"
     }
 
     @ViewBuilder
@@ -2902,7 +2183,7 @@ private struct IndexedAssetPager: View {
             .contentShape(Rectangle())
             .simultaneousGesture(customSwipeGesture)
             .animation(isScrubbing ? nil : .easeInOut(duration: 0.32), value: currentIndex)
-        } else if currentIndex == initialIndexForPreview,
+        } else if currentIndex == seedIndex,
                   let initialPreviewImage {
             // The unsorted pager loads metadata page by page, so the opening
             // asset may not have arrived yet. Show the tapped thumbnail
@@ -2923,13 +2204,6 @@ private struct IndexedAssetPager: View {
                 .contentShape(Rectangle())
                 .simultaneousGesture(customSwipeGesture)
         }
-    }
-
-    /// Index the seeded preview belongs to. The pager may jump to other
-    /// indexes while the opening page loads, and the seed must not follow it.
-    private var initialIndexForPreview: Int? {
-        guard initialPreviewImage != nil else { return nil }
-        return initialPreviewIndex
     }
 
     private var customSwipeGesture: some Gesture {
@@ -3412,9 +2686,10 @@ struct IndexedPhotoViewerView: View {
     /// First-frame seed handed over by the unsorted grid cell that was tapped.
     let initialPreviewImage: UIImage?
     let initialAssetIdentifier: String?
+    /// This session's own state, owned by the navigator that pushed the viewer.
     /// Kept in sync with the displayed photo so the system zoom transition can
     /// resolve the current grid cell at dismissal time.
-    let transitionState: PhotoViewerTransitionState?
+    let transitionState: PhotoViewerTransitionState
     @ObservedObject var store: PhotoLibraryStore
     let onDismissRequested: (() -> Void)?
 
@@ -3450,7 +2725,7 @@ struct IndexedPhotoViewerView: View {
         store: PhotoLibraryStore,
         initialPreviewImage: UIImage? = nil,
         initialAssetIdentifier: String? = nil,
-        transitionState: PhotoViewerTransitionState? = nil,
+        transitionState: PhotoViewerTransitionState,
         onDismissRequested: (() -> Void)? = nil
     ) {
         self.title = title
@@ -3495,8 +2770,7 @@ struct IndexedPhotoViewerView: View {
                             onPagingChanged: handlePagingChanged,
                             onDismissDragEnded: handleDismissDragEnded,
                             isScrubbing: isScrubbingFilmstrip,
-                            isIndexingUnsorted: store.isIndexingUnsorted,
-                            transitionState: transitionState
+                            isIndexingUnsorted: store.isIndexingUnsorted
                         )
                         .frame(width: proxy.size.width, height: proxy.size.height)
                         .contentShape(Rectangle())
@@ -3630,7 +2904,7 @@ struct IndexedPhotoViewerView: View {
         }
         .onChange(of: currentAssetID) { _, _ in
             isFavorite = currentAsset?.isFavorite ?? false
-            transitionState?.update(
+            transitionState.update(
                 index: currentIndex,
                 assetIdentifier: currentAsset?.localIdentifier
             )
@@ -3639,14 +2913,17 @@ struct IndexedPhotoViewerView: View {
         .onAppear {
             isDismissing = false
             isPaging = false
-            transitionState?.update(
+            transitionState.update(
                 index: currentIndex,
                 assetIdentifier: currentAsset?.localIdentifier
             )
-            transitionState?.interactiveDismissVeto = { [self] in
-                isZooming || isPaging
+            // Same veto contract as the library viewer — and here it matters
+            // most: the pager only ever reports horizontal paging, so a
+            // downward drag can no longer be swallowed by `isPaging`.
+            transitionState.interactiveDismissVeto = { [self] in
+                isZooming || isPaging || isScrubbingFilmstrip
             }
-            transitionState?.zoomAlignmentRectProvider = { [self] containerSize in
+            transitionState.zoomAlignmentRectProvider = { [self] containerSize in
                 mediaAlignmentRect(in: containerSize)
             }
             PagerDiagnostics.log(
@@ -3658,8 +2935,8 @@ struct IndexedPhotoViewerView: View {
             PagerDiagnostics.log(
                 "viewer disappear kind=indexed index=\(currentIndex) dismissing=\(isDismissing)"
             )
-            transitionState?.interactiveDismissVeto = nil
-            transitionState?.zoomAlignmentRectProvider = nil
+            transitionState.interactiveDismissVeto = nil
+            transitionState.zoomAlignmentRectProvider = nil
             neighborPrefetch.stop()
         }
     }
@@ -3761,17 +3038,11 @@ struct IndexedPhotoViewerView: View {
         }
     }
 
-    /// Single dismissal entry point; the system zoom transition owns the
-    /// visual zoom-out.
+    /// Single dismissal entry point; the navigation pop owns the zoom-out.
+    /// `isDismissing` prevents this viewer from issuing the pop twice; it never
+    /// gates a *new* viewer, and the system's own pull-down ignores it entirely.
     private func requestDismiss(reason: String) {
-        guard !isDismissing, !isPaging else {
-            if isPaging {
-                PagerDiagnostics.log(
-                    "viewer dismiss ignored kind=indexed reason=\(reason) paging=true index=\(currentIndex)"
-                )
-            }
-            return
-        }
+        guard !isDismissing else { return }
         isDismissing = true
         PagerDiagnostics.log(
             "viewer dismiss requested kind=indexed reason=\(reason) index=\(currentIndex)"

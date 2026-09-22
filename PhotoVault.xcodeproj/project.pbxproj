@@ -25,7 +25,10 @@
 		A10000000000000000000017 /* LANAlbumViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000017 /* LANAlbumViews.swift */; };
 		A10000000000000000000018 /* AppMotion.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000018 /* AppMotion.swift */; };
 		A10000000000000000000019 /* AppLoadingPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000019 /* AppLoadingPolicy.swift */; };
-		A10000000000000000000020 /* PhotoViewerPresentationBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000020 /* PhotoViewerPresentationBridge.swift */; };
+		A10000000000000000000020 /* PhotoViewerTransition.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000020 /* PhotoViewerTransition.swift */; };
+		A10000000000000000000067 /* PhotoViewerNavigator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000067 /* PhotoViewerNavigator.swift */; };
+		A10000000000000000000068 /* PhotoViewerHostingController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000068 /* PhotoViewerHostingController.swift */; };
+		A10000000000000000000069 /* ViewerPagingCollectionController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000069 /* ViewerPagingCollectionController.swift */; };
 		A10000000000000000000065 /* SlideshowOptions.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000065 /* SlideshowOptions.swift */; };
 		A10000000000000000000066 /* SlideshowFilterProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000066 /* SlideshowFilterProbe.swift */; };
 		A10000000000000000000021 /* ViewerPerformanceTrace.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000021 /* ViewerPerformanceTrace.swift */; };
@@ -85,7 +88,10 @@
 		B10000000000000000000017 /* LANAlbumViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LANAlbumViews.swift; sourceTree = "<group>"; };
 		B10000000000000000000018 /* AppMotion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppMotion.swift; sourceTree = "<group>"; };
 		B10000000000000000000019 /* AppLoadingPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLoadingPolicy.swift; sourceTree = "<group>"; };
-		B10000000000000000000020 /* PhotoViewerPresentationBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoViewerPresentationBridge.swift; sourceTree = "<group>"; };
+		B10000000000000000000020 /* PhotoViewerTransition.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoViewerTransition.swift; sourceTree = "<group>"; };
+		B10000000000000000000067 /* PhotoViewerNavigator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoViewerNavigator.swift; sourceTree = "<group>"; };
+		B10000000000000000000068 /* PhotoViewerHostingController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoViewerHostingController.swift; sourceTree = "<group>"; };
+		B10000000000000000000069 /* ViewerPagingCollectionController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerPagingCollectionController.swift; sourceTree = "<group>"; };
 		B10000000000000000000065 /* SlideshowOptions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlideshowOptions.swift; sourceTree = "<group>"; };
 		B10000000000000000000066 /* SlideshowFilterProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlideshowFilterProbe.swift; sourceTree = "<group>"; };
 		B10000000000000000000021 /* ViewerPerformanceTrace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerPerformanceTrace.swift; sourceTree = "<group>"; };
@@ -166,7 +172,10 @@
 				B10000000000000000000017 /* LANAlbumViews.swift */,
 				B10000000000000000000018 /* AppMotion.swift */,
 				B10000000000000000000019 /* AppLoadingPolicy.swift */,
-				B10000000000000000000020 /* PhotoViewerPresentationBridge.swift */,
+				B10000000000000000000020 /* PhotoViewerTransition.swift */,
+				B10000000000000000000067 /* PhotoViewerNavigator.swift */,
+				B10000000000000000000068 /* PhotoViewerHostingController.swift */,
+				B10000000000000000000069 /* ViewerPagingCollectionController.swift */,
 				B10000000000000000000065 /* SlideshowOptions.swift */,
 				B10000000000000000000066 /* SlideshowFilterProbe.swift */,
 				B10000000000000000000021 /* ViewerPerformanceTrace.swift */,
@@ -362,7 +371,10 @@
 				A10000000000000000000017 /* LANAlbumViews.swift in Sources */,
 				A10000000000000000000018 /* AppMotion.swift in Sources */,
 				A10000000000000000000019 /* AppLoadingPolicy.swift in Sources */,
-				A10000000000000000000020 /* PhotoViewerPresentationBridge.swift in Sources */,
+				A10000000000000000000020 /* PhotoViewerTransition.swift in Sources */,
+				A10000000000000000000067 /* PhotoViewerNavigator.swift in Sources */,
+				A10000000000000000000068 /* PhotoViewerHostingController.swift in Sources */,
+				A10000000000000000000069 /* ViewerPagingCollectionController.swift in Sources */,
 				A10000000000000000000065 /* SlideshowOptions.swift in Sources */,
 				A10000000000000000000066 /* SlideshowFilterProbe.swift in Sources */,
 				A10000000000000000000021 /* ViewerPerformanceTrace.swift in Sources */,

@@ -83,42 +83,121 @@
 - “快速收藏夹”指用户在相册选择器里用星标自行标记的一组常用相册（不是某个固定相册）。标记集合按 `PhotoQuickAlbums.storageKey` 持久化为相册 ID 数组（`PhotoLibraryStore.quickAlbumIDs`，@Published），长按子菜单按标记顺序列出这些相册，点一下直接加入，已在的项打勾；没有标记相册时整个子菜单隐藏。旧版单相册 ID（`legacyStorageKey`）首次读取时迁移。
 - 相册选择器（添加到相册）必须与侧栏同构：行样式与设置页同高（28pt 图标槽、标题居左、数量靠右的紧凑单行），顶层相册平铺在前，文件夹行可展开，展开后先子文件夹再相册，每层缩进一级；行尾是快速收藏星标（点星标只切换标记，不选中相册、不关闭面板）。箭头向右表示收起、向下表示展开，与侧栏同一逻辑。图库页、未整理页、普通详情页、未整理详情页共用 `AlbumPickerSheet`，改动时四处行为要保持一致。
 
-## 详情页分页：必须保持连续可滑动
+## 详情页分页与转场：导航式 Fluid Zoom
 
-- 不要用动态变化的绝对索引 `TabView` 页面窗口来实现详情分页。页面集合变化后，SwiftUI 的 `TabView`/内部 `UIPageViewController` 可能与 selection 失步，典型症状是第一次能滑、第二次卡住。
-- 当前系统滑动样式使用 `NativePhotoPager` + UIKit `UIPageViewController`。分页控制器保留当前页及前后邻页，使用 delegate 的 `didFinishAnimating` 唯一地更新 `currentIndex`，不要在动画中立即把 selection 归中。
-- 外部胶片点击跳转也必须经过同一个 UIKit 分页控制器；要有重复 programmatic transition 保护，不能在图片下载导致的多次 SwiftUI 更新中重启动画。
-- 胶片条是实时 scrub 语义（对齐 iOS 26 相册）：拖动/减速过程中 `scrollViewDidScroll` 持续把中心标记下的缩略图索引写回 `currentIndex`，主图即时跟着切，不能等滚动停止才切换。scrub 期间胶片条不做 `scrollToItem` 回中、不逐帧写 `position`，松手后停在原位。scrub 状态经 `onScrubbingChanged` 传给 `NativePhotoPager`（`isScrubbing`），scrub 分支必须用 `setViewControllers(animated: false)` 即时换页——动画式 programmatic transition 的 pending 保护会丢掉连发的索引更新。自定义切换样式在 scrub 期间禁用过渡动画。
-- `viewControllerBefore`/`viewControllerAfter` 在边界返回 `nil`；不能创建负索引或超范围页面。
-- 未整理详情页仍按元数据页懒加载，缺少资产时显示占位页；资产到达后只更新对应页面，不重置分页控制器。
-- 系统样式不要再叠加自定义水平 `DragGesture`。自定义淡入、推入、缩放样式可以使用单独的自定义 pager，但要保证一次手势只推进一次索引。
-- 图片自身的单指拖拽不能在 1 倍缩放时注册为有效手势，否则会抢走详情分页。当前规则是 1 倍时把单指滑动交给分页，只有缩放大于约 1.01 倍后才允许图片平移。
-- 双指缩放、放大后的平移和单指分页必须互斥；切页或页面消失时必须清除 `isZooming`，不能让旧页的缩放状态阻塞新页。
-- `AssetImageView` 不要给每张图片单独加 opacity 淡入。详情页的切换动画由 pager 统一负责，否则会出现一张滑动、一张淡入的割裂效果，尤其是 iCloud 图片返回时更明显。
-- 详情页底部操作栏对齐原生相册的悬浮工具栏样式：图标按钮一律用 iOS 26 液态玻璃（`.glassEffect(.regular.interactive(), in: Circle())`，顶栏、底栏、菜单、幻灯片控制同一套），不包胶囊/毛玻璃容器背景；46pt 命中区、均匀分布整个宽度、不留提示文字。玻璃按钮不得引入影响分页命中区域的额外手势层。
-- 分享面板必须用 `ActivityPresenter.present(items:onDismiss:)` 从最顶层 UIKit VC 呈现，不能把 `UIActivityViewController` 托管进 SwiftUI `.sheet`——后者首帧尺寸错误导致面板内容跳位。`requestShareItems` 准备临时文件期间（iCloud 照片可能很慢）必须给出原位反馈（详情页分享按钮原 46pt 框内切换为 ProgressView，网格侧禁用按钮），并用 `isPreparingShare` 防止重复触发；临时文件在 `onDismiss` 清理。
-- 图片可以延伸到全屏，但关闭、信息、全屏等控制必须在安全区域内，不能被状态栏、灵动岛、Home Indicator 或底部黑边遮挡。
-- 查看器的呈现/退出是"哪来的回哪"的空间转场（P0 原则）：退出目标永远是**当前正在看的照片**对应的网格 cell，不是进入时的那张。实现走 `PhotoViewerPresentationBridge`（`.background` 里的 `UIViewControllerRepresentable`，用真实 UIKit `present` 呈现 `UIHostingController`）+ iOS 26 系统缩放转场（`preferredTransition = .zoom(options:sourceViewProvider:)`）。**`fullScreenCover` 做不了这个**——SwiftUI 自己持有 hosting controller，`preferredTransition` 设上时呈现已完成；不要改回 fullScreenCover。
-- 退出目标由 `PhotoViewerTransitionState`（currentIndex + currentAssetIdentifier）决定：查看器**每次翻页**都要 `update(index:assetIdentifier:)`，退出时只读当前值、绝不读 initialIndex。网格侧 `PhotoGridTransitionCoordinator.sourceView(index:assetIdentifier:)` 持弱引用 collectionView 查找目标 cell：index 先用 assetIdentifier 校验，不一致时在 ±24 邻域内按 identifier 重扫（删除会平移索引），找不到（照片已删）返回 nil 让 UIKit 走默认转场；目标 cell 不可见时先 `scrollToItem(.centeredVertically, animated: false)` + `layoutIfNeeded()`（此时查看器盖着网格，用户看不到跳动）。禁止建全库 identifier→index/cell 缓存。
-- 退出只有单一入口 `requestDismiss(reason:)`（`isDismissing` 防重入）：关闭按钮、下拉提交、移出相册等都调它；视觉一律交给系统缩放转场，**禁止再写"成功后向下飞出"的自定义轨迹**（旧 `ViewerMotion.completionOffset` 已删）。系统转场的交互式下拉（`ZoomInteractiveDismissSwipeDown`）自带跟手进度和取消连续性，不要叠自定义 mediaScale/offset/cornerRadius 双重变换。
-- 🔴 **系统发起的退出必须兜底复位状态（实测 P0）**：下拉提交后 UIKit 自己结束呈现，`dismissIfNeeded` 的 completion 和 delegate 都可能不走——若不复位，屏幕上 `viewerRequest` 残留非 nil、`isViewerTransitioning` 卡在 true、网格 `collectionView.isUserInteractionEnabled = false`，表现为"查看器明明退出了，之后点什么都没反应"。兜底是 `PhotoViewerHostingController.viewDidDisappear`（bridge 内子类）→ `hostedViewDidVanish(controller:)`：与 programmatic 路径、`presentationControllerDidDismiss` 三路信号全部收敛进 `finishDismissal(sessionID:)`，谁先到谁复位，其余幂等。⚠️ 兜底必须带**会话校验**：`guard hosted === controller`（`presentationControllerDidDismiss` 同理校验 `presentedViewController`），否则一个已经结清的旧查看器迟到的 `viewDidDisappear` 会把**刚打开的新会话**误判为已结束。
-- 🔴 **退出状态是四态，"UIKit 决定取消" ≠ "取消结束"**：`Coordinator.DismissalPhase` = `.idle` / `.interactive` / `.cancelling` / `.committed`。`.interactive` 是"系统下拉正在拖"（可能取消），`.cancelling` 是"已决定回弹但回弹动画还在跑"，`.committed` 是"这次退出一定走完"。**只有 commit 才释放网格**：`dismissTransitionCommitted()` 里 `setGridInteractionEnabled(true)` + `outgoingViewerInteractionRoot().isUserInteractionEnabled = false`。关闭按钮与其它 programmatic 退出在 `dismissIfNeeded` 里直接视为 committed（不可取消）；系统下拉靠 `notifyWhenInteractionChanges` 的 `context.isCancelled` 分派 **cancelling / committed**，`.cancelling → .idle` 只能由 `coordinator.animate(alongsideTransition: nil) { }` 的转场 completion 落下。⚠️ 把"决定"和"结束"写成同一时刻（旧实现：`notifyWhenInteractionChanges`/`viewWillAppear` 里直接置 idle）会让 programmatic 关闭插进 UIKit 还没跑完的回弹转场里，所以 `.cancelling` 必须存在、`dismissIfNeeded()` 只认 `.idle`、回弹期间到达的关闭记进 `pendingDismissRequest` 等 settle 重放。**但这个结论不要推广到下拉方向仲裁上**——那是另一码事，见下一条；把它当成"回弹期间门必须关"的依据，正是"取消一次下拉后马上再下拉没反应"没被修掉的原因。`viewWillAppear` 不再做任何结算，兜底挪到 `viewDidAppear`；`dismissTransitionCancelled()` 接受 `.cancelling`（正常）与 `.interactive`（completion 丢失时兜底）。禁止 asyncAfter 补一次。
-- 🔴 **下拉仲裁区分 reserve / track / blocked**（2026-09-22 更新）：`downwardArbitrationState` 在 idle 返回 reserve，cancelling 返回 track，dragging/committed 返回 blocked。回弹期间继续记录同一笔触摸，保持 possible，不提前 began、也不因相位 failed；每次 move 重查，settle 后才能 reserve。App 不能替 UIKit 提前启动第二个转场。
-- 🔴 **同一 presenter 串行呈现 Viewer**：`PresentationPhase` 为 empty/presenting/presented/dismissing；旧会话保持到系统 completion，禁止 retiringSessions 和 `isBeingDismissed` 放行新 present。commit 立即恢复网格，动画内点击只更新最新 pending；只有 empty 且 `presentedViewController == nil` 才消费请求。`finishDismissal` 先按 session 校验、恢复输入、清理旧状态、通知旧会话结束，最后 flush。系统转场 completion、dismiss completion、delegate 和无 completion 时的 viewDidDisappear fallback 均汇入它。UIKit bookkeeping 未释放时仅允许单次 MainActor yield，禁止循环或定时重试。
-- 🔴 **门必须在每次 `touchesMoved` 重查，禁止在 `touchesBegan` 定终身**：`UIGestureRecognizer.state = .failed` 对同一笔触摸不可逆，而回弹往往在手指还在往下走的几百毫秒里就结束了——落指瞬间读到的相位不代表拖动途中的相位。`touchesBegan` 只判"是不是单指、是不是已经记过起点"（`shouldTrackAtTouchDown` 刻意不接受任何相位参数），方向与门都由 `resolution(at:)` 这唯一出口给出 hold / gated / reserve / release。呈现阶段永远是 `.idle`，所以"打开动画可被打断"不被误伤；`AssetPager`/`IndexedAssetPager`/`NativePhotoPager` 必须把这份状态透传到 pager（两套查看器共用同一座桥，一处漏传就是一处没修）。`canBePrevented(by:)` 回 `preventing !== pagingPan`：一律回 `false` 会把仲裁 recognizer 抬到系统退出手势之上，同样吞触摸。
-- 🔴 **只允许关掉 Viewer 自己那一支，禁止走到公共祖先**：`outgoingViewerInteractionRoot()` 从 `hosted.view` 往上爬，遇到第一个 `containsRegisteredGrid(in:)` 为真的祖先**立刻停**——那说明再往上就是 Viewer + Grid 的公共祖先（window / 转场根），禁用它等于把网格一起禁掉。实测层级很短：`_UIHostingView<PhotoViewerView>` → `UITransitionView` → window，`containsGrid=false`，网格是 `UITransitionView` 的**兄弟**而不是子孙，所以关掉 `UITransitionView` 是正确的：命中测试会跳过它落到网格。禁用必须在 `finishDismissal` 里**无条件恢复**（`restoreViewerInteraction()`），否则会留下永久 `isUserInteractionEnabled = false` 的视图。
-- 🔴 **禁止 Timer / 重试轮询**：曾经的 `interactionReassertTimer`（0.08s × 10 次反复把容器压回 disabled）已删除——和 UIKit 转场抢控制权，而且动画长一点就会在计时器停掉后把触摸重新吞回去。曾经的 `schedulePresentRetry()`（主队列反复 `flushPendingRequest`）也已删除。现在的排队打开请求是**事件驱动**的：`sync` 在 `dismissalPhase != .idle` 且请求 id 不同时只 `pendingRequest = request`，由 dismiss completion → `finishDismissal` → `flushPendingRequest()` 拉起来；`presentedRequestID` 直到 `finishDismissal` 才清空，所以"旧会话还在退"这件事天然可判。
-- 🔴 **`viewWillDisappear` ≠ 提交**：交互式下拉在**拖动开始**就触发它（取消时再触发 `viewWillAppear` 回来），所以它只能标记 `.interactive`，绝不能当 commit。唤醒网格触发的 SwiftUI 更新会让 dismissing 会话自己的请求再次流经 `sync`——超替分支必须按 `request.id != presentedRequestID` 过滤，否则同一个查看器会在退出后又弹回来。`dismissIfNeeded` 开头 `guard dismissalPhase == .idle`，否则 SwiftUI 每次重渲染带来的 `sync(nil)` 都会再发一次 `dismiss`。
-- 🔴 **XCUITest 无法在动画中途注入手势**：`tap()`/`swipeUp()` 前会等 App 回到 idle，实测上滑要等退出动画结束 **407ms 之后**才落到网格。所以"动画期间能不能操作"不能靠 UI 测试断言，必须用 App 内探针：`dismiss_probe`（commit 时刻）与 `dismiss_probe_mid_transition`（`coordinator.animate(alongsideTransition:)` 里，转场动画进行中）用真实 `window.hitTest(grid 中心)` 回答"这一下会不会打到网格"，输出形如 `grid=reached:true hit=UICollectionView enabled=true`。日志在 `Library/Caches/PhotoVaultDiagnostics.log`。UI 测试负责的是另一件事：退出后整个视口都可命中（`cell.isHittable`，跨 0/5/15 取样，能抓到只盖住一部分的残留遮罩），以及退出后单击必达且打开的是被点的那张（`viewer-counter` 断言 "3 / N"，而不是"又有查看器出现"）。注意 `swipeUp()` 也**不能**用来证明滚动：实测同一次上滑只让 offset 走了 77pt，cell 不会离屏，"photo-cell-0 消失了"这种断言会假失败。
-- 🔴 **UI 用例里"只要回弹"的下拉必须压在 5% 屏幕高度以内**：提交阈值按照片**实际显示高度**算，不按屏幕——同一笔 13% 屏幕高度的下拉在竖屏截图上是回弹，在横屏照片（letterbox 后更矮）上就是退出，用例会变成随照片顺序失败的假回归。`waitForExistence` 在元素已存在时立即返回 true，不能用来证明"回弹后查看器仍在场"，要用 `waitForNonExistence` 或轮询 `viewer-counter`；同理"UI 用例两次下拉之间不 sleep 就算命中了回弹窗口"也是假的（XCTest 自己等 idle），所以连续下拉的竞态**只能**靠 App 内探针。证据是 `-viewer-cancel-reentry-probe`：每次相位切换打 `viewer_cancel_reentry_probe stage=dragging|cancelling|settled gate=… want=… failures=N`（落在 `Library/Caches/PhotoVaultLaunch.log`），并在进入 `.cancelling` 时跑 `ViewerDownwardIntentGesture.debugVerifyCancellationReentry()`（成功记 `viewer_cancel_reentry_tracking passed=true`），断言"回弹期间 arbitration=track 且保持 possible，结算后才 reserve；dragging/committed 为 blocked，同一笔触摸继续移动时重查"。⚠️ 探针只许断言**纯逻辑**（`shouldTrackAtTouchDown`/`decision`/`resolution`/`canPrevent`）：脱离触摸序列给未挂载的 recognizer 置 `.began` 会直接崩，别改成模拟真实触摸。UI 侧再加一道 `viewer-cancel-count`（DEBUG 隐藏 UILabel，由 `reportCancellationSettled()` 累加）证明每一笔短下拉都**真的**开始并取消，而不是界面没反应也被判通过。
-- 缩放转场选项：`interactiveDismissShouldBegin` **只能否决、不能放行**，返回值必须是 `context.willBegin && !vetoed`（veto 在 `isZooming || isPaging` 时抬起，把单指拖动还给图片平移和 pager）。写成无条件 `!vetoed` 等于替 UIKit 放行它自己判定不会开始的交互：实测 `swipeRight`（触摸落在前导边缘）时 context 报 `willBegin=false velY=0`，仍被这段代码开成交互式退出，"翻上一张"变成"退出查看器"——系统的退出 recognizer 有三个（`ZoomInteractiveDismissLeadingEdgePan` / `SwipeDown` / `Pinch`），只有 SwipeDown 是用户要的；`alignmentRectProvider` 返回照片 aspect-fit 实际矩形（letterbox 除外），让缩放 morph 对准照片本体而不是全屏容器。
-- 🔴 查看器静止背景必须不透明：`dimmingColor` 只覆盖转场进行中/交互中，呈现完成后的静止态没有暗化层——hosting 背景若为 clear，letterbox 会透出底层网格（连"图库"标题栏都看得见）。`hosting.view.backgroundColor = .black` 且不要再改回 clear。
-- 🔴 不要试图替换分页器内部 scrollView 的 pan delegate：`UIScrollView` 强制内置 pan 的 delegate 是它自己，`setDelegate:` 直接 SIGABRT（`'UIScrollView's built-in pan gesture recognizer must have its scroll view as its delegate'`）。真机触摸下系统下拉与 pager 手势仲裁本来就通，无需（也不要）用 `require(toFail:)` 给 pager pan 加等待。
-- 🔴 **查看器里读不到 `@Environment(\.scenePhase)`（恒为 `.background`）**：详情页由 `PhotoViewerPresentationBridge` 手工创建 `UIHostingController` 并自己 `present`，没有 `Scene` 挂在上面的 SwiftUI 层级只会拿到该环境键的**默认值**。实测后果两处：① 从详情页开播的幻灯片永远停在第 1 张——自动推进任务的 `guard phase == .active` 直接 return（从图库页开播的同一条幻灯片正常，因为它在 App 自己的层级里）；② `VideoAssetViewer` 的 `onAppear` 不敢 `play()`，详情页的视频不播。凡是从查看器可达的代码一律用 `AppSceneState.shared.phase`（`PhotoVaultApp.swift`，由 `UIApplication` 的 active/inactive/background 通知驱动，任何层级都正确），不要再写 `@Environment(\.scenePhase)`；只有活在 App 自己层级里的页面（`ContentView`、LAN 相册、设置、智能搜索）才可以用环境值。`SlideshowView` / `IndexedSlideshowView` / `VideoAssetViewer` 已改。
-- 查看器退出路径的回归用 UI 测试跑：`xcodebuild test -project PhotoVault.xcodeproj -scheme PhotoVault -destination 'platform=iOS Simulator,id=<id>' -only-testing:PhotoVaultUITests`。覆盖：关闭退出、下拉退出、短拉取消连续、翻页后关闭、未整理查看器下拉退出——每个场景都断言"退出后网格仍可交互"（再现 P0 死屏的最直接探针）。**模拟器的输入自动化必须用 XCUITest**：macOS 侧 CGEvent 合成事件会被桌面窗墙吃掉，到不了模拟器窗口。
-- 详情展示期间要让底层相册网格进入 inactive 状态，暂停其交互和图片请求；确认退出后可立即恢复底层滚动交互，视觉转场仍由详情页完成，`onDismiss` 只做最终清理，避免用户退出后还要等待才能滑动。
-- 详情返回时不要因为 `isActive` 恢复就无条件对相册网格调用 `reloadData()`；这会清掉已经显示的缩略图并重新显示 loading，和全屏退出动画叠加成闪屏。未变化的数据应保留可见 cell，只恢复取消的请求；数据源变化时才整体刷新。
-- `NativePhotoPager` 销毁时先解除 `UIPageViewController` 的 delegate/dataSource；未整理详情的分页元数据请求必须用代次校验，页面消失后丢弃旧回调。
+> 架构细节见 [docs/VIEWER_NAVIGATION_ZOOM.md](docs/VIEWER_NAVIGATION_ZOOM.md)。旧文档
+> `VIEWER_SERIAL_PRESENTATION.md` / `VIEWER_DISMISS_REENTRY.md` 描述的是已删除的
+> `PhotoViewerPresentationBridge` 架构，只作历史记录。
+
+- 详情页是**真正的 UIKit 导航 push/pop**：每个能开详情页的 ContentView 分支各有一个独立
+  `NavigationStack`，`PhotoViewerNavigator` 通过 `PhotoViewerNavigationAnchor` 取到那个
+  `UINavigationController`，`pushViewController` / `popViewController`。`preferredTransition = .zoom`
+  设在 push 之前。**不要改回 modal `present`/`dismiss`，也不要改回 `fullScreenCover`**。
+- 🔴 **不要重新引入"转场进行中就拒绝用户操作"**。禁止 transition gate、pending queue、generation、
+  `asyncAfter`、Timer、cooldown、`isTransitioning` 早退、手动开关系统 gesture。push 永远无条件执行：
+  A 的 pop 还在播时点 B，直接 push B，UIKit 自己衔接两段转场。搜索 `pending` / `transition` /
+  `generation` / `asyncAfter` 时若在 Viewer 路径上发现这类逻辑，视为回归。
+- 🔴 **每个 Viewer 一份 `PhotoViewerTransitionState`**（`sessionID` 在 `open` 时新建）。禁止把
+  "当前 Viewer 状态"放回 `PhotoGridTransitionCoordinator`（旧的 `viewerTransitionState` +
+  `beginViewerSession()` 已删）：A pop 与 B push 重叠时两者必须同时存在，否则 source cell 会串。
+  `zoomTransition(options:)` 的 source closure 必须捕获**本会话**的 state。
+- 🔴 **网格交互只有一个布尔** `PhotoViewerNavigator.isGridInteractionBlocked`，网格 `isActive` 由它驱动。
+  规则：push 开始/稳定/下拉拖动中/取消回弹 → `true`；**下拉 commit** → `false`（zoom-out 还在播，
+  网格已可点）；关闭按钮等非交互 pop → 立即 `false`。回调全部按 `sessionID` 归属。
+- 🔴 **取消回弹后必须自己把 Viewer 的触摸还回去**（`restoreViewerInteraction`）。这是**UIKit 的状态**：
+  interactive pop 会把被 push 的 hosting view 置 `isUserInteractionEnabled=false`，**取消路径不恢复**，
+  而三个系统 Zoom dismissal recognizer 正挂在它上面——disabled 期间下拉根本不会被识别（没有
+  `zoom_dismiss_should_begin`、没有 `viewWillDisappear`），表现就是"连续几次完全没反应、某次又恢复"。
+  在取消回调与 `viewDidAppear` 两处恢复；事件驱动，禁止 Timer/asyncAfter。不要重新引入
+  `ViewerInteractionContainerView` 那种覆写 setter 去拒绝 UIKit 写入的做法。
+- 分页用 `ViewerPagingCollectionController`（`UICollectionView` + `isPagingEnabled`），**不要改回
+  `UIPageViewController`**：它内部 scrollView 的 pan 会抢纵向手势，曾经因此需要
+  `ViewerDownwardIntentGesture` 三方仲裁（已整类删除）。方向仲裁只有一处：
+  `ViewerPagingCollectionView.gestureRecognizerShouldBegin` —— `|x| > |y| * 1.05` 才归 Pager，
+  明显纵向留给 `ZoomInteractiveDismissSwipeDown`；放大中和胶片 scrub 中一律不翻页。
+- 🔴 **方向判定用累计 translation，不要只用瞬时 velocity**：`gestureRecognizerShouldBegin` 在刚够识别
+  拖动的瞬间执行，慢速/按住再拖的手势此时 velocity 近乎噪声（实测同一笔 281pt 斜向拖动只有 129pt
+  到达 scroll view，纯 velocity 判定会误拒）。翻页提交阈值 30% 视口宽 + 200pt/s flick
+  （`pagingCommitFraction`），对齐系统相册；靠 `scrollViewWillEndDragging` 给目标 index，
+  UIKit 自己动画，不要自己写翻页动画。
+- 不再用动态 `TabView` 页面窗口分页。Cell 由 `ViewerPageCell` 回收（内部一个
+  `UIHostingController`，只在内容 identity 变化时更新 `rootView`）。
+- 外部跳转（胶片点击/scrub、幻灯片返回）走 representable 的 `currentIndex` → `setCurrentIndex`；
+  scrub 期间用 `animated: false` 即时跟随，拖动/减速中不做 `scrollToItem` 回中。
+  横向翻页状态 `onPagingChanged` 只由分页 pan 的 began/ended 驱动，纵向拖动不会置 `isPaging`。
+- 未整理详情页仍按元数据页懒加载，缺少资产时显示占位页；资产到达后只更新对应页面。
+- 系统样式不要再叠加自定义水平 `DragGesture`。自定义淡入、推入、缩放样式可以用单独的自定义 pager，
+  但要保证一次手势只推进一次索引。
+- 图片自身的单指拖拽不能在 1 倍缩放时注册为有效手势，否则会抢走详情分页；只有缩放大于约 1.01 倍后
+  才允许图片平移。双指缩放、放大后的平移和单指分页必须互斥；切页或页面消失时必须清除 `isZooming`。
+- `AssetImageView` 不要给每张图片单独加 opacity 淡入，详情页切换动画由 pager 统一负责。
+- 详情页底部操作栏对齐原生相册的悬浮工具栏样式：图标按钮一律用 iOS 26 液态玻璃
+  （`.glassEffect(.regular.interactive(), in: Circle())`，顶栏、底栏、菜单、幻灯片控制同一套），
+  不包胶囊/毛玻璃容器背景；46pt 命中区、均匀分布整个宽度、不留提示文字。玻璃按钮不得引入
+  影响分页命中区域的额外手势层。
+- 分享面板必须用 `ActivityPresenter.present(items:onDismiss:)` 从最顶层 UIKit VC 呈现，不能把
+  `UIActivityViewController` 托管进 SwiftUI `.sheet`——后者首帧尺寸错误导致面板内容跳位。
+  `requestShareItems` 准备临时文件期间（iCloud 照片可能很慢）必须给出原位反馈（详情页分享按钮
+  原 46pt 框内切换为 ProgressView，网格侧禁用按钮），并用 `isPreparingShare` 防止重复触发；
+  临时文件在 `onDismiss` 清理。
+- 图片可以延伸到全屏，但关闭、信息、全屏等控制必须在安全区域内，不能被状态栏、灵动岛、
+  Home Indicator 或底部黑边遮挡。
+- 查看器的呈现/退出是"哪来的回哪"的空间转场（P0 原则）：退出目标永远是**当前正在看的照片**
+  对应的网格 cell，不是进入时的那张。退出目标由 `PhotoViewerTransitionState`（currentIndex +
+  currentAssetIdentifier）决定：查看器**每次翻页**都要 `update(index:assetIdentifier:)`，
+  退出时只读当前值、绝不读 initialIndex。网格侧
+  `PhotoGridTransitionCoordinator.sourceView(index:assetIdentifier:)` 持弱引用 collectionView
+  查找目标 cell：index 先用 assetIdentifier 校验，不一致时在 ±24 邻域内按 identifier 重扫
+  （删除会平移索引），找不到（照片已删）返回 nil 让 UIKit 走默认转场；目标 cell 不可见时先
+  `scrollToItem(.centeredVertically, animated: false)` + `layoutIfNeeded()`。禁止建全库
+  identifier→index/cell 缓存。
+- 退出只有单一入口 `requestDismiss(reason:)`（`isDismissing` 只防本 Viewer 重复 pop，不是动画门）：
+  关闭按钮、下拉提交、移出相册等都调它；视觉一律交给系统缩放转场，**禁止再写"成功后向下飞出"的
+  自定义轨迹**。系统下拉（`ZoomInteractiveDismissSwipeDown`）自带跟手进度和取消连续性，
+  不要叠自定义 mediaScale/offset/cornerRadius 双重变换。
+- 缩放转场选项：`interactiveDismissShouldBegin` **只能否决、不能放行**，返回值必须是
+  `context.willBegin && !vetoed`（veto 在 `isZooming || isPaging || isScrubbingFilmstrip` 时抬起）。
+  写成无条件 `!veto` 等于替 UIKit 放行它自己判定不会开始的交互：实测 `swipeRight`（触摸落在
+  前导边缘）时 context 报 `willBegin=false velY=0`，仍被开成交互式退出，"翻上一张"变成"退出查看器"——
+  系统的退出 recognizer 有三个（`LeadingEdgePan` / `SwipeDown` / `Pinch`），只有 SwipeDown 是用户要的。
+  `alignmentRectProvider` 返回照片 aspect-fit 实际矩形（letterbox 除外），让 morph 对准照片本体。
+- 🔴 查看器静止背景必须不透明：`dimmingColor` 只覆盖转场进行中/交互中，静止态没有暗化层——
+  hosting 背景若为 clear，letterbox 会透出底层网格。`view.backgroundColor = .black`，不要改回 clear。
+- 🔴 不要试图替换分页器内部 scrollView 的 pan delegate：`UIScrollView` 强制内置 pan 的 delegate 是它
+  自己，`setDelegate:` 直接 SIGABRT。也不要给 pager pan 加 `require(toFail:)` 等系统退出手势。
+- 🔴 **查看器里读不到 `@Environment(\.scenePhase)`（恒为 `.background`）**：详情页由
+  `PhotoViewerHostingController` 手工创建并 push，不在 SwiftUI 的视图树里，拿不到 Scene 提供的
+  环境值。实测后果两处：① 从详情页开播的幻灯片永远停在第 1 张——自动推进任务的
+  `guard phase == .active` 直接 return（从图库页开播的正常，因为它在 App 自己的层级里）；
+  ② `VideoAssetViewer` 的 `onAppear` 不敢 `play()`，详情页的视频不播。凡是从查看器可达的代码
+  一律用 `AppSceneState.shared.phase`（`PhotoVaultApp.swift`，由 `UIApplication` 的
+  active/inactive/background 通知驱动，任何层级都正确），不要再写 `@Environment(\.scenePhase)`；
+  只有活在 App 自己层级里的页面（`ContentView`、LAN 相册、设置、智能搜索）才可以用环境值。
+  `SlideshowView` / `IndexedSlideshowView` / `VideoAssetViewer` 已改。
+- 🔴 **NavigationStack 必须与 NavigationSplitView 隔离**：compact 宽度下 push 到 split view 自己
+  内部的 stack，pop 回来会把详情展示状态搞乱（一次返回直接跳回侧栏、之后侧栏所有行都点不进去）。
+  因此 `.library` / `.unsorted` / `.album` / `.search` / `.smartSearch` / `.lan` 每个分支都包一层
+  专属 `NavigationStack` + 稳定 `.id`。新增能打开详情页的分支必须照做。
+- 🔴 **navigator 绝不能当 `UINavigationController.delegate`**：实测窗口里只有**一个**
+  `UINavigationController`，compact 宽度下 SwiftUI 的 `NavigationStack` 与
+  `NavigationSplitView` 共用它，而它的 delegate 正是"侧栏选中 → 详情列切换"的驱动。
+  设成 delegate 会让侧栏每一行"选中态更新、详情列不动"（就是本文档开头记的侧栏污染）。
+  导航栏改由 `viewerWillAppear`（`setNavigationBarHidden(true, animated: false)`）与
+  anchor 的 `viewWillAppear`（恢复 `false`）管理。**不要在动画过程中带动画隐藏 bar**
+  （会和缩放转场抢帧）；Viewer 自带顶栏，网格要能在 pop 后正确恢复标题与工具栏。
+- `PhotoViewerNavigationAnchor` 只负责把导航 controller 存下来：anchor 被承载时
+  `navInWindow` 可能为 true 而它**并不在栈里**（该分支还不是详情列的可见内容），
+  所以不要在 attach 时断言或依赖当时的栈内容。
+- 查看器退出路径的回归用 UI 测试跑：`xcodebuild test -project PhotoVault.xcodeproj -scheme PhotoVault
+  -destination 'platform=iOS Simulator,id=<id>' -only-testing:PhotoVaultUITests`。覆盖：关闭退出、
+  下拉退出、短拉取消连续、翻页后关闭、未整理查看器下拉退出——每个场景都断言"退出后网格仍可交互"。
+  **模拟器的输入自动化必须用 XCUITest**：macOS 侧 CGEvent 合成事件会被桌面窗墙吃掉。
+  首次在全新模拟器上跑之前要先授予照片权限，`launchToGrid` 会自动点掉系统弹窗。
+- 详情展示期间要让底层相册网格进入 inactive 状态，暂停其交互和图片请求；退出 commit 后可立即恢复
+  底层滚动交互，视觉转场仍由系统完成。
+- 详情返回时不要因为 `isActive` 恢复就无条件对相册网格调用 `reloadData()`；这会清掉已经显示的
+  缩略图并重新显示 loading，和全屏退出动画叠加成闪屏。未变化的数据应保留可见 cell。
+- 未整理详情的分页元数据请求必须用代次校验，页面消失后丢弃旧回调。
 
 ## 文件夹相册（局域网/本地/U 盘文件夹）
 

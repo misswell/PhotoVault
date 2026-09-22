@@ -28,6 +28,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments += arguments
         app.launch()
+        grantPhotoAccessIfNeeded()
 
         let grid = app.collectionViews["photo-grid"]
         if grid.waitForExistence(timeout: 15) { return app }
@@ -36,6 +37,22 @@ final class PhotoViewerDismissUITests: XCTestCase {
         if libraryRow.waitForExistence(timeout: 5) { libraryRow.tap() }
         XCTAssertTrue(grid.waitForExistence(timeout: 20), "图库网格应加载出照片")
         return app
+    }
+
+    /// Dismisses the system photo-library prompt on a fresh simulator.
+    ///
+    /// Without this the whole suite fails on the first run against a new
+    /// simulator, because every grid assertion is satisfied by a permission
+    /// dialog that never goes away.
+    private func grantPhotoAccessIfNeeded() {
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        for label in ["允许完全访问", "Allow Full Access"] {
+            let button = springboard.buttons[label]
+            if button.waitForExistence(timeout: 3) {
+                button.tap()
+                return
+            }
+        }
     }
 
     private func openViewer(at index: Int, in app: XCUIApplication) {
@@ -145,15 +162,29 @@ final class PhotoViewerDismissUITests: XCTestCase {
         assertGridIsAlive(after: app)
     }
 
-    func testOpenAndDismissTransitionsAcceptReplacementRequest() throws {
-        let app = launchToGrid(arguments: ["-viewer-interruption-probe"])
+    /// 打开动画中途关闭、接着在 pop 动画中途再 push —— 全靠 App 内探针驱动，
+    /// 因为 XCUITest 无法在动画中间注入手势。
+    ///
+    /// 探针走的是和 UI 完全相同的入口（`PhotoViewerNavigator.open/close`），
+    /// 之后断言：导航栈最终只有一个 Viewer（没有被 pop 掉的旧会话堆积），
+    /// 而且网格仍然可用。这两条合起来证明"没有 transition gate、没有排队"。
+    func testFluidTransitionProbeInterruptsWithoutGating() throws {
+        let app = launchToGrid(arguments: ["-viewer-fluid-transition-probe"])
         let cell = app.cells["photo-cell-0"]
         XCTAssertTrue(cell.waitForExistence(timeout: 20))
         cell.tap()
-        expectViewerIndex(3, in: app, "动画中的第二次请求必须打开第 3 张")
-        app.swipeLeft()
-        expectViewerIndex(4, in: app, "旧会话完成回调不得关闭或阻塞新查看器")
+
+        // 探针会在 push 动画中 close、再于 pop 动画中 open，最终必须停在
+        // 一个可用的查看器上 —— 而不是"点了一下没反应"。
+        XCTAssertTrue(
+            app.buttons["viewer-close"].waitForExistence(timeout: 10),
+            "动画中的 close+reopen 之后必须仍有一个查看器在场"
+        )
         app.buttons["viewer-close"].tap()
+        XCTAssertTrue(
+            app.buttons["viewer-close"].waitForNonExistence(timeout: 10),
+            "探针跑完后查看器仍必须能正常关闭"
+        )
         assertGridIsAlive(after: app)
     }
 
@@ -179,7 +210,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         }
     }
 
-    // XCTest waits for idle; the in-app interruption probe covers animation-time queuing.
+    // XCTest waits for idle; the app's fluid-transition probe covers animation-time input.
     func testRapidDismissReopenKeepsPullDownWorking() { verifyRapidReopen(closeButton: false) }
     func testRapidCloseReopenKeepsPullDownWorking() { verifyRapidReopen(closeButton: true) }
 
@@ -277,7 +308,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         let window = app.windows.firstMatch
 
         // 短下拉：远不到提交阈值，UIKit 会决定回弹。
-        pullDown(in: window, from: 0.45, to: 0.50, holdFor: 0.05)
+        cancellablePullDown(in: window)
         XCTAssertTrue(
             app.buttons["viewer-close"].exists,
             "第一次短下拉应留在查看器里（探针日志 stage=cancelling 是它的凭据）"
@@ -306,7 +337,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         let window = app.windows.firstMatch
 
         for round in 1...5 {
-            pullDown(in: window, from: 0.45, to: 0.50, holdFor: 0.05)
+            cancellablePullDown(in: window)
             XCTAssertTrue(
                 app.buttons["viewer-close"].exists,
                 "第 \(round) 次短下拉应留在查看器里"
@@ -341,7 +372,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         expectViewerIndex(openedAt + 1, in: app, "左滑应到下一张")
 
         let window = app.windows.firstMatch
-        pullDown(in: window, from: 0.45, to: 0.50, holdFor: 0.05)
+        cancellablePullDown(in: window)
         // 等这一次回弹真正结束再翻页：这里要证的是"回弹结束后一切恢复"，
         // 回弹过程中的那一次触摸由上一条用例负责。
         Thread.sleep(forTimeInterval: 1.5)
@@ -360,11 +391,26 @@ final class PhotoViewerDismissUITests: XCTestCase {
         XCTAssertTrue(app.buttons["viewer-close"].exists)
     }
 
-    /// Drags straight down from `fromY` to `toY` (normalized screen heights).
+    /// 一笔"注定回弹"的短下拉：屏幕高度的 10%。
     ///
-    /// ⚠️ 提交阈值按照片的**实际显示高度**算，不是按屏幕：同一笔 13% 屏幕高度
-    /// 的下拉，在竖屏截图上是回弹，在横屏照片上（letterbox 后更矮）就是退出。
-    /// 这里要"只回弹"的下拉一律压在 5% 屏幕高度以内。
+    /// 两个阈值之间要有余量，而它们**不是**同一个量：
+    ///
+    /// - 下限是 **UIKit 自己的识别门槛**。实测 5%（≈44pt）配合
+    ///   `press(forDuration: 0.05, thenDragTo:)` 生成的慢速拖动，系统
+    ///   `ZoomInteractiveDismissSwipeDown` 有时**根本不会开始**——App 侧连
+    ///   `zoom_dismiss_should_begin` 都收不到，整笔下拉像没发生过。这不是
+    ///   App 的门（`interactiveDismissShouldBegin` 现在无条件记日志），也不是
+    ///   "回弹没归位"，而是手势本身低于系统识别门槛。测试要证明的是"取消了还能
+    ///   再拉"，所以必须给一个系统一定会接住的拖动。
+    /// - 上限是**照片实际显示高度**的提交阈值（约 30%，竖屏照片 ≈ 210pt）。
+    ///   10% 屏幕高度（≈87pt）离它足够远。
+    ///
+    /// ⚠️ 提交阈值按照片**实际显示高度**算，不按屏幕：同一笔 13% 屏幕高度的
+    /// 下拉，在竖屏截图上是回弹，在横屏照片（letterbox 后更矮）上就是退出。
+    private func cancellablePullDown(in window: XCUIElement) {
+        pullDown(in: window, from: 0.40, to: 0.50, holdFor: 0.05)
+    }
+
     private func pullDown(
         in window: XCUIElement,
         from fromY: CGFloat,
@@ -433,7 +479,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
     /// 早已播完。**"动画进行中能不能操作"在 UI 测试进程里无法观测**，它由
     /// App 内探针负责（`dismiss_probe_mid_transition`：在转场动画块里用真实
     /// `window.hitTest` 回答"这一下会不会打到网格"，见
-    /// `PhotoViewerPresentationBridge`）。
+    /// `PhotoViewerNavigator.installMidPopProbe`）。
     ///
     /// UI 测试守住的是另一半：退出后整个视口都可命中。
     func testGridIsFullyHittableAfterDismissal() throws {
@@ -486,7 +532,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
 
         for round in 0..<10 {
             let index = round % 4
-            // XCTest 等 idle；动画内排队由 interruption probe 单独验证。
+            // XCTest 等 idle；动画内打断由 fluid-transition probe 单独验证。
             openViewer(at: index, in: app)
             expectViewerIndex(
                 index + 1,
@@ -511,6 +557,63 @@ final class PhotoViewerDismissUITests: XCTestCase {
         XCTAssertTrue(app.buttons["viewer-close"].exists, "静止期查看器应保持在场")
         app.buttons["viewer-close"].tap()
         XCTAssertTrue(app.cells.firstMatch.waitForExistence(timeout: 10))
+    }
+
+    /// 验收 [26]：Viewer 的 push/pop 不得污染 NavigationSplitView。
+    ///
+    /// 这条守的是一个真实故障：Viewer 是真正的导航 push，而 compact 宽度下
+    /// SwiftUI 的 `NavigationStack` 与 `NavigationSplitView` 共用同一个
+    /// `UINavigationController`（实测窗口里只有一个）。曾经为了让 Viewer 隐藏
+    /// 导航栏而把 navigator 设成那个 controller 的 delegate，直接顶掉了 split
+    /// view 自己的 delegate，于是侧栏行只剩选中态、详情列再也不导航 —— 也就是
+    /// AGENTS.md 里记录的"侧栏被污染"。所以断言必须是"push/pop 之后侧栏还能进
+    /// 别的页面"，而不只是"查看器还能打开"。
+    func testSidebarNavigationSurvivesViewerPushPop() throws {
+        let app = launchToGrid()
+
+        // push + pop 一次普通详情页
+        let grid = app.collectionViews["photo-grid"]
+        XCTAssertTrue(grid.cells["photo-cell-0"].waitForExistence(timeout: 20))
+        grid.cells["photo-cell-0"].tap()
+        XCTAssertTrue(app.buttons["viewer-close"].waitForExistence(timeout: 10))
+        app.buttons["viewer-close"].tap()
+        XCTAssertTrue(app.buttons["viewer-close"].waitForNonExistence(timeout: 10))
+
+        // 侧栏必须还能导航到别的页面
+        let sidebarToggle = app.navigationBars.buttons.firstMatch
+        XCTAssertTrue(sidebarToggle.waitForExistence(timeout: 5), "应存在展开侧栏的按钮")
+        sidebarToggle.tap()
+
+        let unsortedRow = app.staticTexts["未整理"].firstMatch
+        XCTAssertTrue(unsortedRow.waitForExistence(timeout: 8), "侧栏应出现未整理入口")
+        unsortedRow.tap()
+        XCTAssertTrue(
+            app.collectionViews["unsorted-photo-grid"].waitForExistence(timeout: 20),
+            "Viewer push/pop 之后侧栏进入未整理必须仍然有效"
+        )
+
+        // 未整理详情页也 push/pop 一次，再回侧栏
+        let unsortedCell = app.collectionViews["unsorted-photo-grid"].cells["photo-cell-0"]
+        XCTAssertTrue(unsortedCell.waitForExistence(timeout: 20))
+        unsortedCell.tap()
+        if !app.buttons["viewer-close"].waitForExistence(timeout: 8) {
+            // 未整理网格可以先显示占位符：第一下点击只触发元数据页加载。
+            unsortedCell.tap()
+        }
+        XCTAssertTrue(app.buttons["viewer-close"].waitForExistence(timeout: 10), "未整理详情页应打开")
+        app.buttons["viewer-close"].tap()
+        XCTAssertTrue(app.buttons["viewer-close"].waitForNonExistence(timeout: 10))
+
+        let sidebarToggleAgain = app.navigationBars.buttons.firstMatch
+        XCTAssertTrue(sidebarToggleAgain.waitForExistence(timeout: 5), "侧栏按钮应仍在")
+        sidebarToggleAgain.tap()
+        let libraryRow = app.staticTexts["图库"].firstMatch
+        XCTAssertTrue(libraryRow.waitForExistence(timeout: 8), "侧栏应仍可展开")
+        libraryRow.tap()
+        XCTAssertTrue(
+            app.collectionViews["photo-grid"].waitForExistence(timeout: 20),
+            "两轮 Viewer push/pop 之后侧栏进入图库必须仍然有效"
+        )
     }
 
     /// 未整理页（Indexed 查看器）：下拉退出后网格仍可交互。
@@ -545,17 +648,32 @@ final class PhotoViewerDismissUITests: XCTestCase {
         }
         unsortedRow.tap()
 
-        let firstCell = app.cells.firstMatch
-        let appeared = firstCell.waitForExistence(timeout: 20)
-        if !appeared {
+        // 必须按**未整理网格自己的** identifier 取 cell。compact 宽度下侧栏
+        // 刚收起时侧栏行本身也是 `app.cells`（List 的行就是 cell），
+        // `app.cells.firstMatch` 会点到"图库/未整理"那一行而不是照片 —— 表现为
+        // "未整理查看器应打开"失败，而 App 侧日志里连一次 grid_tap 都没有。
+        let unsortedGrid = app.collectionViews["unsorted-photo-grid"]
+        let gridAppeared = unsortedGrid.waitForExistence(timeout: 20)
+        if !gridAppeared {
             // 失败时把整棵可访问性树写进结果，能看到未整理页实际渲染了什么。
             let tree = app.debugDescription
             XCTFail(
                 "未整理网格应加载出照片（前 3000 字符树）：\n"
                     + String(tree.prefix(3000))
             )
+            return
         }
+        let firstCell = unsortedGrid.cells["photo-cell-0"]
+        XCTAssertTrue(
+            firstCell.waitForExistence(timeout: 20),
+            "未整理网格第一个 cell 应存在"
+        )
         firstCell.tap()
+        if !app.buttons["viewer-close"].waitForExistence(timeout: 8) {
+            // 未整理网格的 cell 可以先是占位符：第一下点击只触发元数据页加载，
+            // 页面到达后需要再点一次。重试一次而不是直接判失败。
+            firstCell.tap()
+        }
         XCTAssertTrue(
             app.buttons["viewer-close"].waitForExistence(timeout: 10),
             "未整理查看器应打开"
@@ -563,9 +681,10 @@ final class PhotoViewerDismissUITests: XCTestCase {
 
         let window = app.windows.firstMatch
         // End-to-end cancellation regression; XCTest still waits for idle.
-        // The app's window.hitTest probe checks input during the real bounce.
+        // The counter is incremented from the transition's own cancellation
+        // callback, so "the viewer is still here" cannot pass for "it reacted".
         for round in 1...3 {
-            pullDown(in: window, from: 0.45, to: 0.50, holdFor: 0.05)
+            cancellablePullDown(in: window)
             XCTAssertEqual(app.staticTexts["viewer-cancel-count"].label, String(round),
                            "未整理详情每一笔短下拉都必须真的取消")
         }

@@ -28,24 +28,15 @@ struct SmartSearchScreen: View {
     /// the filmstrip all behave identically to a photo opened from the library.
     @ObservedObject var store: PhotoLibraryStore
 
-    @State private var viewerRequest: SearchViewerRequest?
+    /// Same navigator the photo grids use: whichever screen opens the viewer,
+    /// it is one shared push/pop architecture with session-scoped transition
+    /// state. The results grid is a SwiftUI `LazyVGrid`, so there is no
+    /// `PhotoGridTransitionCoordinator` here and UIKit falls back to its
+    /// default morph — but paging, dismissal and interruption behaviour are
+    /// identical to the library.
+    @StateObject private var viewerNavigator = PhotoViewerNavigator()
 
     private let columns = [GridItem(.adaptive(minimum: 108, maximum: 180), spacing: 2)]
-
-    /// The ranked array cannot be handed to `PhotoViewerView`, which pages a
-    /// `PHFetchResult`. The result set is fetched by identifier (bounded by
-    /// `maximumResults`) and `initialAssetIdentifier` makes the *tapped* photo
-    /// the one that opens; paging order inside the viewer follows PhotoKit's
-    /// ordering rather than the ranking. Opening the right photo is what
-    /// matters; the ordering caveat is recorded in the baseline rather than
-    /// hidden.
-    private struct SearchViewerRequest: Identifiable {
-        let id = UUID()
-        /// Ranked, not a `PHFetchResult` -- see `open(_:at:)`.
-        let assets: ViewerAssets
-        let index: Int
-        let identifier: String
-    }
 
     init(store: PhotoLibraryStore) {
         self.store = store
@@ -66,18 +57,10 @@ struct SmartSearchScreen: View {
         )
         .onSubmit(of: .search) { model.search(draft) }
         .task { await model.prepare() }
-        .fullScreenCover(item: $viewerRequest) { request in
-            PhotoViewerView(
-                assets: request.assets,
-                initialIndex: request.index,
-                store: store,
-                album: nil,
-                initialPreviewImage: nil,
-                initialAssetIdentifier: request.identifier,
-                transitionState: nil,
-                onDismissRequested: { viewerRequest = nil }
-            )
-        }
+        .background(
+            PhotoViewerNavigationAnchor(navigator: viewerNavigator)
+                .frame(width: 0, height: 0)
+        )
     }
 
     // MARK: - Status
@@ -235,10 +218,31 @@ struct SmartSearchScreen: View {
             $0.localIdentifier == asset.localIdentifier
         }) else { return }
 
-        viewerRequest = SearchViewerRequest(
-            assets: .ordered(ranked),
-            index: resolved,
-            identifier: asset.localIdentifier
+        viewerNavigator.open(
+            request: PhotoViewerRequest(
+                index: resolved,
+                assetIdentifier: asset.localIdentifier,
+                previewImage: nil
+            ),
+            // No grid transition coordinator: the results are a SwiftUI grid,
+            // so the zoom has no cell to morph from and UIKit uses its default.
+            gridTransitionCoordinator: nil,
+            makeRootView: { state, onDismiss in
+                AnyView(
+                    PhotoViewerView(
+                        // Ranked, not a `PHFetchResult`: the viewer pages in
+                        // relevance order. See the note on `open(_:at:)`.
+                        assets: .ordered(ranked),
+                        initialIndex: state.currentIndex,
+                        store: store,
+                        album: nil,
+                        initialPreviewImage: nil,
+                        initialAssetIdentifier: asset.localIdentifier,
+                        transitionState: state,
+                        onDismissRequested: onDismiss
+                    )
+                )
+            }
         )
     }
 
