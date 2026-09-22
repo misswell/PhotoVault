@@ -210,16 +210,8 @@ final class PhotoViewerDismissUITests: XCTestCase {
         expectViewerIndex(2, in: app, "取消退出后应能继续翻页到第 2 张")
     }
 
-    /// 短下拉取消之后**马上**再来一次长下拉：必须仍能退出。
-    ///
-    /// 回归的是"UIKit 刚决定取消就被当成 transition 已结束"。那一瞬间系统还在
-    /// 跑回弹动画，状态机却已经回到 idle，于是第二次下拉被 downward intent
-    /// recognizer 占住、系统 Zoom dismissal 又起不来——整笔触摸两边都不认，
-    /// 既不退出也不翻页。
-    ///
-    /// 启动参数让 App 内探针在这次真实的取消回弹上核对闸门：回弹期间必须关、
-    /// 结束后必须开，违反即 DEBUG `assert` 崩溃（表现为本用例失败）。两次下拉
-    /// 之间不 sleep，就是为了落在回弹还没结束的那段窗口里。
+    /// 连续两次 XCTest 手势会等待 idle，不能证明动画中途输入。
+    /// App 探针只验证方向仲裁和状态；回弹中途接管须看真机 generation 日志。
     func testSecondPullDownImmediatelyAfterCancelledDismissStillWorks() throws {
         let app = launchToGrid(arguments: ["-viewer-cancel-reentry-probe"])
         openViewer(at: 0, in: app)
@@ -232,11 +224,13 @@ final class PhotoViewerDismissUITests: XCTestCase {
             "第一次短下拉应留在查看器里（探针日志 stage=cancelling 是它的凭据）"
         )
 
-        // 不等回弹播完，直接再拉：这一段就是原来会被吞掉的触摸。
+        XCTAssertEqual(app.staticTexts["viewer-cancel-count"].label, "1",
+                       "必须发生一次真实取消，不能把无响应当成回弹")
+        // XCTest 会等 idle；这仅是端到端回归，不证明 mid-bounce touch。
         pullDown(in: window, from: 0.30, to: 0.92, holdFor: 0.08)
         XCTAssertTrue(
             app.buttons["viewer-close"].waitForNonExistence(timeout: 5),
-            "取消回弹期间发起的第二次下拉必须仍能退出查看器"
+            "取消后第二次下拉必须仍能退出查看器"
         )
         assertGridIsAlive(after: app)
     }
@@ -258,6 +252,8 @@ final class PhotoViewerDismissUITests: XCTestCase {
                 app.buttons["viewer-close"].exists,
                 "第 \(round) 次短下拉应留在查看器里"
             )
+            XCTAssertEqual(app.staticTexts["viewer-cancel-count"].label, String(round),
+                           "每一笔短下拉都必须真实开始并取消，不能只是界面仍存在")
         }
         // 等回弹结束再核对：仍停在同一张，说明五次都是真回弹而不是攒出来的退出。
         Thread.sleep(forTimeInterval: 1.5)
@@ -463,6 +459,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
     /// 两套查看器共用同一座 UIKit 呈现桥，各自都要回归。
     func testUnsortedViewerPullDownDismissalKeepsGridAlive() throws {
         let app = XCUIApplication()
+        app.launchArguments += ["-viewer-cancel-reentry-probe"]
         app.launch()
 
         let libraryCell = app.cells.firstMatch
@@ -507,6 +504,13 @@ final class PhotoViewerDismissUITests: XCTestCase {
         )
 
         let window = app.windows.firstMatch
+        // End-to-end cancellation regression; XCTest still waits for idle.
+        // The app's window.hitTest probe checks input during the real bounce.
+        for round in 1...3 {
+            pullDown(in: window, from: 0.45, to: 0.50, holdFor: 0.05)
+            XCTAssertEqual(app.staticTexts["viewer-cancel-count"].label, String(round),
+                           "未整理详情每一笔短下拉都必须真的取消")
+        }
         let start = window.coordinate(
             withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35)
         )

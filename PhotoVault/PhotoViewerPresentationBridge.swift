@@ -2,6 +2,126 @@ import Photos
 import SwiftUI
 import UIKit
 
+// MARK: - Pure dismissal policy (also exercised by tools/test-viewer-dismiss-state.swift)
+
+struct ViewerDismissInteraction {
+    private(set) var generation: UInt64 = 0
+    private(set) var active: UInt64?
+    private(set) var cancelling: UInt64?
+
+    mutating func begin() -> UInt64 {
+        generation &+= 1
+        active = generation
+        // Keep the previous cancellation token: a late appearance callback
+        // must compare it with active, never assume it belongs to the new drag.
+        return generation
+    }
+
+    mutating func cancel(_ token: UInt64) -> Bool {
+        guard active == token else { return false }
+        cancelling = token
+        return true
+    }
+
+    mutating func settle(_ token: UInt64) -> Bool {
+        guard active == token, cancelling == token else { return false }
+        clear()
+        return true
+    }
+
+    mutating func commit(_ token: UInt64) -> Bool {
+        guard active == token else { return false }
+        clear()
+        return true
+    }
+
+    mutating func clear() {
+        active = nil
+        cancelling = nil
+    }
+}
+
+func shouldBeginViewerInteractiveDismiss(
+    willBegin: Bool, velocityX: CGFloat, velocityY: CGFloat, vetoed: Bool
+) -> Bool {
+    guard !vetoed else { return false }
+    return willBegin || (velocityY > 0 && velocityY >= abs(velocityX) * 1.15)
+}
+
+// MARK: - Presentation input
+
+/// Own the presentation's hit-test root rather than letting an internal hosting
+/// view reject the entire second touch during UIKit's cancellation animation.
+/// UIKit still installs and drives its zoom recognizers on this root.
+@MainActor
+private final class ViewerInteractionContainerView: UIView {
+    var preservesInteractiveInput: (() -> Bool)?
+    #if DEBUG
+    var onPreservedInput: (() -> Void)?
+    #endif
+
+    override var isUserInteractionEnabled: Bool {
+        get { super.isUserInteractionEnabled }
+        set {
+            if !newValue, preservesInteractiveInput?() == true {
+                photoVaultTrace("viewer_preserved_interactive_input")
+                #if DEBUG
+                onPreservedInput?()
+                #endif
+                return
+            }
+            super.isUserInteractionEnabled = newValue
+        }
+    }
+}
+
+#if DEBUG
+/// Passive window-level diagnostics. Never recognizes or prevents another
+/// recognizer, and exists only for an explicitly enabled device repro session.
+@MainActor
+private final class ViewerTouchDeliveryProbe: UIGestureRecognizer {
+    var phase: (() -> String)?
+    var viewerSnapshot: ((CGPoint) -> String)?
+    private var loggedMove = false
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        loggedMove = false
+        record("began", touches: touches)
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        guard !loggedMove else { return }
+        loggedMove = true
+        record("moved", touches: touches)
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        record("ended", touches: touches)
+        state = .failed
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        record("cancelled", touches: touches)
+        state = .failed
+    }
+
+    private func record(_ stage: String, touches: Set<UITouch>) {
+        guard let touch = touches.first else { return }
+        var chain: [String] = []
+        var node = touch.view
+        while let current = node, !(current is UIWindow) {
+            chain.append("\(type(of: current))(enabled=\(current.isUserInteractionEnabled))")
+            node = current.superview
+        }
+        let point = touch.location(in: view)
+        photoVaultTrace("viewer_touch_delivery stage=\(stage) phase=\(phase?() ?? "none") chain=\(chain.joined(separator: "->")) viewer=\(viewerSnapshot?(point) ?? "none")")
+    }
+}
+#endif
+
 // MARK: - Transition state
 
 /// Live pointer to the photo the viewer is currently showing.
@@ -32,11 +152,9 @@ final class PhotoViewerTransitionState {
     /// interactive zoom dismissal.
     ///
     /// Mirrored from `Coordinator.dismissalPhase` — which stays authoritative —
-    /// so the pager's downward-intent recognizer can see the same truth the
-    /// bridge sees. Two sources is exactly how the second pull-down after a
-    /// cancelled one got swallowed: the bridge still believed the bounce-back
-    /// was settling while the pager had already released the drag to a
-    /// dismissal UIKit could not start.
+    /// so direction arbitration and lifecycle handling use the same state.
+    /// Cancelling is not idle, but must still permit downward arbitration:
+    /// failing a recognizer at touch-down loses that entire touch sequence.
     enum InteractiveDismissState {
         /// The viewer is at rest; a new pull-down may be arbitrated.
         case idle
@@ -62,8 +180,23 @@ final class PhotoViewerTransitionState {
 
     private(set) var interactiveDismissState: InteractiveDismissState = .idle
 
-    /// Only a settled viewer may start arbitration for a new pull-down.
-    var canBeginDownwardIntent: Bool { interactiveDismissState == .idle }
+    /// Whether a touch that is already travelling may keep arbitrating a
+    /// downward pull.
+    ///
+    /// `.cancelling` answers **yes**. All this gate can ever do is take a drag
+    /// away from the pager's *horizontal* pan, and a downward drag never pages
+    /// it — so answering “no” cannot redirect the touch to anything useful, it
+    /// can only make the pull-down disappear. It is also the wrong instant to
+    /// decide: UIKit's bounce-back outlives the finger's first sampled points,
+    /// and a recognizer that reports `.failed` at touch-down is finished for
+    /// that whole touch sequence even after the bounce settles. That is the
+    /// “cancel a pull-down, immediately pull down again, nothing happens” bug.
+    ///
+    /// `.dragging` and `.committed` answer no: there the system already owns
+    /// the drag, or the viewer is on its way out.
+    var mayArbitrateDownwardDrag: Bool {
+        interactiveDismissState == .idle || interactiveDismissState == .cancelling
+    }
 
     func setInteractiveDismissState(_ state: InteractiveDismissState) {
         interactiveDismissState = state
@@ -330,32 +463,145 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
     /// hook alone is not a commit signal; the paired cancel hook exists
     /// precisely because a began-but-cancelled dismissal leaves the viewer
     /// on screen.
-    final class PhotoViewerHostingController<Root: View>: UIHostingController<Root> {
+    final class PhotoViewerHostingController<Root: View>: UIViewController {
+        private let content: UIHostingController<Root>
+
+        init(rootView: Root) {
+            content = UIHostingController(rootView: rootView)
+            super.init(nibName: nil, bundle: nil)
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("init(coder:) is unavailable") }
+
+        override func loadView() {
+            let container = ViewerInteractionContainerView()
+            container.backgroundColor = .black
+            container.preservesInteractiveInput = { [weak self] in
+                self?.interaction.active != nil
+            }
+            #if DEBUG
+            container.onPreservedInput = { [weak self] in
+                self?.verifyInteractiveHitTesting(stage: "preserved")
+            }
+            #endif
+            view = container
+            addChild(content)
+            content.view.backgroundColor = .black
+            content.view.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(content.view)
+            NSLayoutConstraint.activate([
+                content.view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                content.view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                content.view.topAnchor.constraint(equalTo: container.topAnchor),
+                content.view.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            ])
+            content.didMove(toParent: self)
+        }
+
+        override var childForStatusBarHidden: UIViewController? { content }
+        override var childForStatusBarStyle: UIViewController? { content }
+        override var childForHomeIndicatorAutoHidden: UIViewController? { content }
+        override var childForScreenEdgesDeferringSystemGestures: UIViewController? { content }
+
         /// Carries the controller itself so a late `viewDidDisappear` from an
         /// already-settled viewer cannot be mistaken for the current one.
         var onVanishedWithoutCallback: ((UIViewController) -> Void)?
         /// A dismissal transition is starting; `interactive` says whether UIKit
         /// is driving it from the zoom transition's pull-down gesture, which
         /// can still be cancelled.
-        var onDismissTransitionBegan: ((_ interactive: Bool) -> Void)?
+        var onDismissTransitionBegan: ((_ interactive: Bool, _ generation: UInt64?) -> Void)?
         /// An interactive pull-down was cancelled: the viewer stays
         /// on screen and everything the began hook released must be restored.
         /// Fires when the bounce-back has **settled**, not when UIKit decides
         /// to reverse — see `onDismissTransitionCancelling`.
-        var onDismissTransitionCancelled: (() -> Void)?
+        var onDismissTransitionCancelled: ((UInt64) -> Void)?
         /// UIKit has decided to reverse an interactive pull-down. The viewer
         /// stays on screen, but the reverse animation is still running, so
         /// this is not the same moment as `onDismissTransitionCancelled`.
-        var onDismissTransitionCancelling: (() -> Void)?
+        var onDismissTransitionCancelling: ((UInt64) -> Void)?
         /// An interactive pull-down passed the commit threshold: the zoom-out
         /// will finish, so the grid can come back while it plays.
-        var onDismissTransitionCommitted: (() -> Void)?
+        var onDismissTransitionCommitted: ((UInt64?) -> Void)?
         /// DEBUG: lets the bridge ask the hit-test question from inside the
         /// transition's own animation block, rather than before it starts.
         var onTransitionAnimationStep: (() -> Void)?
         /// Only a drag that actually began may report an outcome. Cleared when
         /// the transition settles, not when UIKit decides its outcome.
-        private(set) var isInteractiveDismissActive = false
+        private var interaction = ViewerDismissInteraction()
+        var isInteractiveDismissActive: Bool { interaction.active != nil }
+        #if DEBUG
+        private let cancellationCounter = UILabel()
+        private var cancellationCount = 0
+        private var touchDeliveryProbe: ViewerTouchDeliveryProbe?
+
+        private func verifyInteractiveHitTesting(stage: String) {
+            guard ProcessInfo.processInfo.arguments.contains("-viewer-cancel-reentry-probe"),
+                  let window = view.window else { return }
+            let point = CGPoint(x: window.bounds.midX, y: window.bounds.height * 0.45)
+            let hit = window.hitTest(point, with: nil)
+            let reachesViewer = hit === view || hit?.isDescendant(of: view) == true
+            photoVaultTraceLaunch(
+                "viewer_cancel_hit_test stage=\(stage) active=\(String(describing: interaction.active)) "
+                    + "cancelling=\(String(describing: interaction.cancelling)) enabled=\(view.isUserInteractionEnabled) "
+                    + "reached=\(reachesViewer) hit=\(hit.map { String(describing: type(of: $0)) } ?? "nil")"
+            )
+            assert(view.isUserInteractionEnabled && reachesViewer,
+                   "Cancellable zoom must keep the viewer reachable for the next touch")
+        }
+
+        private func installTouchDeliveryProbe() {
+            guard touchDeliveryProbe == nil,
+                  ProcessInfo.processInfo.arguments.contains("-viewer-cancel-reentry-probe"),
+                  let window = view.window else { return }
+            let probe = ViewerTouchDeliveryProbe(target: nil, action: nil)
+            probe.cancelsTouchesInView = false
+            probe.delaysTouchesBegan = false
+            probe.delaysTouchesEnded = false
+            probe.phase = { [weak self] in
+                guard let self else { return "gone" }
+                return "active=\(String(describing: self.interaction.active)),cancelling=\(String(describing: self.interaction.cancelling))"
+            }
+            probe.viewerSnapshot = { [weak self, weak window] point in
+                guard let self, let window else { return "gone" }
+                let root = self.view!
+                let local = root.convert(point, from: window)
+                let hit = root.hitTest(local, with: nil)
+                let pans = (root.gestureRecognizers ?? []).filter { $0 is UIPanGestureRecognizer }.map {
+                    "\($0.name ?? String(describing: type(of: $0))):\($0.state.rawValue):enabled=\($0.isEnabled)"
+                }.joined(separator: ",")
+                return "enabled=\(root.isUserInteractionEnabled),hidden=\(root.isHidden),alpha=\(root.alpha),hit=\(hit.map { String(describing: type(of: $0)) } ?? "nil"),pans=[\(pans)]"
+            }
+            window.addGestureRecognizer(probe)
+            touchDeliveryProbe = probe
+        }
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            guard ProcessInfo.processInfo.arguments.contains("-viewer-cancel-reentry-probe") else { return }
+            cancellationCounter.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+            cancellationCounter.textColor = .clear
+            cancellationCounter.text = "0"
+            // A live 1x1 view at the top-left would swallow one point of touch
+            // and skew exactly the gesture tests this counter exists for.
+            cancellationCounter.isUserInteractionEnabled = false
+            cancellationCounter.isAccessibilityElement = true
+            cancellationCounter.accessibilityIdentifier = "viewer-cancel-count"
+            view.addSubview(cancellationCounter)
+        }
+        #endif
+
+        private func reportCancellationSettled(generation: UInt64) {
+            guard interaction.settle(generation) else {
+                photoVaultTrace("viewer_dismiss_stale_cancel_completion generation=\(generation) active=\(String(describing: interaction.active))")
+                return
+            }
+            #if DEBUG
+            cancellationCount += 1
+            cancellationCounter.text = String(cancellationCount)
+            #endif
+            onDismissTransitionCancelled?(generation)
+        }
 
         override func viewWillDisappear(_ animated: Bool) {
             super.viewWillDisappear(animated)
@@ -364,16 +610,17 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             guard isBeingDismissed else { return }
 
             guard let coordinator = transitionCoordinator else {
-                // Nothing to observe, and a dismissal is by definition not
-                // cancellable at this point.
-                onDismissTransitionBegan?(false)
-                onDismissTransitionCommitted?()
+                interaction.clear()
+                onDismissTransitionBegan?(false, nil)
+                onDismissTransitionCommitted?(nil)
                 return
             }
 
             let interactive = coordinator.initiallyInteractive
-            if interactive { isInteractiveDismissActive = true }
-            onDismissTransitionBegan?(interactive)
+            let observedGeneration = interactive ? interaction.begin() : nil
+            if !interactive { interaction.clear() }
+            if interactive { view.isUserInteractionEnabled = true }
+            onDismissTransitionBegan?(interactive, observedGeneration)
 
             // DEBUG: step inside the transition's animation block so the
             // "can the grid be touched yet?" question is answered while the
@@ -387,73 +634,59 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             guard interactive else {
                 // Close button and every programmatic exit: not cancellable, so
                 // the dismissal is committed the moment it starts.
-                onDismissTransitionCommitted?()
+                onDismissTransitionCommitted?(nil)
                 return
             }
 
-            // ⚠️ `viewWillDisappear` fires when the DRAG starts, so it is not a
-            // commit signal — a short drag returns through `viewWillAppear`. The
-            // transition coordinator is the only trustworthy source: it reports
-            // once when the interaction ends, and `isCancelled` says which way.
+            guard let observedGeneration else { return }
             coordinator.notifyWhenInteractionChanges { [weak self] context in
                 MainActor.assumeIsolated {
-                    guard let self, self.isInteractiveDismissActive else { return }
+                    guard let self else { return }
+                    guard self.interaction.active == observedGeneration else {
+                        photoVaultTrace("viewer_dismiss_stale_interaction_change generation=\(observedGeneration) active=\(String(describing: self.interaction.active))")
+                        return
+                    }
                     if context.isCancelled {
-                        // Only the *decision* to reverse. UIKit is starting the
-                        // bounce-back now; the session is not settled yet, so
-                        // `isInteractiveDismissActive` stays up and the paired
-                        // completion hook below does the settling. Reporting
-                        // "cancelled" here is what let a second pull-down land
-                        // inside a transition that was still running.
-                        self.onDismissTransitionCancelling?()
+                        guard self.interaction.cancel(observedGeneration) else { return }
+                        self.onDismissTransitionCancelling?(observedGeneration)
+                        #if DEBUG
+                        self.verifyInteractiveHitTesting(stage: "cancelling")
+                        #endif
                     } else {
-                        // Past the commit point: nothing may cancel this any
-                        // more, so the drag is over even though the zoom-out
-                        // keeps playing.
-                        self.isInteractiveDismissActive = false
-                        self.onDismissTransitionCommitted?()
+                        guard self.interaction.commit(observedGeneration) else { return }
+                        self.onDismissTransitionCommitted?(observedGeneration)
                     }
                 }
             }
 
-            // The transition's own completion is the only place a cancelled
-            // pull-down is genuinely over. Registers alongside nothing; the
-            // block runs when UIKit finishes the reverse animation.
             coordinator.animate(alongsideTransition: nil) { [weak self] context in
                 MainActor.assumeIsolated {
-                    guard let self, self.isInteractiveDismissActive,
-                          context.isCancelled else { return }
-                    self.isInteractiveDismissActive = false
-                    self.onDismissTransitionCancelled?()
+                    guard let self, context.isCancelled else { return }
+                    self.reportCancellationSettled(generation: observedGeneration)
                 }
             }
         }
 
-        override func viewWillAppear(_ animated: Bool) {
-            super.viewWillAppear(animated)
-            // Deliberately does NOT settle a cancelled pull-down. This fires as
-            // soon as UIKit *decides* to reverse — while the bounce-back is
-            // still animating — so treating it as "settled" reopened the viewer
-            // for input a fraction of a second too early and the next drag was
-            // swallowed by the transition still in flight. `viewDidAppear` and
-            // the transition completion both land after the motion is over.
-        }
-
         override func viewDidAppear(_ animated: Bool) {
             super.viewDidAppear(animated)
-            // Safety net for a cancelled drag whose transition completion never
-            // arrived: reaching here means the viewer is genuinely back on
-            // screen and stable. Idempotent — the bridge ignores a cancel when
-            // nothing is in flight.
-            if isInteractiveDismissActive {
-                isInteractiveDismissActive = false
-                onDismissTransitionCancelled?()
-            }
+            #if DEBUG
+            installTouchDeliveryProbe()
+            #endif
+            // Only a cancellation decision for the still-active generation can
+            // settle here. Appearance from an older reversal cannot clear a new drag.
+            guard !isBeingDismissed,
+                  let cancelling = interaction.cancelling,
+                  interaction.active == cancelling else { return }
+            reportCancellationSettled(generation: cancelling)
         }
 
         override func viewDidDisappear(_ animated: Bool) {
             super.viewDidDisappear(animated)
-            isInteractiveDismissActive = false
+            interaction.clear()
+            #if DEBUG
+            if let probe = touchDeliveryProbe { probe.view?.removeGestureRecognizer(probe) }
+            touchDeliveryProbe = nil
+            #endif
             onVanishedWithoutCallback?(self)
         }
     }
@@ -467,9 +700,9 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// a committed close — and the grid was released for both.
         ///
         /// `.cancelling` exists because "UIKit decided to reverse" and "the
-        /// reversal finished" are two different instants, and only the second
-        /// one is safe for a new pull-down. Every write goes through
-        /// `enterPhase(_:)` so the pager's copy can never lag behind.
+        /// reversal finished" are two different instants. A new system drag may
+        /// interrupt cancellation; a queued programmatic close waits for settle.
+        /// Every write mirrors the phase into the pager's direction gate.
         private enum DismissalPhase {
             /// The viewer is at rest and a new dismissal may begin.
             case idle
@@ -511,7 +744,9 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// the two zooms without letting old callbacks settle the new viewer.
         private var presentedRequestID: UUID?
         private var generation = 0
+        private var activeInteractiveDismissGeneration: UInt64?
         #if DEBUG
+        private var isVerifyingDismissLogic = false
         private var didRunInterruptionProbe = false
         private var debugReentryProbeFailures = 0
         #endif
@@ -564,6 +799,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             presentedRequestID = nil
             pendingRequest = nil
             pendingDismissRequest = false
+            activeInteractiveDismissGeneration = nil
             dismissalPhase = .idle
             makeViewer = nil
             restoreViewerInteraction()
@@ -608,6 +844,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                     retiringSessions[presentedRequestID] = (hosted, hosted.view)
                     self.hosted = nil
                     self.presentedRequestID = nil
+                    activeInteractiveDismissGeneration = nil
                     dismissalPhase = .idle
                     photoVaultTraceLaunch("viewer_reopen_during_dismissal")
                     flushPendingRequest()
@@ -682,7 +919,13 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                 assetIdentifier: request.assetIdentifier
             )
 
+            #if DEBUG
+            if ProcessInfo.processInfo.arguments.contains("-viewer-cancel-reentry-probe") {
+                Self.verifyDismissGenerationIsolation()
+            }
+            #endif
             presentedRequestID = request.id
+            activeInteractiveDismissGeneration = nil
             dismissalPhase = .idle
             // A fresh session inherits no debt from whatever closed the last
             // one; replaying a stale close here would dismiss the new viewer.
@@ -696,21 +939,21 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             hosting.onVanishedWithoutCallback = { [weak self] controller in
                 self?.hostedViewDidVanish(controller: controller, sessionID: request.id)
             }
-            hosting.onDismissTransitionBegan = { [weak self] interactive in
+            hosting.onDismissTransitionBegan = { [weak self] interactive, generation in
                 guard let self, self.presentedRequestID == request.id else { return }
-                self.dismissTransitionBegan(interactive: interactive)
+                self.dismissTransitionBegan(interactive: interactive, generation: generation)
             }
-            hosting.onDismissTransitionCancelling = { [weak self] in
+            hosting.onDismissTransitionCancelling = { [weak self] generation in
                 guard let self, self.presentedRequestID == request.id else { return }
-                self.dismissTransitionCancelling()
+                self.dismissTransitionCancelling(generation: generation)
             }
-            hosting.onDismissTransitionCancelled = { [weak self] in
+            hosting.onDismissTransitionCancelled = { [weak self] generation in
                 guard let self, self.presentedRequestID == request.id else { return }
-                self.dismissTransitionCancelled()
+                self.dismissTransitionCancelled(generation: generation)
             }
-            hosting.onDismissTransitionCommitted = { [weak self] in
+            hosting.onDismissTransitionCommitted = { [weak self] generation in
                 guard let self, self.presentedRequestID == request.id else { return }
-                self.dismissTransitionCommitted()
+                self.dismissTransitionCommitted(generation: generation)
             }
             #if DEBUG
             hosting.onTransitionAnimationStep = { [weak self] in
@@ -749,6 +992,16 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             #endif
         }
 
+        private func traceDismiss(_ message: String) {
+            #if DEBUG
+            if isVerifyingDismissLogic {
+                photoVaultTrace(message + " synthetic=true")
+                return
+            }
+            #endif
+            photoVaultTrace(message)
+        }
+
         /// A dismissal transition is starting. `interactive` distinguishes the
         /// system's pull-down (still cancellable) from a close button or any
         /// programmatic exit (already committed) — see `DismissalPhase`.
@@ -757,42 +1010,55 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// interactive dismissal before the previous bounce-back settled, that
         /// is a live drag and tracking it beats pretending the reversal is
         /// still in progress.
-        private func dismissTransitionBegan(interactive: Bool) {
-            photoVaultTrace(
-                "viewer_dismiss_transition_began interactive=\(interactive) "
-                    + "phase=\(dismissalPhase.label)"
-            )
+        private func dismissTransitionBegan(interactive: Bool, generation: UInt64?) {
+            guard interactive else {
+                activeInteractiveDismissGeneration = nil
+                return
+            }
+            guard let generation else {
+                assertionFailure("Interactive dismissal requires a generation")
+                return
+            }
             guard dismissalPhase == .idle || dismissalPhase == .cancelling else { return }
-            // The commit hook owns both the phase and the interaction release.
-            // Setting committed here would make that hook return too early.
-            if interactive { dismissalPhase = .interactive }
+            let reentered = dismissalPhase == .cancelling
+            activeInteractiveDismissGeneration = generation
+            dismissalPhase = .interactive
+            traceDismiss("viewer_dismiss_interactive_begin generation=\(generation)")
+            if reentered {
+                traceDismiss("viewer_dismiss_reentered generation=\(generation)")
+            }
         }
 
         /// The zoom-out will finish: the grid may take touches again and the
         /// viewer's own subtree stops hit testing, so the rest of the animation
         /// plays over a fully live grid. Nothing here touches alpha, transform,
         /// frame or the transition itself.
-        private func dismissTransitionCommitted() {
+        private func dismissTransitionCommitted(generation: UInt64? = nil) {
+            if let generation, generation != activeInteractiveDismissGeneration {
+                traceDismiss("viewer_dismiss_stale_commit generation=\(generation) active=\(String(describing: activeInteractiveDismissGeneration))")
+                return
+            }
+            activeInteractiveDismissGeneration = nil
             guard dismissalPhase != .committed else { return }
-            photoVaultTrace("viewer_dismiss_committed")
+            traceDismiss("viewer_dismiss_committed generation=\(String(describing: generation))")
             dismissalPhase = .committed
 
             // Re-enable the grid directly as well as through SwiftUI state:
             // the state update lands a frame later, and the whole point is that
             // scrolling and tapping work while the zoom-out is still running.
             transitionCoordinator?.setGridInteractionEnabled(true)
-            photoVaultTrace("grid_interaction_enabled")
+            traceDismiss("grid_interaction_enabled")
 
             let root = outgoingViewerInteractionRoot()
             outgoingInteractionRoot = root
             root?.isUserInteractionEnabled = false
-            photoVaultTrace(
+            traceDismiss(
                 "viewer_interaction_root_disabled "
                     + "class=\(root.map { String(describing: type(of: $0)) } ?? "nil")"
             )
             #if DEBUG
             debugTraceInteractionHierarchy()
-            photoVaultTrace(
+            traceDismiss(
                 "dismiss_probe "
                     + (transitionCoordinator?.debugHitTestProbe() ?? "no-coordinator")
             )
@@ -808,20 +1074,21 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// viewer here would leave a live viewer that no touch can reach.
         ///
         /// Reached only once the bounce-back has actually finished. The moment
-        /// UIKit *decides* to reverse is `dismissTransitionCancelling()`, and
-        /// collapsing the two is what made the next pull-down disappear: the
-        /// state machine said `idle` while UIKit was still animating the
-        /// previous reversal, so the second drag was arbitrated into a
-        /// dismissal that could not start.
+        /// UIKit *decides* to reverse is `dismissTransitionCancelling()`.
+        /// Keep these distinct so queued programmatic closes are replayed only
+        /// after settlement. Direction arbitration does not issue a dismissal
+        /// and remains available while UIKit is reversing.
         ///
-        /// `.interactive` is accepted as a fallback for the case where the
-        /// transition completion never fires; the normal path is
-        /// `interactive → cancelling → idle`.
-        private func dismissTransitionCancelled() {
-            guard dismissalPhase == .cancelling || dismissalPhase == .interactive else {
+        /// Only the matching cancellation may settle; a newer interactive
+        /// drag must survive every late callback from the previous reversal.
+        private func dismissTransitionCancelled(generation: UInt64) {
+            guard generation == activeInteractiveDismissGeneration else {
+                traceDismiss("viewer_dismiss_stale_cancelled generation=\(generation) active=\(String(describing: activeInteractiveDismissGeneration))")
                 return
             }
-            photoVaultTrace("viewer_dismiss_cancelled_settled")
+            guard dismissalPhase == .cancelling else { return }
+            traceDismiss("viewer_dismiss_cancelled_settled generation=\(generation)")
+            activeInteractiveDismissGeneration = nil
             dismissalPhase = .idle
             restoreViewerInteraction()
             transitionCoordinator?.setGridInteractionEnabled(false)
@@ -830,7 +1097,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             // refused then; now that the viewer is genuinely back at rest this
             // is the only place left to honour it.
             if pendingDismissRequest {
-                photoVaultTrace("viewer_dismiss_deferred_replayed")
+                traceDismiss("viewer_dismiss_deferred_replayed")
                 dismissIfNeeded()
             }
         }
@@ -840,7 +1107,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// `.cancelling` is only ever entered from a live drag.
         private func dismissalPhaseChanged(from previous: DismissalPhase) {
             let phase = dismissalPhase
-            photoVaultTrace("viewer_dismiss_phase \(previous.label)->\(phase.label)")
+            traceDismiss("viewer_dismiss_phase \(previous.label)->\(phase.label)")
             transitionCoordinator?.viewerTransitionState
                 .setInteractiveDismissState(phase.mapsTo)
             #if DEBUG
@@ -848,7 +1115,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
                 !(previous == .idle && phase == .cancelling),
                 "cancelling 只能由 interactive 进入"
             )
-            if ProcessInfo.processInfo.arguments
+            if !isVerifyingDismissLogic, ProcessInfo.processInfo.arguments
                 .contains("-viewer-cancel-reentry-probe") {
                 debugCancelReentryProbe(from: previous)
             }
@@ -856,29 +1123,66 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         }
 
         #if DEBUG
-        /// Samples the downward-intent gate across a real cancelled drag.
+        /// Exercises the production Bridge handlers without views or gestures.
+        /// This proves callback isolation, never claims mid-animation UI input.
+        private static func verifyDismissGenerationIsolation() {
+            let probe = Coordinator()
+            probe.isVerifyingDismissLogic = true
+            var settled = 0
+            probe.onDismissalCancelled = { settled += 1 }
+            probe.dismissTransitionBegan(interactive: true, generation: 1)
+            probe.dismissTransitionCancelling(generation: 1)
+            probe.dismissTransitionBegan(interactive: true, generation: 2)
+            probe.dismissTransitionCancelled(generation: 1)
+            probe.dismissTransitionCancelling(generation: 1)
+            probe.dismissTransitionCommitted(generation: 1)
+            assert(probe.dismissalPhase == .interactive)
+            assert(probe.activeInteractiveDismissGeneration == 2 && settled == 0)
+            // Even a matching token cannot settle a drag without a cancel decision.
+            probe.dismissTransitionCancelled(generation: 2)
+            assert(probe.dismissalPhase == .interactive)
+            probe.dismissTransitionCommitted(generation: 2)
+            assert(probe.dismissalPhase == .committed)
+            assert(probe.activeInteractiveDismissGeneration == nil)
+
+            let cancelled = Coordinator()
+            cancelled.isVerifyingDismissLogic = true
+            cancelled.onDismissalCancelled = { settled += 1 }
+            cancelled.dismissTransitionBegan(interactive: true, generation: 1)
+            cancelled.dismissTransitionCancelling(generation: 1)
+            cancelled.dismissTransitionCancelled(generation: 1)
+            cancelled.dismissTransitionCancelled(generation: 1)
+            assert(cancelled.dismissalPhase == .idle && settled == 1)
+            assert(cancelled.activeInteractiveDismissGeneration == nil)
+            photoVaultTraceLaunch("viewer_dismiss_generation_logic passed=true synthetic=true")
+        }
+
+        /// Samples the downward-arbitration gate across a real cancelled drag.
         ///
-        /// XCUITest cannot inject input mid-animation, so the race itself is
-        /// only observable from inside the app: this records whether the gate
-        /// was shut while UIKit bounced the drag back and open again once it
-        /// settled. Failures are counted across drags and written to the launch
-        /// log (`Library/Caches/PhotoVaultLaunch.log`).
+        /// XCUITest waits for idle before injecting input, so two serial XCTest
+        /// drags never land inside UIKit's reverse animation. This does: it
+        /// reads the gate at each phase change and re-runs the recognizer's own
+        /// direction/gate resolution on the phase that used to swallow the
+        /// second pull-down.
         private func debugCancelReentryProbe(from previous: DismissalPhase) {
             guard dismissalPhase != previous else { return }
             let gate = transitionCoordinator?.viewerTransitionState
-                .canBeginDownwardIntent ?? false
+                .mayArbitrateDownwardDrag ?? false
             switch (previous, dismissalPhase) {
             case (.idle, .interactive):
                 photoVaultTraceLaunch(
                     "viewer_cancel_reentry_probe stage=dragging gate=\(gate)"
                 )
+            case (.cancelling, .interactive):
+                photoVaultTraceLaunch("viewer_cancel_reentry_probe stage=reentered generation=\(String(describing: activeInteractiveDismissGeneration))")
             case (.interactive, .cancelling):
-                if gate { debugReentryProbeFailures += 1 }
+                if !gate { debugReentryProbeFailures += 1 }
+                ViewerDownwardIntentGesture.debugVerifyCancellationReentry()
                 photoVaultTraceLaunch(
                     "viewer_cancel_reentry_probe stage=cancelling gate=\(gate) "
-                        + "want=false failures=\(debugReentryProbeFailures)"
+                        + "want=true failures=\(debugReentryProbeFailures)"
                 )
-                assert(!gate, "回弹仍在进行，downward intent 门却已开")
+                assert(gate, "回弹期间封锁下拉仲裁，第二笔下拉会整笔失效")
             case (.cancelling, .idle):
                 if !gate { debugReentryProbeFailures += 1 }
                 photoVaultTraceLaunch(
@@ -895,12 +1199,16 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
         /// UIKit has decided to reverse the pull-down, but the reverse
         /// animation is only starting. The viewer stays on screen — nothing
         /// released by the commit path needs restoring, because nothing was
-        /// released — yet the session is emphatically not idle: the gate that
-        /// lets the pager arbitrate a new pull-down stays shut until
-        /// `dismissTransitionCancelled()`.
-        private func dismissTransitionCancelling() {
+        /// released — yet the session is emphatically not idle. Only direction
+        /// arbitration remains available; programmatic dismissal still waits
+        /// for `dismissTransitionCancelled()`.
+        private func dismissTransitionCancelling(generation: UInt64) {
+            guard generation == activeInteractiveDismissGeneration else {
+                traceDismiss("viewer_dismiss_stale_cancelling generation=\(generation) active=\(String(describing: activeInteractiveDismissGeneration))")
+                return
+            }
             guard dismissalPhase == .interactive else { return }
-            photoVaultTrace("viewer_dismiss_cancelling")
+            traceDismiss("viewer_dismiss_cancelling generation=\(generation)")
             dismissalPhase = .cancelling
         }
 
@@ -1020,6 +1328,7 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             // viewer that nothing can reach.
             restoreViewerInteraction()
             hosted = nil
+            activeInteractiveDismissGeneration = nil
             dismissalPhase = .idle
             generation &+= 1
             ViewerPerformanceTrace.viewerDismissEnd()
@@ -1039,21 +1348,23 @@ struct PhotoViewerPresentationBridge<Viewer: View>: UIViewControllerRepresentabl
             let options = UIViewController.Transition.ZoomOptions()
             options.dimmingColor = .black
             if !reduceMotion {
-                // This closure decides the interaction rather than voting on it:
-                // returning `true` starts a dismissal UIKit itself would not
-                // have begun. Measured on a rightward swipe from the leading
-                // edge, the context reported `willBegin=false velY=0` and an
-                // unconditional `!vetoed` still handed the system recognizer
-                // the touch, so the viewer dismissed instead of paging back.
-                // The veto (zoomed photo panning, page transition in flight) may
-                // only ever deny.
+                // Preserve UIKit's normal decision and vetoes, but allow a
+                // clearly downward pull to grab an in-flight cancellation.
+                // Horizontal/zero velocity alone must never override willBegin.
                 options.interactiveDismissShouldBegin = { context in
+                    let vetoed = state.interactiveDismissVeto?() ?? false
+                    let result = shouldBeginViewerInteractiveDismiss(
+                        willBegin: context.willBegin,
+                        velocityX: context.velocity.dx,
+                        velocityY: context.velocity.dy,
+                        vetoed: vetoed
+                    )
                     photoVaultTrace(
                         "zoom_dismiss_should_begin willBegin=\(context.willBegin) "
-                            + "velY=\(Int(context.velocity.dy))"
+                            + "velX=\(context.velocity.dx) velY=\(context.velocity.dy) "
+                            + "state=\(state.interactiveDismissState.label) vetoed=\(vetoed) result=\(result)"
                     )
-                    let vetoed = state.interactiveDismissVeto?() ?? false
-                    return context.willBegin && !vetoed
+                    return result
                 }
                 // Align the morph with the photo itself (aspect-fit letterbox
                 // excluded) so the zoom grows out of and lands on the image,

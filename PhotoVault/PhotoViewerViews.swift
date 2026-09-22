@@ -350,15 +350,14 @@ private struct ViewerMediaView: View {
 /// Resolves downward intent before the horizontal scroll view starts paging.
 /// This recognizer only arbitrates; UIKit's zoom gesture still owns every pixel
 /// of the dismissal. No replacement scroll-view delegate or failure dependency.
-private final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognizerDelegate {
+final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureRecognizerDelegate {
     weak var pagingPan: UIGestureRecognizer?
     var canReserveDownwardDrag: (() -> Bool)?
-    /// The viewer's live dismissal state. The recognizer stays out of the way
-    /// while a pull-back is still bouncing, because the arbitration itself is
-    /// harmless then but the *reservation* is not: blocking the pager for a
-    /// dismissal UIKit cannot start swallows the whole touch.
+    /// The viewer session's live dismissal state, read on every sampled move.
+    /// UIKit still owns the actual zoom transition.
     weak var transitionState: PhotoViewerTransitionState?
     private var origin: CGPoint?
+    private var didLogGating = false
 
     init(pagingPan: UIGestureRecognizer) {
         self.pagingPan = pagingPan
@@ -369,15 +368,25 @@ private final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureR
         delaysTouchesEnded = false
     }
 
-    /// Whether this touch may reserve the downward direction.
+    /// Whether the pager may give up the downward direction right now.
     ///
-    /// The shared dismissal state is the same value the presentation bridge
-    /// writes, so the pager can never believe the viewer is at rest while the
-    /// bridge is still inside a cancelled transition.
+    /// Live, and re-asked on every sampled move: the gate can flip while the
+    /// finger is still travelling (UIKit finishing a bounce-back being the
+    /// common case). Deciding it once at touch-down is what lost the whole
+    /// gesture, because `.failed` is terminal for that touch sequence.
     private var mayReserveDownwardDrag: Bool {
         guard canReserveDownwardDrag?() == true else { return false }
         guard let transitionState else { return true }
-        return transitionState.canBeginDownwardIntent
+        return transitionState.mayArbitrateDownwardDrag
+    }
+
+    /// Whether this landing finger should be tracked at all.
+    ///
+    /// Deliberately says nothing about the dismissal state: the gate is
+    /// evaluated per move, so a touch that lands during a bounce-back can
+    /// still be reserved once the bounce settles under the finger.
+    private func shouldTrackAtTouchDown(fingers: Int, hasOrigin: Bool) -> Bool {
+        fingers == 1 && !hasOrigin
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
@@ -385,37 +394,155 @@ private final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureR
         // problem; forcing a state here would fight UIKit's reset. Only a
         // fresh cycle may decide anything.
         guard state == .possible else { return }
-        let allowed = mayReserveDownwardDrag
-        let dismissState = transitionState.map { $0.interactiveDismissState.label } ?? "none"
-        let touch = touches.count == 1 && event.allTouches?.count == 1
-            ? touches.first : nil
-        photoVaultTrace(
-            "viewer_downward_intent reserve=\(allowed && touch != nil) "
-                + "dismissState=\(dismissState) fingers=\(event.allTouches?.count ?? -1)"
-        )
-        guard allowed, origin == nil, let touch else {
+        let fingers = event.allTouches?.count ?? 0
+        // Multiple fingers mean pinch/zoom, never a pull-down.
+        guard shouldTrackAtTouchDown(fingers: fingers, hasOrigin: origin != nil),
+              let touch = touches.first else {
             state = .failed
             return
         }
         origin = touch.location(in: view)
+        photoVaultTrace(
+            "viewer_downward_intent began dismissState="
+                + (transitionState?.interactiveDismissState.label ?? "none")
+        )
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
-        guard let origin, let touch = touches.first else { return }
+        guard let touch = touches.first else { return }
+        moveTracking(to: touch.location(in: view))
+    }
+
+    private func moveTracking(to location: CGPoint) {
         if state == .began || state == .changed {
             state = .changed
             return
         }
         guard state == .possible else { return }
-        let location = touch.location(in: view)
+        switch resolution(at: location) {
+        case .hold:
+            break
+        case .gated:
+            // Downward, but the gate is shut. Reported once per touch: this is
+            // the state that replaced "fail the touch", so a device log can
+            // tell a pull-down that is still alive from one that was dropped.
+            guard !didLogGating else { return }
+            didLogGating = true
+            photoVaultTrace(
+                "viewer_downward_intent gated dismissState="
+                    + (transitionState?.interactiveDismissState.label ?? "none")
+            )
+        case .release:
+            // Clearly horizontal or upward: hand the drag to the pager now
+            // rather than sitting on it until the finger lifts.
+            state = .failed
+            photoVaultTrace("viewer_downward_intent released to pager")
+        case .reserve:
+            state = .began
+            photoVaultTrace("viewer_downward_intent reserved")
+        }
+    }
+
+    private enum DownwardDecision {
+        /// Movement below the threshold that resolves a direction.
+        case tooClose
+        /// Far enough to have a direction, and that direction is downward.
+        case downward
+        /// Far enough, and the drag is leaving the pull-down (horizontal/up).
+        case away
+        /// No origin recorded, so nothing may be concluded.
+        case undecided
+    }
+
+    private func decision(at location: CGPoint) -> DownwardDecision {
+        guard let origin else { return .undecided }
         let dx = location.x - origin.x
         let dy = location.y - origin.y
-        guard hypot(dx, dy) >= 6 else { return }
-        // A slightly diagonal pull remains a dismissal. Clearly horizontal
+        guard hypot(dx, dy) >= 6 else { return .tooClose }
+        // A slightly diagonal pull remains a dismissal; clearly horizontal
         // motion and upward drags immediately leave the pager alone.
-        state = dy > 0 && dy >= abs(dx) ? .began : .failed
-        if state == .began { photoVaultTrace("viewer_downward_intent reserved") }
+        return dy > 0 && dy >= abs(dx) ? .downward : .away
     }
+
+    /// What a sampled point means for this touch: direction crossed with the
+    /// live dismissal gate.
+    ///
+    /// `.hold` and `.gated` both keep the recognizer `.possible`, which blocks
+    /// nothing — touches are delivered immediately (`delaysTouchesBegan/Ended`
+    /// are off) and this recognizer can only ever prevent the pager's pan,
+    /// never UIKit's own dismissal gesture. So waiting out the bounce-back
+    /// costs nothing, while failing the touch costs the gesture.
+    private enum DownwardResolution {
+        /// Nothing to conclude from this sample yet.
+        case hold
+        /// Downward, but the gate is shut; keep tracking and re-check.
+        case gated
+        /// Downward and the pager may give up the direction.
+        case reserve
+        /// Not a pull-down; leave the drag to the pager.
+        case release
+    }
+
+    private func resolution(at location: CGPoint) -> DownwardResolution {
+        switch decision(at: location) {
+        case .tooClose, .undecided:
+            return .hold
+        case .away:
+            return .release
+        case .downward:
+            return mayReserveDownwardDrag ? .reserve : .gated
+        }
+    }
+
+    #if DEBUG
+    /// Runs from the bridge's real cancelling phase on the same helpers touch
+    /// delivery uses, over a throwaway state object.
+    ///
+    /// It checks what a pull-down *concludes*. It never drives a recognizer
+    /// through UIKit's state machine: setting `.began` outside live touch
+    /// handling is what crashed the earlier version of this probe.
+    static func debugVerifyCancellationReentry() {
+        let pager = UIPanGestureRecognizer()
+        let intent = ViewerDownwardIntentGesture(pagingPan: pager)
+        // Strong local: `transitionState` is weak, and the probe owns the only
+        // reference to this throwaway session state.
+        let session = PhotoViewerTransitionState(index: 0, assetIdentifier: nil)
+        intent.transitionState = session
+        intent.canReserveDownwardDrag = { true }
+
+        // A second finger lands while UIKit is still bouncing the first back.
+        session.setInteractiveDismissState(.cancelling)
+        assert(intent.shouldTrackAtTouchDown(fingers: 1, hasOrigin: false),
+               "回弹没结束就放弃落指，会让第二笔下拉整笔失效")
+        assert(!intent.shouldTrackAtTouchDown(fingers: 2, hasOrigin: false),
+               "多指是缩放，不参与下拉仲裁")
+        intent.origin = .zero
+        assert(intent.decision(at: CGPoint(x: 1, y: 12)) == .downward,
+               "第二笔下拉必须仍能识别出向下")
+        assert(intent.decision(at: CGPoint(x: 12, y: 1)) == .away,
+               "横向拖动必须交给分页器")
+        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .reserve,
+               "回弹期间的下拉必须仍能占住方向")
+
+        // While the system already owns a drag, or is on its way out, the
+        // recognizer must step aside without failing the touch.
+        session.setInteractiveDismissState(.dragging)
+        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .gated,
+               "系统正在拖动时仲裁器必须让路")
+        session.setInteractiveDismissState(.committed)
+        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .gated,
+               "退出进行中必须让路")
+
+        // The same touch, once the bounce has settled: still reservable.
+        session.setInteractiveDismissState(.idle)
+        assert(intent.resolution(at: CGPoint(x: 2, y: 40)) == .reserve,
+               "回弹结束后，同一笔触摸必须能占住下拉方向")
+
+        assert(intent.canPrevent(pager), "下拉方向不能交给横向分页器")
+        assert(!intent.canPrevent(UIPanGestureRecognizer()), "不得阻止系统退出手势")
+        photoVaultTraceLaunch("viewer_cancel_reentry_tracking passed=true")
+    }
+    #endif
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
         switch state {
@@ -436,6 +563,7 @@ private final class ViewerDownwardIntentGesture: UIGestureRecognizer, UIGestureR
     override func reset() {
         super.reset()
         origin = nil
+        didLogGating = false
         #if DEBUG
         photoVaultTrace("viewer_downward_intent_reset")
         #endif
@@ -600,10 +728,9 @@ private struct NativePhotoPager: UIViewControllerRepresentable {
                 return !self.isZooming && !self.isManualTransitionInProgress
                     && !self.isScrubbing && self.pendingProgrammaticIndex == nil
             }
-            // The bridge's live dismissal state, consulted per touch: while a
-            // pull-back is still bouncing this recognizer must not reserve the
-            // direction, because the system gesture cannot take over yet and
-            // the drag would be claimed by neither.
+            // Keep downward direction arbitration alive during reversal as well.
+            // Failing here hands the second drag to the horizontal pager for
+            // its entire touch sequence, even after the bounce has settled.
             intent.transitionState = transitionState
             scrollView.addGestureRecognizer(intent)
             downwardIntentGesture = intent
