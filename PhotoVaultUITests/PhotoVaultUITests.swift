@@ -128,6 +128,163 @@ final class PhotoViewerDismissUITests: XCTestCase {
         )
     }
 
+    // MARK: - Quick album organization
+
+    private func showAlbumDock(in app: XCUIApplication) {
+        let create = app.buttons["album-dock-create"]
+        if !create.waitForExistence(timeout: 3) {
+            app.buttons["viewer-album-dock-toggle"].tap()
+        }
+        XCTAssertTrue(create.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.tabBars.buttons["图库"].isHittable, "详情页必须隐藏首页标签栏")
+        app.buttons["album-dock-filter-all"].tap()
+    }
+
+    private func dockAlbum(named name: String, in app: XCUIApplication) -> XCUIElement {
+        app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label == %@", "album-dock-album-", name
+        )).firstMatch
+    }
+
+    private func expectMembership(_ value: String, album: XCUIElement) {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true AND value == %@", value), object: album
+        )
+        XCTAssertEqual(XCTWaiter().wait(for: [expectation], timeout: 15), .completed)
+    }
+
+    /// Real PhotoKit writes: create a destination, add another photo without a
+    /// sheet, page back to verify per-photo checks, and retain recents on restart.
+    func testAlbumDockOneTapAddTracksPhotoAndPersistsRecents() throws {
+        let app = launchToGrid()
+        openViewer(at: 0, in: app)
+        showAlbumDock(in: app)
+        let title = "快捷整理-\(UUID().uuidString.prefix(8))"
+        app.buttons["album-dock-create"].tap()
+        let createAlert = app.alerts["新建相册"]
+        XCTAssertTrue(createAlert.waitForExistence(timeout: 5))
+        createAlert.textFields.firstMatch.tap()
+        createAlert.textFields.firstMatch.typeText(title)
+        createAlert.buttons["创建并加入"].tap()
+
+        app.buttons["album-dock-search"].tap()
+        let search = app.textFields["album-dock-search-field"]
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        search.tap()
+        search.typeText(title)
+        // Dismiss the keyboard before paging through the media canvas.
+        search.typeText("\n")
+        let destination = dockAlbum(named: title, in: app)
+        expectMembership("已加入", album: destination)
+
+        let window = app.windows.firstMatch
+        let right = window.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.4))
+        let left = window.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.4))
+        right.press(forDuration: 0.08, thenDragTo: left)
+        expectViewerIndex(2, in: app)
+        expectMembership("未加入", album: destination)
+        destination.tap()
+        expectMembership("已加入", album: destination)
+        XCTAssertFalse(app.navigationBars["添加到相册"].exists, "一点加入不能再弹选择器")
+        destination.tap()
+        expectMembership("已加入", album: destination)
+
+        left.press(forDuration: 0.08, thenDragTo: right)
+        expectViewerIndex(1, in: app)
+        expectMembership("已加入", album: destination)
+        destination.press(forDuration: 1)
+        let pin = app.buttons["设为星标"]
+        XCTAssertTrue(pin.waitForExistence(timeout: 5))
+        pin.tap()
+        XCTAssertTrue(pin.waitForNonExistence(timeout: 5), "选择星标后菜单必须关闭")
+        app.buttons["album-dock-filter-starred"].tap()
+        expectMembership("已加入", album: destination)
+        destination.press(forDuration: 1)
+        app.buttons["从此相册移出"].tap()
+        expectMembership("未加入", album: destination)
+        destination.tap()
+        expectMembership("已加入", album: destination)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "相册快捷栏-星标和归属"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+
+        app.terminate()
+        app.launch()
+        openViewer(at: 0, in: app)
+        showAlbumDock(in: app)
+        app.buttons["album-dock-filter-recent"].tap()
+        expectMembership("已加入", album: dockAlbum(named: title, in: app))
+        app.buttons["album-dock-close"].tap()
+        XCTAssertTrue(app.collectionViews["viewer-filmstrip"].waitForExistence(timeout: 5))
+        app.buttons["viewer-album-dock-toggle"].tap()
+        XCTAssertTrue(app.buttons["album-dock-create"].waitForExistence(timeout: 5))
+    }
+
+    func testAlbumDockFavoriteAndPagingKeepIndependentState() throws {
+        let app = launchToGrid()
+        openViewer(at: 1, in: app)
+        showAlbumDock(in: app)
+        let favorite = app.buttons["viewer-favorite"]
+        let originalLabel = favorite.label
+        favorite.tap()
+        let expectedLabel = originalLabel == "收藏" ? "取消收藏" : "收藏"
+        let changed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@ AND enabled == true", expectedLabel), object: favorite
+        )
+        XCTAssertEqual(XCTWaiter().wait(for: [changed], timeout: 15), .completed)
+        favorite.tap()
+        let restored = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@ AND enabled == true", originalLabel), object: favorite
+        )
+        XCTAssertEqual(XCTWaiter().wait(for: [restored], timeout: 15), .completed)
+        app.buttons["viewer-close"].tap()
+        assertGridIsAlive(after: app)
+    }
+
+    func testUnsortedAlbumDockAddsWithoutLeavingCurrentPhoto() throws {
+        let app = launchToGrid()
+        openViewer(at: 0, in: app)
+        showAlbumDock(in: app)
+        let title = "未整理快捷-\(UUID().uuidString.prefix(8))"
+        app.buttons["album-dock-create"].tap()
+        let createAlert = app.alerts["新建相册"]
+        XCTAssertTrue(createAlert.waitForExistence(timeout: 5))
+        createAlert.textFields.firstMatch.tap()
+        createAlert.textFields.firstMatch.typeText(title)
+        createAlert.buttons["创建并加入"].tap()
+        app.buttons["viewer-close"].tap()
+        XCTAssertTrue(app.buttons["viewer-close"].waitForNonExistence(timeout: 10))
+        XCTAssertTrue(app.tabBars.buttons["图库"].isHittable, "退出详情页应恢复首页标签栏")
+        app.navigationBars.buttons.firstMatch.tap()
+        let unsorted = app.staticTexts["未整理"].firstMatch
+        XCTAssertTrue(unsorted.waitForExistence(timeout: 8))
+        unsorted.tap()
+        let grid = app.collectionViews["unsorted-photo-grid"]
+        XCTAssertTrue(grid.waitForExistence(timeout: 20))
+        let cell = grid.cells["photo-cell-0"]
+        XCTAssertTrue(cell.waitForExistence(timeout: 20))
+        cell.tap()
+        if !app.buttons["viewer-close"].waitForExistence(timeout: 8) { cell.tap() }
+        XCTAssertTrue(app.buttons["viewer-close"].waitForExistence(timeout: 10))
+        showAlbumDock(in: app)
+        app.buttons["album-dock-filter-recent"].tap()
+        let destination = dockAlbum(named: title, in: app)
+        expectMembership("未加入", album: destination)
+        let initialCounter = app.staticTexts["viewer-counter"].label
+        destination.tap()
+        expectMembership("已加入", album: destination)
+        XCTAssertEqual(app.staticTexts["viewer-counter"].label, initialCounter,
+                       "未整理加入相册后应保留当前照片，方便继续整理")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "未整理详情-一点加入"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        app.buttons["viewer-close"].tap()
+        XCTAssertTrue(app.buttons["viewer-close"].waitForNonExistence(timeout: 10))
+        assertGridIsAlive(after: app)
+    }
+
     // MARK: - Dismissal scenarios
 
     /// 打开 A → 点关闭 → 退出；网格仍可交互（关闭按钮路径）。
@@ -188,6 +345,19 @@ final class PhotoViewerDismissUITests: XCTestCase {
         assertGridIsAlive(after: app)
     }
 
+    func testInterruptedViewerIgnoresRetiredSessionCallbacks() throws {
+        let app = launchToGrid(arguments: ["-viewer-session-ownership-probe", "-viewer-cancel-reentry-probe"])
+        app.cells["photo-cell-0"].tap()
+        let status = app.staticTexts["viewer-session-probe"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        let passed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == 'passed'"), object: status)
+        XCTAssertEqual(XCTWaiter().wait(for: [passed], timeout: 5), .completed,
+                       "旧详情页回调不能覆盖新会话：\(status.label)")
+        longPullDown(in: app)
+        XCTAssertTrue(app.buttons["viewer-close"].waitForNonExistence(timeout: 10))
+        assertGridIsAlive(after: app)
+    }
+
     private func longPullDown(in app: XCUIApplication) {
         let window = app.windows.firstMatch
         window.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.35))
@@ -228,6 +398,9 @@ final class PhotoViewerDismissUITests: XCTestCase {
     func testFilmstripScrubThenPullDownStillWorks() {
         let app = launchToGrid()
         openViewer(at: 0, in: app)
+        let dockClose = app.buttons["album-dock-close"]
+        XCTAssertTrue(dockClose.waitForExistence(timeout: 5))
+        dockClose.tap()
         let filmstrip = app.collectionViews["viewer-filmstrip"]
         XCTAssertTrue(filmstrip.waitForExistence(timeout: 10))
         let initial = app.staticTexts["viewer-counter"].label

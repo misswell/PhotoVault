@@ -88,6 +88,15 @@ let state = PhotoViewerTransitionState(
 用户想要哪个会话（`desiredSessionID`）、哪个会话已 commit 正在退（`exposedOutgoingViewer`）、
 导航栈里还有没有 viewer。回调全部按 `sessionID` 归属，迟到的旧回调不会改新会话。
 
+## 动画打断时的会话归属（2026-10-02）
+
+每次 `open` 创建新的 session ID，包括复用同一个请求重开同一张照片。关闭闭包捕获
+该 ID，只能关闭自己的 Viewer。旧页的 `willAppear` / `didAppear`、退出提交与取消回调
+不能覆盖新页的 `currentViewer`、`desiredSessionID` 或网格交互状态。已提交退出的页即使
+在 `popViewController` 内收到迟到的 `didAppear`，也不能重新屏蔽网格。
+
+这些校验只丢弃过期回调；新 push 仍立即执行，没有转场等待队列。
+
 ## 手势归属
 
 `ViewerPagingCollectionView.gestureRecognizerShouldBegin` 是**唯一**的方向仲裁：
@@ -103,7 +112,8 @@ let state = PhotoViewerTransitionState(
 `reserve` / `track`、`canPrevent` / `canBePrevented` 整类删除。分页判定用**累计 translation**
 而不是瞬时 velocity：`gestureRecognizerShouldBegin` 在刚够识别拖动的瞬间执行，慢速或按住再拖的手势
 此时 velocity 近乎噪声（实测同一笔 281pt 的斜向拖动只有 129pt 到达 scroll view，velocity 判定会
-误拒）。翻页提交阈值用 30% 视口宽度（`pagingCommitFraction`）+ 200pt/s 的 flick，对齐系统相册。
+误拒）。起手只有 2–3pt 时也必须使用累计位移，不能回退到速度；只有位移为零时才用速度。
+翻页提交由 `pagingCommitFraction` 和 200pt/s 的 flick 决定。
 
 ## 必须保留的一条 UIKit 兜底
 
@@ -122,7 +132,9 @@ _UIHostingView<AnyView>(enabled=false) -> UIViewControllerWrapperView(enabled=tr
 这就是"连续 4 次没反应、第 5 次突然退出"的来历。
 
 因此 `PhotoViewerNavigator.restoreViewerInteraction(_:)` 在取消回调与 `viewDidAppear`
-两处把 `isUserInteractionEnabled` 恢复为 `true`。它是**把输入还给用户**，不是 gate：
+以及 transition coordinator 的取消动画完成回调三处把 `isUserInteractionEnabled` 恢复为 `true`。
+取消决定发生在回弹结束前，UIKit 仍可能在后续回弹中再次关闭触摸；完成回调补上最后一次恢复，
+且先校验回调属于当前 Viewer，不能影响期间新打开的页。它是**把输入还给用户**，不是 gate：
 事件驱动、无 Timer、无asyncAfter，且只在当前为 `false` 时写入一次。
 
 旧实现里的 `ViewerInteractionContainerView`（覆写 `isUserInteractionEnabled` setter 去拒绝
@@ -157,9 +169,16 @@ viewer_fluid_transition_probe step=… failures=N
 - `-viewer-fluid-transition-probe`（App 内）：走 `navigator.open` / `navigator.close` 的真实入口，
   在 push 动画未结束时 close、在 pop 动画未结束时 open，然后断言导航栈最终只有一个 Viewer。
   它证明**没有 transition gate、没有排队**，不冒充真实手指。
-- `-viewer-cancel-reentry-probe`：`viewer-cancel-count`（DEBUG 隐藏 UILabel）由 transition 自己的
+- `-viewer-session-ownership-probe`：真实 push/pop 打断后，再注入旧页迟到的生命周期、取消、
+  退出和关闭回调，逐项验证新页仍是当前页、网格仍被屏蔽；UI 测试随后用真实下拉退出新页。
+- `-viewer-cancel-reentry-probe`：`viewer-cancel-count`（DEBUG SwiftUI 无触摸状态文本）由 transition 自己的
   取消回调累加，证明每一笔短下拉**真的开始并取消**；`viewer_touch_reachability` 每次
   `viewDidAppear` 用真实 `window.hitTest` 回答"这一下会不会打到 Viewer"。
+
+2026-10-02 验证：旧会话探针在修正前失败，修正后通过；15 项相关模拟器 UI 回归通过，
+包括两组各十轮退出重进、五次实际取消、斜向手势、胶片条、未整理、侧栏及详情幻灯片。
+XCUITest 会等待 App idle，这些结果不能代替真机回弹途中连续下拉的验收。
+当日 BENG 设备显示 unavailable，真机体验仍待确认。
 
 ## NavigationSplitView 隔离的两个实测陷阱
 

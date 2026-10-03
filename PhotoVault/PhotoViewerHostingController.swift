@@ -1,6 +1,54 @@
 import SwiftUI
 import UIKit
 
+/// The detail NavigationStack can sit inside both a split-view navigation
+/// controller and the home TabView. Hide their chrome for the full-screen
+/// viewer, without taking over any navigation delegate or transition.
+@MainActor
+enum PhotoViewerContainerChrome {
+    static func setHidden(_ hidden: Bool, from controller: UIViewController) {
+        var ancestor: UIViewController? = controller
+        while let current = ancestor {
+            if let navigation = current as? UINavigationController {
+                navigation.setNavigationBarHidden(hidden, animated: false)
+            }
+            if let tabs = current as? UITabBarController {
+                tabs.setTabBarHidden(hidden, animated: false)
+            }
+            ancestor = current.parent
+        }
+    }
+}
+
+#if DEBUG
+@MainActor
+final class PhotoViewerDebugStatus: ObservableObject {
+    @Published var cancellationCount = 0
+    @Published var sessionProbe = "pending"
+}
+
+private struct PhotoViewerDebugStatusView: View {
+    @ObservedObject var status: PhotoViewerDebugStatus
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if ProcessInfo.processInfo.arguments.contains("-viewer-cancel-reentry-probe") {
+                Text(String(status.cancellationCount))
+                    .accessibilityIdentifier("viewer-cancel-count")
+            }
+            if ProcessInfo.processInfo.arguments.contains("-viewer-session-ownership-probe") {
+                Text(status.sessionProbe)
+                    .accessibilityIdentifier("viewer-session-probe")
+            }
+        }
+        .font(.system(size: 1))
+        .foregroundStyle(.clear)
+        .frame(width: 1, height: 1)
+        .allowsHitTesting(false)
+    }
+}
+#endif
+
 /// One viewer session, hosted for real UIKit navigation.
 ///
 /// It is a plain `UIHostingController` — no interaction-overriding container,
@@ -30,23 +78,28 @@ final class PhotoViewerHostingController: UIHostingController<AnyView> {
     /// which is what let an overlapping pop→push read the wrong session.
     weak var gridTransitionCoordinator: PhotoGridTransitionCoordinator?
 
+    #if DEBUG
+    let debugStatus: PhotoViewerDebugStatus
+    #endif
+
     init(sessionID: UUID, transitionState: PhotoViewerTransitionState, rootView: AnyView) {
         self.sessionID = sessionID
         self.transitionState = transitionState
+        #if DEBUG
+        let debugStatus = PhotoViewerDebugStatus()
+        self.debugStatus = debugStatus
+        super.init(rootView: AnyView(rootView.overlay(alignment: .topLeading) {
+            PhotoViewerDebugStatusView(status: debugStatus)
+        }))
+        #else
         super.init(rootView: rootView)
+        #endif
         // Opaque black so the aspect-fit letterbox reads as a black canvas at
         // rest: the transition's dimming only covers the animated/interactive
         // phases, so a clear background would show the grid through it.
         view.backgroundColor = .black
         // The viewer is full-screen and owns its own top bar.
         hidesBottomBarWhenPushed = true
-    }
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        #if DEBUG
-        installCancellationCounter()
-        #endif
     }
 
     @available(*, unavailable)
@@ -62,26 +115,8 @@ final class PhotoViewerHostingController: UIHostingController<AnyView> {
     /// this counter is the evidence that each short pull really ran. It is
     /// incremented by the navigator from the transition's own cancellation
     /// callback — never from a synthetic touch.
-    private let cancellationCounter = UILabel()
-    private(set) var cancellationCount = 0
-
     func reportInteractiveDismissCancelled() {
-        cancellationCount += 1
-        cancellationCounter.text = String(cancellationCount)
-    }
-
-    private func installCancellationCounter() {
-        guard ProcessInfo.processInfo.arguments.contains("-viewer-cancel-reentry-probe")
-        else { return }
-        cancellationCounter.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
-        cancellationCounter.textColor = .clear
-        cancellationCounter.text = "0"
-        // A live 1x1 view at the top-left would swallow one point of touch and
-        // skew exactly the gesture tests this counter exists for.
-        cancellationCounter.isUserInteractionEnabled = false
-        cancellationCounter.isAccessibilityElement = true
-        cancellationCounter.accessibilityIdentifier = "viewer-cancel-count"
-        view.addSubview(cancellationCounter)
+        debugStatus.cancellationCount += 1
     }
     #endif
 

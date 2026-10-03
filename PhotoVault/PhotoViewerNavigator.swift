@@ -92,15 +92,18 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
             return
         }
 
+        // A request may be reused (e.g. reopen the same photo). Its identity is
+        // not the identity of a controller whose callbacks can still arrive.
+        let sessionID = UUID()
         let state = PhotoViewerTransitionState(
-            sessionID: request.id,
+            sessionID: sessionID,
             index: request.index,
             assetIdentifier: request.assetIdentifier
         )
         let viewer = PhotoViewerHostingController(
-            sessionID: request.id,
+            sessionID: sessionID,
             transitionState: state,
-            rootView: makeRootView(state, { [weak self] in self?.close() })
+            rootView: makeRootView(state, { [weak self] in self?.close(sessionID: sessionID) })
         )
         viewer.viewerNavigator = self
         viewer.gridTransitionCoordinator = gridTransitionCoordinator
@@ -114,7 +117,7 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
         )
         self.gridTransitionCoordinator = gridTransitionCoordinator
         currentViewer = viewer
-        desiredSessionID = request.id
+        desiredSessionID = sessionID
         setGridInteractionBlocked(true)
         photoVaultTraceLaunch("viewer_nav_push_requested \(state.debugLabel)")
         navigationController.pushViewController(
@@ -133,10 +136,11 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
     /// Pop the viewer the user is asking to close. Programmatic exits (close
     /// button, 移出相册) are not cancellable, so the grid is released right away
     /// and the rest of the zoom-out plays over a live grid.
-    func close() {
+    func close(sessionID: UUID? = nil) {
         guard let navigationController else { return }
         guard let viewer = currentViewer,
-              navigationController.viewControllers.contains(where: { $0 === viewer })
+              navigationController.topViewController === viewer,
+              sessionID == nil || sessionID == viewer.sessionID
         else {
             photoVaultTraceLaunch("viewer_nav_pop_ignored reason=no-viewer-on-stack")
             reconcileGridInteraction()
@@ -153,11 +157,15 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
     // MARK: - Viewer lifecycle (forwarded by PhotoViewerHostingController)
 
     func viewerWillAppear(_ viewer: PhotoViewerHostingController) {
+        guard exposedOutgoingViewer !== viewer,
+              desiredSessionID == viewer.sessionID
+                || (desiredSessionID == nil && navigationController?.topViewController === viewer)
+        else { return }
         // The viewer carries its own top bar (关闭 / 信息 / 全屏), so UIKit's has
         // to go. `animated: false` on purpose: animating the bar while the zoom
         // transition runs fights it for the same run-loop frames. The grid gets
         // the bar back from its own anchor's `viewWillAppear`.
-        viewer.navigationController?.setNavigationBarHidden(true, animated: false)
+        PhotoViewerContainerChrome.setHidden(true, from: viewer)
     }
 
     func viewerIsAppearing(_ viewer: PhotoViewerHostingController) {
@@ -168,8 +176,20 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
 
     /// The viewer has settled on screen (or came back from a cancelled pull).
     func viewerDidAppear(_ viewer: PhotoViewerHostingController) {
+        // During an interrupted push UIKit can finish A's appearance inside
+        // popViewController. A has already committed its exit at that point.
+        // Later A callbacks also must not take ownership away from B.
+        guard navigationController?.topViewController === viewer,
+              exposedOutgoingViewer !== viewer,
+              desiredSessionID == nil || desiredSessionID == viewer.sessionID
+        else {
+            photoVaultTraceLaunch("viewer_appearance_ignored \(viewer.transitionState.debugLabel)")
+            return
+        }
+        PhotoViewerContainerChrome.setHidden(true, from: viewer)
         exposedOutgoingViewer = nil
         currentViewer = viewer
+        desiredSessionID = viewer.sessionID
         // Covers the bounce-back that ends without a cancellation callback.
         restoreViewerInteraction(viewer)
         reconcileGridInteraction()
@@ -234,6 +254,20 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
                 }
             }
         }
+        // The decision callback runs BEFORE the bounce finishes. UIKit can
+        // write interaction=false again during that bounce. Repair once more
+        // at its real completion, without delaying or gating a new gesture.
+        transitionCoordinator.animate(alongsideTransition: nil) { [weak self, weak viewer] context in
+            MainActor.assumeIsolated {
+                guard context.isCancelled, let self, let viewer,
+                      self.ownsInteractivePop(viewer) else { return }
+                self.restoreViewerInteraction(viewer)
+                photoVaultTraceLaunch("viewer_pop_cancel_completed \(viewer.transitionState.debugLabel)")
+                #if DEBUG
+                self.debugTraceTouchReachability(stage: "cancelCompleted")
+                #endif
+            }
+        }
     }
 
     func viewerDidDisappear(_ viewer: PhotoViewerHostingController) {
@@ -259,6 +293,12 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
     /// though the viewer is still animating away. This is what lets the user
     /// tap the next photo while the previous zoom-out is playing.
     private func releaseGrid(viewer: PhotoViewerHostingController, interactive: Bool) {
+        guard currentViewer === viewer,
+              desiredSessionID == nil || desiredSessionID == viewer.sessionID
+        else {
+            photoVaultTraceLaunch("viewer_grid_release_ignored \(viewer.transitionState.debugLabel)")
+            return
+        }
         if desiredSessionID == viewer.sessionID {
             desiredSessionID = nil
         }
@@ -278,9 +318,7 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
     /// An interactive pull-down bounced back: the viewer is still on screen, so
     /// the grid must stop taking touches again.
     private func interactivePopCancelled(_ viewer: PhotoViewerHostingController) {
-        guard navigationController?.topViewController === viewer
-                || desiredSessionID == viewer.sessionID
-        else { return }
+        guard ownsInteractivePop(viewer) else { return }
         desiredSessionID = viewer.sessionID
         exposedOutgoingViewer = nil
         setGridInteractionBlocked(true)
@@ -294,6 +332,13 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
             "viewer_pop_interaction_cancelled \(viewer.transitionState.debugLabel)"
         )
         traceStack("popCancelled")
+    }
+
+    /// Callback ownership only: never a condition on starting push/pop input.
+    private func ownsInteractivePop(_ viewer: PhotoViewerHostingController) -> Bool {
+        currentViewer === viewer
+            && (desiredSessionID == nil || desiredSessionID == viewer.sessionID)
+            && (navigationController?.topViewController === viewer || desiredSessionID == viewer.sessionID)
     }
 
     // MARK: - Grid interaction
@@ -394,6 +439,7 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
     #if DEBUG
     private var fluidProbeFailures = 0
     private var didStartFluidProbe = false
+    private var retiredProbeViewer: PhotoViewerHostingController?
     private var lastOpen: (
         request: PhotoViewerRequest,
         makeRootView: (PhotoViewerTransitionState, @escaping () -> Void) -> AnyView
@@ -406,6 +452,7 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
     private func debugRunFluidProbeIfNeeded() {
         guard !didStartFluidProbe,
               ProcessInfo.processInfo.arguments.contains("-viewer-fluid-transition-probe")
+                || ProcessInfo.processInfo.arguments.contains("-viewer-session-ownership-probe")
         else { return }
         didStartFluidProbe = true
         photoVaultTraceLaunch("viewer_fluid_transition_probe step=push_started failures=\(fluidProbeFailures)")
@@ -425,6 +472,7 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
             "viewer_fluid_transition_probe step=interrupt_open \(viewer.transitionState.debugLabel) "
                 + "stack=\(stackDescription())"
         )
+        retiredProbeViewer = viewer
         // Close while the zoom-in is still playing. If a transition gate
         // existed, this would be swallowed and the viewer would survive.
         close()
@@ -467,6 +515,41 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
                 + "stack=\(stackDescription()) failures=\(fluidProbeFailures)"
         )
         debugCheckStackInvariant()
+        debugVerifyRetiredSessionCallbacks()
+    }
+
+    /// Exercises deliberately late callbacks against the real mounted stack.
+    /// It is a lifecycle-order probe, not a simulated finger or animation.
+    private func debugVerifyRetiredSessionCallbacks() {
+        defer { retiredProbeViewer = nil }
+        guard ProcessInfo.processInfo.arguments.contains("-viewer-session-ownership-probe"),
+              let retired = retiredProbeViewer,
+              let active = navigationController?.topViewController as? PhotoViewerHostingController,
+              active !== retired else { return }
+        var failures = 0
+        func verify(_ step: String) {
+            let passed = currentViewer === active
+                && desiredSessionID == active.sessionID
+                && isGridInteractionBlocked
+                && navigationController?.topViewController === active
+                && retired.sessionID != active.sessionID
+            if !passed { failures += 1 }
+            photoVaultTraceLaunch("viewer_session_probe step=\(step) passed=\(passed)")
+        }
+        verify("before_retired_callbacks")
+        viewerWillAppear(retired)
+        verify("retired_willAppear")
+        viewerDidAppear(retired)
+        verify("retired_didAppear")
+        releaseGrid(viewer: retired, interactive: false)
+        verify("retired_release")
+        interactivePopCancelled(retired)
+        verify("retired_cancel")
+        viewerDidDisappear(retired)
+        verify("retired_didDisappear")
+        close(sessionID: retired.sessionID)
+        verify("retired_close")
+        active.debugStatus.sessionProbe = failures == 0 ? "passed" : "failed \(failures)"
     }
 
     /// The stack may never accumulate viewers: every pop must actually leave the
@@ -622,7 +705,11 @@ final class PhotoViewerNavigationAnchorController: UIViewController {
         super.viewWillAppear(animated)
         attachIfPossible()
         // The grid is on screen again: give it back UIKit's navigation bar.
-        navigationController?.setNavigationBarHidden(false, animated: false)
+        // An underlying SwiftUI anchor may reappear while a new viewer is
+        // already being pushed. Its lifecycle must not reveal home chrome.
+        if navigator?.isGridInteractionBlocked != true {
+            PhotoViewerContainerChrome.setHidden(false, from: self)
+        }
     }
 
     override func viewIsAppearing(_ animated: Bool) {

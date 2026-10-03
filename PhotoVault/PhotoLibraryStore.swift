@@ -38,6 +38,15 @@ private func performPhotoLibraryChange(
     }
 }
 
+/// PhotoKit creates the placeholder on its transaction queue and reads it
+/// back on completion. Keep that handoff synchronized under Swift 6.
+private final class CreatedAlbumReference: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identifier: String?
+    func set(_ value: String?) { lock.withLock { identifier = value } }
+    func get() -> String? { lock.withLock { identifier } }
+}
+
 private func requestPhotoLibraryAuthorization(
     completion: @escaping @MainActor (PHAuthorizationStatus) -> Void
 ) {
@@ -151,6 +160,10 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     @Published private(set) var indexErrorMessage: String?
     /// Album identifiers pinned by the user for the grid's quick-add menu.
     @Published private(set) var quickAlbumIDs: [String] = []
+    /// Most recently used destinations, shared by every quick-add entry point.
+    @Published private(set) var recentAlbumIDs: [String] = []
+    @Published private(set) var albumMembershipRevision = 0
+    private static let recentAlbumStorageKey = "PhotoVault.recentAlbumIDs.v1"
     /// Asset identifiers queued for deferred deletion. The assets remain in
     /// PhotoKit until the user explicitly empties the recycle bin. The
     /// parallel Set keeps `isInRecycleBin` O(1) for the viewer's per-render
@@ -208,6 +221,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         authorizationStatus = cachedStatus ?? .notDetermined
         super.init()
         loadQuickAlbumIDs()
+        recentAlbumIDs = UserDefaults.standard.stringArray(forKey: Self.recentAlbumStorageKey) ?? []
         loadRecycleBinIDs()
         photoVaultTraceLaunch(
             "store init done seeded=\(cachedStatus != nil) "
@@ -696,6 +710,30 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         quickAlbumIDs.contains(id)
     }
 
+    /// One containment query for the displayed photo, never a scan of each
+    /// album's members. PhotoKit's synchronous XPC work stays off the UI thread.
+    func albumMembershipIDs(for asset: PHAsset) async -> Set<String> {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let result = PHAssetCollection.fetchAssetCollectionsContaining(
+                    asset, with: .album, options: nil
+                )
+                var ids = Set<String>()
+                result.enumerateObjects { collection, _, _ in
+                    ids.insert(collection.localIdentifier)
+                }
+                continuation.resume(returning: ids)
+            }
+        }
+    }
+
+    private func recordRecentAlbum(_ id: String) {
+        recentAlbumIDs.removeAll { $0 == id }
+        recentAlbumIDs.insert(id, at: 0)
+        recentAlbumIDs = Array(recentAlbumIDs.prefix(24))
+        UserDefaults.standard.set(recentAlbumIDs, forKey: Self.recentAlbumStorageKey)
+    }
+
     func toggleQuickAlbum(_ id: String) {
         if let index = quickAlbumIDs.firstIndex(of: id) {
             quickAlbumIDs.remove(at: index)
@@ -819,6 +857,8 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             request.addAssets(assets as NSArray)
         }) { [weak self] result in
             if case .success = result {
+                self?.recordRecentAlbum(album.id)
+                self?.albumMembershipRevision &+= 1
                 self?.optimisticallyAddMembership(assets, to: album)
             }
             completion(result)
@@ -838,7 +878,12 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         performPhotoLibraryChange({
             guard let request = PHAssetCollectionChangeRequest(for: album.collection) else { return }
             request.removeAssets(assets as NSArray)
-        }, completion: completion)
+        }) { [weak self] result in
+            if case .success = result {
+                self?.albumMembershipRevision &+= 1
+            }
+            completion(result)
+        }
     }
 
     func createAlbum(
@@ -852,14 +897,20 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             return
         }
 
+        let createdAlbum = CreatedAlbumReference()
         performPhotoLibraryChange({
             let request = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(
                 withTitle: trimmedTitle
             )
+            createdAlbum.set(request.placeholderForCreatedAssetCollection.localIdentifier)
             if !assets.isEmpty {
                 request.addAssets(assets as NSArray)
             }
-        }) { result in
+        }) { [weak self] result in
+            if case .success = result {
+                if let id = createdAlbum.get() { self?.recordRecentAlbum(id) }
+                self?.albumMembershipRevision &+= 1
+            }
             completion(result)
         }
     }
@@ -897,9 +948,17 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         _ asset: PHAsset,
         completion: @escaping @MainActor (Result<Void, Error>) -> Void = { _ in }
     ) {
+        setFavorite(!asset.isFavorite, for: asset, completion: completion)
+    }
+
+    func setFavorite(
+        _ favorite: Bool,
+        for asset: PHAsset,
+        completion: @escaping @MainActor (Result<Void, Error>) -> Void = { _ in }
+    ) {
         performPhotoLibraryChange({
             let request = PHAssetChangeRequest(for: asset)
-            request.isFavorite = !asset.isFavorite
+            request.isFavorite = favorite
         }) { result in
             completion(result)
         }

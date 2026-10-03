@@ -883,6 +883,9 @@ struct PhotoViewerView: View {
     @State private var slideshowLastRetarget = 0
     @State private var alert: PhotoVaultAlert?
     @StateObject private var neighborPrefetch = ViewerNeighborPrefetch()
+    @AppStorage("PhotoVault.viewer.albumDock.visible") private var isAlbumDockVisible = true
+    @State private var favoriteSavingAssetIDs = Set<String>()
+    @State private var favoriteFeedbackSignal = 0
 
     init(
         assets: ViewerAssets,
@@ -947,6 +950,9 @@ struct PhotoViewerView: View {
                 // area so its buttons remain tappable on iPhone and iPad.
                 .ignoresSafeArea(.container, edges: .all)
 
+                ViewerFavoriteFeedback(trigger: favoriteFeedbackSignal)
+                    .id(currentAsset?.localIdentifier)
+
                 VStack(spacing: 0) {
                         topBar
                             .opacity(chromeOpacity)
@@ -955,7 +961,7 @@ struct PhotoViewerView: View {
                         Spacer()
 
                         VStack(spacing: 0) {
-                            if assets.count > 0 {
+                            if assets.count > 0 && !isAlbumDockVisible {
                                 ViewerFilmstrip(
                                     assets: assets,
                                     currentIndex: $currentIndex,
@@ -973,6 +979,9 @@ struct PhotoViewerView: View {
                                 .padding(.horizontal, 10)
                             }
                             bottomBar
+                            if isAlbumDockVisible {
+                                ViewerAlbumDock(asset: currentAsset, store: store, isVisible: $isAlbumDockVisible)
+                            }
                         }
                         .opacity(chromeOpacity)
                         .offset(y: controlsVisible ? 0 : 24)
@@ -1060,6 +1069,10 @@ struct PhotoViewerView: View {
                 message: Text(alert.message),
                 dismissButton: .default(Text("好"))
             )
+        }
+        .onChange(of: isAlbumDockVisible) { _, _ in
+            // Removing a decelerating filmstrip must release its paging veto.
+            isScrubbingFilmstrip = false
         }
         .onChange(of: currentIndex) { _, newIndex in
             guard assets.count > 0 else { return }
@@ -1221,6 +1234,27 @@ struct PhotoViewerView: View {
         onDismissRequested?()
     }
 
+    private func toggleCurrentFavorite() {
+        guard let asset = currentAsset else { return }
+        let id = asset.localIdentifier
+        guard favoriteSavingAssetIDs.insert(id).inserted else { return }
+        let newValue = !isFavorite
+        store.setFavorite(newValue, for: asset) { result in
+            favoriteSavingAssetIDs.remove(id)
+            switch result {
+            case .success:
+                guard currentAsset?.localIdentifier == id else { return }
+                isFavorite = newValue
+                if newValue {
+                    favoriteFeedbackSignal += 1
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                }
+            case .failure:
+                handle(result)
+            }
+        }
+    }
+
     private func handlePagingChanged(_ paging: Bool) {
         isPaging = paging
     }
@@ -1287,16 +1321,16 @@ struct PhotoViewerView: View {
     private var bottomBar: some View {
         HStack(spacing: 0) {
             viewerBarAction {
-                guard assets.count > 0 else { return }
-                store.toggleFavorite(assets.object(at: currentIndex))
-                isFavorite.toggle()
+                toggleCurrentFavorite()
             } label: {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
                     .symbolRenderingMode(.hierarchical)
                     .contentTransition(.symbolEffect(.replace))
             }
             .animation(.snappy(duration: 0.22), value: isFavorite)
-            .disabled(assets.count == 0)
+            .disabled(currentAsset == nil || favoriteSavingAssetIDs.contains(currentAsset?.localIdentifier ?? ""))
+            .foregroundStyle(isFavorite ? .red : .white)
+            .accessibilityIdentifier("viewer-favorite")
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
 
             Spacer()
@@ -1327,9 +1361,8 @@ struct PhotoViewerView: View {
                 Button {
                     isShowingAlbumPicker = true
                 } label: {
-                    Label("移入相册", systemImage: "folder.badge.plus")
+                    Label("完整相册选择器", systemImage: "folder.badge.plus")
                 }
-
                 if let album, album.kind == .user {
                     Button(role: .destructive) {
                         removeCurrentFromAlbum()
@@ -1338,13 +1371,16 @@ struct PhotoViewerView: View {
                     }
                 }
             } label: {
-                Image(systemName: "folder.badge.plus")
+                Image(systemName: isAlbumDockVisible ? "rectangle.bottomthird.inset.filled" : "folder.badge.plus")
+                    .frame(width: 36, height: 36)
+                    .glassEffect(.regular.interactive(), in: Circle())
                     .frame(width: 46, height: 46)
                     .contentShape(Rectangle())
+            } primaryAction: {
+                isAlbumDockVisible.toggle()
             }
-            .disabled(currentAsset == nil)
-            .accessibilityLabel("管理相册")
-            .glassEffect(.regular.interactive(), in: Circle())
+            .accessibilityLabel(isAlbumDockVisible ? "收起相册快捷栏" : "显示相册快捷栏")
+            .accessibilityIdentifier("viewer-album-dock-toggle")
 
             Spacer()
 
@@ -2717,6 +2753,9 @@ struct IndexedPhotoViewerView: View {
     @State private var slideshowLastAsset: PHAsset?
     @State private var alert: PhotoVaultAlert?
     @StateObject private var neighborPrefetch = ViewerNeighborPrefetch()
+    @AppStorage("PhotoVault.viewer.albumDock.visible") private var isAlbumDockVisible = true
+    @State private var favoriteSavingAssetIDs = Set<String>()
+    @State private var favoriteFeedbackSignal = 0
 
     init(
         title: String,
@@ -2783,6 +2822,9 @@ struct IndexedPhotoViewerView: View {
                 }
                 .ignoresSafeArea(.container, edges: .all)
 
+                ViewerFavoriteFeedback(trigger: favoriteFeedbackSignal)
+                    .id(currentAsset?.localIdentifier)
+
                 VStack(spacing: 0) {
                         topBar
                             .opacity(chromeOpacity)
@@ -2791,7 +2833,7 @@ struct IndexedPhotoViewerView: View {
                         Spacer()
 
                         VStack(spacing: 0) {
-                            if totalCount > 0 {
+                            if totalCount > 0 && !isAlbumDockVisible {
                                 IndexedViewerFilmstrip(
                                     totalCount: totalCount,
                                     store: store,
@@ -2809,6 +2851,9 @@ struct IndexedPhotoViewerView: View {
                                 .padding(.horizontal, 10)
                             }
                             bottomBar
+                            if isAlbumDockVisible {
+                                ViewerAlbumDock(asset: currentAsset, store: store, isVisible: $isAlbumDockVisible)
+                            }
                         }
                         .opacity(chromeOpacity)
                         .offset(y: controlsVisible ? 0 : 24)
@@ -2901,6 +2946,10 @@ struct IndexedPhotoViewerView: View {
                 message: Text(alert.message),
                 dismissButton: .default(Text("好"))
             )
+        }
+        .onChange(of: isAlbumDockVisible) { _, _ in
+            // Removing a decelerating filmstrip must release its paging veto.
+            isScrubbingFilmstrip = false
         }
         .onChange(of: currentAssetID) { _, _ in
             isFavorite = currentAsset?.isFavorite ?? false
@@ -3050,6 +3099,27 @@ struct IndexedPhotoViewerView: View {
         onDismissRequested?()
     }
 
+    private func toggleCurrentFavorite() {
+        guard let asset = currentAsset else { return }
+        let id = asset.localIdentifier
+        guard favoriteSavingAssetIDs.insert(id).inserted else { return }
+        let newValue = !isFavorite
+        store.setFavorite(newValue, for: asset) { result in
+            favoriteSavingAssetIDs.remove(id)
+            switch result {
+            case .success:
+                guard currentAsset?.localIdentifier == id else { return }
+                isFavorite = newValue
+                if newValue {
+                    favoriteFeedbackSignal += 1
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                }
+            case .failure:
+                handle(result)
+            }
+        }
+    }
+
     private func handlePagingChanged(_ paging: Bool) {
         isPaging = paging
     }
@@ -3113,16 +3183,16 @@ struct IndexedPhotoViewerView: View {
     private var bottomBar: some View {
         HStack(spacing: 0) {
             viewerBarAction {
-                guard let currentAsset else { return }
-                store.toggleFavorite(currentAsset)
-                isFavorite.toggle()
+                toggleCurrentFavorite()
             } label: {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
                     .symbolRenderingMode(.hierarchical)
                     .contentTransition(.symbolEffect(.replace))
             }
             .animation(.snappy(duration: 0.22), value: isFavorite)
-            .disabled(currentAsset == nil)
+            .disabled(currentAsset == nil || favoriteSavingAssetIDs.contains(currentAsset?.localIdentifier ?? ""))
+            .foregroundStyle(isFavorite ? .red : .white)
+            .accessibilityIdentifier("viewer-favorite")
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
 
             Spacer()
@@ -3150,16 +3220,19 @@ struct IndexedPhotoViewerView: View {
                 Button {
                     isShowingAlbumPicker = true
                 } label: {
-                    Label("移入相册", systemImage: "folder.badge.plus")
+                    Label("完整相册选择器", systemImage: "folder.badge.plus")
                 }
             } label: {
-                Image(systemName: "folder.badge.plus")
+                Image(systemName: isAlbumDockVisible ? "rectangle.bottomthird.inset.filled" : "folder.badge.plus")
+                    .frame(width: 36, height: 36)
+                    .glassEffect(.regular.interactive(), in: Circle())
                     .frame(width: 46, height: 46)
                     .contentShape(Rectangle())
+            } primaryAction: {
+                isAlbumDockVisible.toggle()
             }
-            .disabled(currentAsset == nil)
-            .accessibilityLabel("移入相册")
-            .glassEffect(.regular.interactive(), in: Circle())
+            .accessibilityLabel(isAlbumDockVisible ? "收起相册快捷栏" : "显示相册快捷栏")
+            .accessibilityIdentifier("viewer-album-dock-toggle")
 
             Spacer()
 

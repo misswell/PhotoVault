@@ -69,9 +69,9 @@ final class ViewerPagingCollectionView: UICollectionView {
     ) -> Bool {
         guard !isMediaZoomed, !isFilmstripScrubbing else { return false }
         let moved = abs(translation.x) + abs(translation.y)
-        // A pan is only decided once something has actually moved; below that
-        // the velocity is a better (if still rough) signal.
-        let (horizontal, vertical) = moved >= 8
+        // UIKit can ask after only 2–3 points. Even then accumulated movement
+        // is reliable; an instantaneous velocity can point the opposite way.
+        let (horizontal, vertical) = moved > 0
             ? (abs(translation.x), abs(translation.y))
             : (abs(velocity.x), abs(velocity.y))
         return horizontal > vertical * 1.05
@@ -121,6 +121,14 @@ final class ViewerPagingCollectionView: UICollectionView {
         }
         assert(slowDrag(tx: -60, ty: 12), "缓慢斜拖只要横向占优就必须翻页")
         assert(!slowDrag(tx: 8, ty: 60), "缓慢纵拖必须留给系统退出手势")
+        assert(!pagerShouldBegin(translation: CGPoint(x: 1, y: 3),
+                                 velocity: CGPoint(x: 500, y: 0),
+                                 isMediaZoomed: false, isFilmstripScrubbing: false),
+               "起手只有几像素的纵拖也不能被横向速度噪声抢走")
+        assert(pagerShouldBegin(translation: CGPoint(x: 3, y: 1),
+                                velocity: CGPoint(x: 0, y: 500),
+                                isMediaZoomed: false, isFilmstripScrubbing: false),
+               "起手只有几像素的横拖也必须按累计位移翻页")
         assert(
             !pagerShouldBegin(
                 velocity: CGPoint(x: 500, y: 20),
@@ -554,9 +562,9 @@ final class ViewerPagingCollectionController: NSObject, UICollectionViewDataSour
     }
 
     /// Fraction of the viewport a slow drag must cover before the page turns.
-    /// Shallower than the default (0.5) and matched to the system viewer, where
-    /// a purposeful drag commits well before half way.
-    static let pagingCommitFraction: CGFloat = 0.3
+    /// Keep this short so a deliberate swipe commits without requiring the
+    /// long travel of UIScrollView's default half-page threshold.
+    static let pagingCommitFraction: CGFloat = 0.06
 
     private func finishPaging() {
         if hasReportedPaging {
