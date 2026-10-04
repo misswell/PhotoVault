@@ -431,6 +431,7 @@ struct PhotoGridView: UIViewRepresentable {
         private var assets: PHFetchResult<PHAsset>
         private var signature: AssetSignature
         private var isActive: Bool
+        private var resumesAfterBackground = false
         private var selectionMode: Bool
         private var selectedIDs: Set<String>
         private var thumbnailSize = CGSize(width: 160, height: 160)
@@ -582,6 +583,8 @@ struct PhotoGridView: UIViewRepresentable {
             )
             NotificationCenter.default.addObserver(self, selector: #selector(handleBecameActive),
                                                    name: UIApplication.didBecomeActiveNotification, object: nil)
+            NotificationCenter.default.addObserver(self, selector: #selector(handleEnteredBackground),
+                                                   name: UIApplication.didEnterBackgroundNotification, object: nil)
 
             DispatchQueue.main.async { [weak self, weak collectionView] in
                 guard let self, let collectionView else { return }
@@ -838,7 +841,15 @@ struct PhotoGridView: UIViewRepresentable {
             return layout.itemSize
         }
 
+        @objc private func handleEnteredBackground() {
+            resumesAfterBackground = true
+            guard let collectionView else { return }
+            for case let cell as PhotoGridCell in collectionView.visibleCells { cell.cancelLoading() }
+        }
+
         @objc private func handleBecameActive() {
+            guard resumesAfterBackground else { return }
+            resumesAfterBackground = false
             guard isActive, let collectionView else { return }
             resumeVisibleCells(in: collectionView)
         }
@@ -1032,6 +1043,16 @@ final class PhotoGridCell: UICollectionViewCell {
     private let videoDurationLabel = UILabel()
 
     private var requestHandle: PhotoRequestHandle?
+    private var requestGeneration = UUID()
+    private var hasFinalImage = false
+#if DEBUG
+    private static let simulatesDegradedFrame = ProcessInfo.processInfo.arguments.contains("-grid-degraded-resume-probe")
+    private var debugLoadCount = 0
+    private func updateResumeProbe() {
+        guard Self.simulatesDegradedFrame else { return }
+        accessibilityValue = "frame=\(imageView.image != nil); loads=\(debugLoadCount); final=\(hasFinalImage)"
+    }
+#endif
     private var representedAsset: PHAsset?
     private var representedIdentifier: String?
     private var representedTargetSize = CGSize.zero
@@ -1127,7 +1148,11 @@ final class PhotoGridCell: UICollectionViewCell {
         selectionMode: Bool,
         isSelected: Bool
     ) {
+        let previousImage = representedIdentifier == asset.localIdentifier && representedTargetSize == targetSize ? imageView.image : nil
+        let previousHadFinalImage = previousImage != nil && hasFinalImage
         cancelRequest()
+        let generation = requestGeneration
+        hasFinalImage = previousHadFinalImage
         representedAsset = asset
         representedIdentifier = asset.localIdentifier
         representedTargetSize = targetSize
@@ -1140,12 +1165,16 @@ final class PhotoGridCell: UICollectionViewCell {
         // There is deliberately no activity indicator here: dozens of
         // recycling cells animating spinners is pure visual noise, and the
         // grid is already prefetched ahead of the viewport.
-        imageView.image = PhotoImageManager.shared.cachedImage(
+        imageView.image = previousImage ?? PhotoImageManager.shared.cachedImage(
             for: asset,
             targetSize: targetSize,
             contentMode: .aspectFill,
             scope: .gridThumbnail
         )
+#if DEBUG
+        debugLoadCount += 1
+        updateResumeProbe()
+#endif
 
         liveBadge.isHidden = !asset.mediaSubtypes.contains(.photoLive)
         videoDurationLabel.isHidden = asset.mediaType != .video
@@ -1187,6 +1216,7 @@ final class PhotoGridCell: UICollectionViewCell {
             guard !cancelled else { return }
             Task { @MainActor [weak self] in
                 guard let self,
+                      self.requestGeneration == generation,
                       self.representedIdentifier == asset.localIdentifier,
                       self.representedTargetSize == targetSize
                 else { return }
@@ -1194,8 +1224,20 @@ final class PhotoGridCell: UICollectionViewCell {
                 // replace an already-shown thumbnail with nothing. No fade:
                 // fast scrolling would otherwise run dozens of simultaneous
                 // opacity animations for no benefit.
-                if let image {
+                if let image, !degraded || !self.hasFinalImage {
                     self.imageView.image = image
+                    if !degraded {
+                        self.hasFinalImage = true
+#if DEBUG
+                        if Self.simulatesDegradedFrame, self.debugLoadCount == 1 {
+                            self.hasFinalImage = false
+                            PhotoImageManager.shared.seedDegradedGridFrame(image, for: asset, targetSize: targetSize)
+                        }
+#endif
+                    }
+#if DEBUG
+                    self.updateResumeProbe()
+#endif
                 }
             }
         }
@@ -1210,7 +1252,7 @@ final class PhotoGridCell: UICollectionViewCell {
         let sameAsset = representedIdentifier == asset.localIdentifier
         let sameTargetSize = representedTargetSize == targetSize
 
-        if sameAsset, sameTargetSize, imageView.image != nil {
+        if sameAsset, sameTargetSize, imageView.image != nil, hasFinalImage {
             setSelection(selectionMode: selectionMode, isSelected: isSelected)
             return
         }
@@ -1257,6 +1299,7 @@ final class PhotoGridCell: UICollectionViewCell {
     }
 
     private func cancelRequest() {
+        requestGeneration = UUID()
         if let requestHandle,
            let representedIdentifier {
             photoVaultTrace(
@@ -1388,6 +1431,7 @@ struct IndexedPhotoGridView: UIViewRepresentable {
         private var totalCount: Int
         private let store: PhotoLibraryStore
         private var isActive: Bool
+        private var resumesAfterBackground = false
         private var selectionMode: Bool
         private var selectedIDs: Set<String>
         private var assetsByIndex: [Int: PHAsset] = [:]
@@ -1539,6 +1583,8 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             )
             NotificationCenter.default.addObserver(self, selector: #selector(handleBecameActive),
                                                    name: UIApplication.didBecomeActiveNotification, object: nil)
+            NotificationCenter.default.addObserver(self, selector: #selector(handleEnteredBackground),
+                                                   name: UIApplication.didEnterBackgroundNotification, object: nil)
 
             DispatchQueue.main.async { [weak self, weak collectionView] in
                 guard let self, let collectionView else { return }
@@ -1878,7 +1924,15 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             }
         }
 
+        @objc private func handleEnteredBackground() {
+            resumesAfterBackground = true
+            guard let collectionView else { return }
+            for case let cell as PhotoGridCell in collectionView.visibleCells { cell.cancelLoading() }
+        }
+
         @objc private func handleBecameActive() {
+            guard resumesAfterBackground else { return }
+            resumesAfterBackground = false
             guard isActive, let collectionView else { return }
             resumeVisibleCells(in: collectionView)
         }

@@ -475,6 +475,12 @@ private final class PhotoRequestScheduler: @unchecked Sendable {
     }
 }
 
+private final class PhotoCachedFrame: @unchecked Sendable {
+    let image: UIImage
+    let isDegraded: Bool
+    init(image: UIImage, isDegraded: Bool) { self.image = image; self.isDegraded = isDegraded }
+}
+
 final class PhotoImageManager {
     static let cacheInvalidatedNotification = Notification.Name("PhotoVault.photoCacheInvalidated")
     // PHCachingImageManager is internally synchronized; all access here is
@@ -484,9 +490,9 @@ final class PhotoImageManager {
     private let manager = PHCachingImageManager()
     private let scheduler: PhotoRequestScheduler
     private let decodeLanes = PhotoDecodeLanes()
-    private let imageCache = NSCache<NSString, UIImage>()
-    private let albumThumbnailCache = NSCache<NSString, UIImage>()
-    private let gridThumbnailCache = NSCache<NSString, UIImage>()
+    private let imageCache = NSCache<NSString, PhotoCachedFrame>()
+    private let albumThumbnailCache = NSCache<NSString, PhotoCachedFrame>()
+    private let gridThumbnailCache = NSCache<NSString, PhotoCachedFrame>()
 
     private init() {
         let physicalMemory = ProcessInfo.processInfo.physicalMemory
@@ -548,7 +554,7 @@ final class PhotoImageManager {
         scheduler = PhotoRequestScheduler(imageManager: manager)
     }
 
-    private func cache(for scope: PhotoImageCacheScope) -> NSCache<NSString, UIImage> {
+    private func cache(for scope: PhotoImageCacheScope) -> NSCache<NSString, PhotoCachedFrame> {
         switch scope {
         case .standard:
             return imageCache
@@ -574,8 +580,15 @@ final class PhotoImageManager {
                 targetSize: targetSize,
                 contentMode: contentMode
             )
-        )
+        )?.image
     }
+
+#if DEBUG
+    func seedDegradedGridFrame(_ image: UIImage, for asset: PHAsset, targetSize: CGSize) {
+        gridThumbnailCache.setObject(PhotoCachedFrame(image: image, isDegraded: true),
+            forKey: imageCacheKey(for: asset, targetSize: targetSize, contentMode: .aspectFill), cost: imageCacheCost(image))
+    }
+#endif
 
     @discardableResult
     func requestImage(
@@ -604,9 +617,12 @@ final class PhotoImageManager {
                 "image cache-hit asset=\(photoVaultShortAssetID(asset.localIdentifier)) "
                     + "priority=\(priority) scope=\(cacheScope)"
             )
-            let handle = PhotoRequestHandle()
-            completion(cachedImage, [PHImageResultIsDegradedKey: false])
-            return handle
+            completion(cachedImage.image, [PHImageResultIsDegradedKey: cachedImage.isDegraded])
+            if !cachedImage.isDegraded {
+                return PhotoRequestHandle(assetIdentifier: asset.localIdentifier, owner: owner)
+            }
+            // A cached low-quality frame is useful immediately, but cannot
+            // complete a request whose high-quality download was cancelled.
         }
 
         photoVaultTrace(
@@ -661,9 +677,10 @@ final class PhotoImageManager {
                     if shouldCacheImage,
                        let preparedImage,
                        !cancelled,
-                       !hasError {
+                       !hasError,
+                       !degraded || cache.object(forKey: cacheKey)?.isDegraded != false {
                         cache.setObject(
-                            preparedImage,
+                            PhotoCachedFrame(image: preparedImage, isDegraded: degraded),
                             forKey: cacheKey,
                             cost: self.imageCacheCost(preparedImage)
                         )

@@ -260,6 +260,38 @@ final class ReferenceWorkflowUITests: XCTestCase {
         XCTAssertTrue(app.buttons["从照片库删除"].exists)
     }
 
+    func testGridResumesDegradedFramesWithoutBlanking() {
+        let app = launch(["-PhotoVault.library.browseMode", "expanded", "-grid-degraded-resume-probe"])
+        let cell = app.collectionViews["photo-grid"].cells["photo-cell-0"]
+        let ready = NSPredicate(format: "value CONTAINS 'frame=true'")
+        expectation(for: ready, evaluatedWith: cell); waitForExpectations(timeout: 15)
+        let before = cell.value as? String
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        let resumedCell = app.collectionViews["photo-grid"].cells["photo-cell-0"]
+        let resumed = NSPredicate(format: "value CONTAINS 'frame=true' AND value CONTAINS 'final=true' AND value != %@", before ?? "")
+        expectation(for: resumed, evaluatedWith: resumedCell); waitForExpectations(timeout: 15)
+        resumedCell.tap()
+        XCTAssertTrue(app.buttons["viewer-close"].waitForExistence(timeout: 10))
+    }
+
+    func testDegradedCacheRefreshesAfterViewerReturns() {
+        let app = launch(["-PhotoVault.library.browseMode", "expanded", "-grid-degraded-resume-probe"])
+        let cell = app.collectionViews["photo-grid"].cells["photo-cell-0"]
+        expectation(for: NSPredicate(format: "value CONTAINS 'frame=true' AND value CONTAINS 'final=false'"), evaluatedWith: cell)
+        waitForExpectations(timeout: 15)
+        let before = cell.value as? String
+        cell.tap()
+        XCTAssertTrue(app.buttons["viewer-close"].waitForExistence(timeout: 10))
+        app.buttons["viewer-close"].tap()
+        let returnedCell = app.collectionViews["photo-grid"].cells["photo-cell-0"]
+        expectation(for: NSPredicate(format: "value CONTAINS 'frame=true' AND value CONTAINS 'final=true' AND value != %@", before ?? ""), evaluatedWith: returnedCell)
+        waitForExpectations(timeout: 15)
+        XCTAssertTrue(returnedCell.isHittable)
+    }
+
     func testMapPanningAndTabReturnReuseAnnotations() {
         let app = launch(["-PhotoVault.library.browseMode", "expanded"])
         XCTAssertTrue(app.tabBars.buttons["地图"].waitForExistence(timeout: 15))
