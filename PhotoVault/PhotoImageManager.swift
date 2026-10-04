@@ -2,6 +2,7 @@ import Foundation
 import Photos
 import AVFoundation
 import UIKit
+import SwiftUI
 
 #if DEBUG
 import os
@@ -210,11 +211,22 @@ private final class PhotoDecodeLanes: @unchecked Sendable {
     }
 }
 
+private struct PhotoRequestOwnerKey: EnvironmentKey { static let defaultValue: UUID? = nil }
+extension EnvironmentValues {
+    var photoRequestOwner: UUID? {
+        get { self[PhotoRequestOwnerKey.self] }
+        set { self[PhotoRequestOwnerKey.self] = newValue }
+    }
+}
+
 /// A cancellable request that may be waiting for a PhotoKit slot or already
 /// running.  The handle deliberately hides PHImageRequestID so callers cannot
 /// accidentally bypass the scheduler when a cell is reused.
 final class PhotoRequestHandle: @unchecked Sendable {
     fileprivate let identifier = UUID()
+    fileprivate let assetIdentifier: String?
+    fileprivate let owner: UUID?
+    init(assetIdentifier: String? = nil, owner: UUID? = nil) { self.assetIdentifier = assetIdentifier; self.owner = owner }
 }
 
 private final class PhotoRequestScheduler: @unchecked Sendable {
@@ -227,7 +239,7 @@ private final class PhotoRequestScheduler: @unchecked Sendable {
 
     private struct PendingRequest {
         let handle: PhotoRequestHandle
-        let priority: PhotoRequestPriority
+        var priority: PhotoRequestPriority
         let sequence: UInt64
         let start: (@escaping () -> Void, @escaping () -> Void) -> PHImageRequestID
     }
@@ -246,6 +258,7 @@ private final class PhotoRequestScheduler: @unchecked Sendable {
     private var pending: [PendingRequest] = []
     private var active: [UUID: ActiveRequest] = [:]
     private var sequence: UInt64 = 0
+    private var viewerAssets: [UUID: String] = [:]
 
     init(imageManager: PHCachingImageManager) {
         self.imageManager = imageManager
@@ -253,16 +266,20 @@ private final class PhotoRequestScheduler: @unchecked Sendable {
 
     func submit(
         priority: PhotoRequestPriority,
+        assetIdentifier: String? = nil,
+        owner: UUID? = nil,
         start: @escaping (@escaping () -> Void, @escaping () -> Void) -> PHImageRequestID
     ) -> PhotoRequestHandle {
-        let handle = PhotoRequestHandle()
+        let handle = PhotoRequestHandle(assetIdentifier: assetIdentifier, owner: owner)
         let boxedStart = SendableBox(value: start)
         stateQueue.async { [weak self] in
             guard let self else { return }
             sequence &+= 1
+            let currentAsset = owner.flatMap { viewerAssets[$0] }
             pending.append(PendingRequest(
                 handle: handle,
-                priority: priority,
+                priority: (priority <= .slideshow && currentAsset != nil && assetIdentifier != nil)
+                    ? (assetIdentifier == currentAsset ? .viewer : .slideshow) : priority,
                 sequence: sequence,
                 start: boxedStart.value
             ))
@@ -274,6 +291,20 @@ private final class PhotoRequestScheduler: @unchecked Sendable {
             drain()
         }
         return handle
+    }
+
+    /// Promote queued work without cancelling/restarting an existing PhotoKit download.
+    func setViewerAsset(_ assetIdentifier: String?, owner: UUID) {
+        stateQueue.async { [weak self] in
+            guard let self else { return }
+            viewerAssets[owner] = assetIdentifier
+            if let assetIdentifier {
+                for index in pending.indices where pending[index].priority <= .slideshow && pending[index].handle.owner == owner {
+                    pending[index].priority = pending[index].handle.assetIdentifier == assetIdentifier ? .viewer : .slideshow
+                }
+            }
+            drain()
+        }
     }
 
     func cancel(_ handle: PhotoRequestHandle?) {
@@ -445,6 +476,7 @@ private final class PhotoRequestScheduler: @unchecked Sendable {
 }
 
 final class PhotoImageManager {
+    static let cacheInvalidatedNotification = Notification.Name("PhotoVault.photoCacheInvalidated")
     // PHCachingImageManager is internally synchronized; all access here is
     // intentionally centralized through this one shared cache owner.
     nonisolated(unsafe) static let shared = PhotoImageManager()
@@ -553,6 +585,7 @@ final class PhotoImageManager {
         deliveryMode: PHImageRequestOptionsDeliveryMode = .opportunistic,
         resizeMode: PHImageRequestOptionsResizeMode = .fast,
         priority: PhotoRequestPriority = .visibleGrid,
+        owner: UUID? = nil,
         isNetworkAccessAllowed: Bool = true,
         cacheResult: Bool = false,
         cacheScope: PhotoImageCacheScope = .standard,
@@ -582,7 +615,7 @@ final class PhotoImageManager {
                 + "network=\(isNetworkAccessAllowed) scope=\(cacheScope)"
         )
 
-        return scheduler.submit(priority: priority) { [weak self] finish, releaseSlot in
+        return scheduler.submit(priority: priority, assetIdentifier: asset.localIdentifier, owner: owner) { [weak self] finish, releaseSlot in
             guard let self else { return PHInvalidImageRequestID }
             let options = PHImageRequestOptions()
             options.deliveryMode = deliveryMode
@@ -643,6 +676,10 @@ final class PhotoImageManager {
                 }
             }
         }
+    }
+
+    func setCurrentViewerAsset(_ identifier: String?, owner: UUID) {
+        scheduler.setViewerAsset(identifier, owner: owner)
     }
 
     func cancel(_ handle: PhotoRequestHandle?) {
@@ -787,7 +824,9 @@ final class PhotoImageManager {
         imageCache.removeAllObjects()
         albumThumbnailCache.removeAllObjects()
         gridThumbnailCache.removeAllObjects()
-        scheduler.cancelRequests(atOrBelow: .viewer)
+        // Preserve visible downloads; cancelling them here strands blank cells.
+        scheduler.cancelRequests(atOrBelow: .nearGrid)
+        NotificationCenter.default.post(name: Self.cacheInvalidatedNotification, object: nil)
     }
 
     /// Frees viewer and grid decode caches when the app leaves the foreground.
@@ -825,10 +864,11 @@ final class PhotoImageManager {
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFit,
         priority: PhotoRequestPriority = .viewer,
+        owner: UUID? = nil,
         isNetworkAccessAllowed: Bool = true,
         completion: @escaping (PHLivePhoto?, [AnyHashable: Any]?) -> Void
     ) -> PhotoRequestHandle {
-        scheduler.submit(priority: priority) { [weak self] finish, releaseSlot in
+        scheduler.submit(priority: priority, assetIdentifier: asset.localIdentifier, owner: owner) { [weak self] finish, releaseSlot in
             guard let self else { return PHInvalidImageRequestID }
             let options = PHLivePhotoRequestOptions()
             options.deliveryMode = .opportunistic
@@ -858,10 +898,11 @@ final class PhotoImageManager {
     func requestPlayerItem(
         for asset: PHAsset,
         priority: PhotoRequestPriority = .viewer,
+        owner: UUID? = nil,
         isNetworkAccessAllowed: Bool = true,
         completion: @escaping (AVPlayerItem?, [AnyHashable: Any]?) -> Void
     ) -> PhotoRequestHandle {
-        scheduler.submit(priority: priority) { [weak self] finish, _ in
+        scheduler.submit(priority: priority, assetIdentifier: asset.localIdentifier, owner: owner) { [weak self] finish, _ in
             guard let self else { return PHInvalidImageRequestID }
             let options = PHVideoRequestOptions()
             options.deliveryMode = .automatic

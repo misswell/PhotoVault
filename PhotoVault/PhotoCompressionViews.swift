@@ -99,7 +99,8 @@ struct PhotoCompressionSheet: View {
         .interactiveDismissDisabled(busy)
         .task {
             if let source = try? await PhotoRenderWorker.shared.render(data: data, recipe: .init(), options: .init(), preview: true) {
-                sourceImage = UIImage(data: source.data)
+                let decoded = await PhotoRenderWorker.shared.displayImage(source.data)
+                guard !Task.isCancelled else { return }; sourceImage = decoded
             }
         }
         .task(id: PhotoCompressionRequest(recipe: recipe, options: options)) {
@@ -112,8 +113,10 @@ struct PhotoCompressionSheet: View {
                 var previewOptions = request.options; previewOptions.maxDimension = 1400
                 let small = try await PhotoRenderWorker.shared.render(data: result.data, recipe: .init(), options: previewOptions, preview: true)
                 try Task.checkCancellation()
+                let decoded = await PhotoRenderWorker.shared.displayImage(small.data)
+                try Task.checkCancellation()
                 guard request == PhotoCompressionRequest(recipe: recipe, options: options) else { return }
-                rendered = result; preparedRequest = request; resultImage = UIImage(data: small.data); rendering = false
+                rendered = result; preparedRequest = request; resultImage = decoded; rendering = false
             } catch is CancellationError {} catch {
                 guard !Task.isCancelled else { return }
                 rendering = false; self.error = error.localizedDescription
@@ -246,7 +249,8 @@ private struct ComparisonAssetView: View {
             do {
                 let data = try await WorkspacePhotoAccess.imageData(asset, original: original)
                 let result = try await PhotoRenderWorker.shared.render(data: data, recipe: .init(), options: .init(), preview: true)
-                try Task.checkCancellation(); image = UIImage(data: result.data)
+                let decoded = await PhotoRenderWorker.shared.displayImage(result.data)
+                try Task.checkCancellation(); image = decoded
             } catch { self.error = error.localizedDescription }
         }
     }

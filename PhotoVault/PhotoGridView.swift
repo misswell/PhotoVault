@@ -580,6 +580,8 @@ struct PhotoGridView: UIViewRepresentable {
                 name: UIApplication.didReceiveMemoryWarningNotification,
                 object: nil
             )
+            NotificationCenter.default.addObserver(self, selector: #selector(handleBecameActive),
+                                                   name: UIApplication.didBecomeActiveNotification, object: nil)
 
             DispatchQueue.main.async { [weak self, weak collectionView] in
                 guard let self, let collectionView else { return }
@@ -836,12 +838,15 @@ struct PhotoGridView: UIViewRepresentable {
             return layout.itemSize
         }
 
+        @objc private func handleBecameActive() {
+            guard isActive, let collectionView else { return }
+            resumeVisibleCells(in: collectionView)
+        }
+
         @objc private func handleMemoryWarning() {
             PhotoImageManager.shared.stopCachingAll()
-            guard let collectionView else { return }
-            for case let cell as PhotoGridCell in collectionView.visibleCells {
-                cell.releaseDecodedImage()
-            }
+            // Keep small visible frames; caches and offscreen assets are released.
+            // Clearing them here leaves blank cells until they are recycled.
         }
 
         private func updateVisibleSelection(in collectionView: UICollectionView) {
@@ -1532,6 +1537,8 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                 name: UIApplication.didReceiveMemoryWarningNotification,
                 object: nil
             )
+            NotificationCenter.default.addObserver(self, selector: #selector(handleBecameActive),
+                                                   name: UIApplication.didBecomeActiveNotification, object: nil)
 
             DispatchQueue.main.async { [weak self, weak collectionView] in
                 guard let self, let collectionView else { return }
@@ -1871,6 +1878,11 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             }
         }
 
+        @objc private func handleBecameActive() {
+            guard isActive, let collectionView else { return }
+            resumeVisibleCells(in: collectionView)
+        }
+
         @objc private func handleMemoryWarning() {
             PhotoImageManager.shared.stopCachingAll()
             guard let collectionView else {
@@ -1879,9 +1891,8 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                 return
             }
 
-            for case let cell as PhotoGridCell in collectionView.visibleCells {
-                cell.releaseDecodedImage()
-            }
+            // Keep small visible frames; caches and offscreen assets are released.
+            // Clearing them here leaves blank cells until they are recycled.
 
             let visiblePages = Set(
                 collectionView.indexPathsForVisibleItems.map { $0.item / pageSize }

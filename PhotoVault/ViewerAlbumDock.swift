@@ -61,6 +61,7 @@ struct ViewerAlbumDock: View {
     }
 
     var body: some View {
+        let albums = displayedAlbums
         VStack(spacing: 0) {
             header
             if isSearching {
@@ -84,7 +85,7 @@ struct ViewerAlbumDock: View {
             }
             ScrollView(.horizontal) {
                 LazyHStack(alignment: .top, spacing: 8) {
-                    ForEach(displayedAlbums) { album in
+                    ForEach(albums) { album in
                         albumButton(album)
                     }
                 }
@@ -94,7 +95,7 @@ struct ViewerAlbumDock: View {
             .scrollIndicators(.hidden)
             .frame(height: 82)
             .overlay {
-                if displayedAlbums.isEmpty {
+                if albums.isEmpty {
                     Text(emptyMessage)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -125,6 +126,8 @@ struct ViewerAlbumDock: View {
                 memberships = []
                 addedAlbumID = nil
             }
+            // A scrub should resolve only its settled/current photo, not every crossed cell.
+            do { try await Task.sleep(for: .milliseconds(120)) } catch { return }
             let result = await store.albumMembershipIDs(for: asset)
             guard !Task.isCancelled, requestedID == displayedAssetID else { return }
             memberships = result

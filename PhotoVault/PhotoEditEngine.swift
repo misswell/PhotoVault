@@ -4,6 +4,7 @@ import CoreImage.CIFilterBuiltins
 import ImageIO
 import Photos
 import UniformTypeIdentifiers
+import UIKit
 
 struct PhotoCrop: Codable, Equatable, Sendable {
     var x: Double = 0
@@ -153,8 +154,15 @@ actor PhotoRenderWorker {
     static let shared = PhotoRenderWorker()
     private let context = CIContext(options: [.cacheIntermediates: false])
 
-    /// All geometry is baked in; ImageIO writes orientation=up plus the source
-    /// EXIF/GPS dictionaries. The preview and final export share this recipe.
+    func displayImage(_ data: Data) -> UIImage? {
+        guard !Task.isCancelled else { return nil }
+        return UIImage(data: data)?.preparingForDisplay()
+    }
+    func write(_ data: Data, to url: URL) throws {
+        try Task.checkCancellation(); try data.write(to: url, options: .atomic)
+    }
+
+    /// All geometry is baked in; ImageIO writes orientation=up plus source EXIF/GPS.
     func render(data: Data, recipe: PhotoEditRecipe, options: PhotoExportOptions, preview: Bool = false) throws -> RenderedPhoto {
         try Task.checkCancellation()
         guard var image = CIImage(data: data, options: [.applyOrientationProperty: true]) else {
@@ -288,7 +296,7 @@ enum PhotoEditSaver {
         try Task.checkCancellation()
         let originalBytes = replace ? Int64((try await WorkspacePhotoAccess.imageData(asset, original: true)).count) : Int64(sourceData.count)
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathExtension(options.format.rawValue)
-        try rendered.data.write(to: url, options: .atomic)
+        try await PhotoRenderWorker.shared.write(rendered.data, to: url)
         defer { try? FileManager.default.removeItem(at: url) }
         let resultID: String
         if replace && !asset.mediaSubtypes.contains(.photoLive) {
@@ -301,7 +309,7 @@ enum PhotoEditSaver {
                 var compatible = options; compatible.format = .jpeg; compatible.quality = 1
                 bytes = try await PhotoRenderWorker.shared.render(data: sourceData, recipe: recipe, options: compatible).data
             } else { bytes = rendered.data }
-            try bytes.write(to: destination)
+            try await PhotoRenderWorker.shared.write(bytes, to: destination)
             output.adjustmentData = PHAdjustmentData(formatIdentifier: "com.misswell.PhotoVault.edit", formatVersion: "1", data: try JSONEncoder().encode(recipe))
             let prepared = PreparedPhotoOutput(value: output)
             try await PHPhotoLibrary.shared().performChanges { @Sendable in

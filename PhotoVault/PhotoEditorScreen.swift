@@ -110,7 +110,8 @@ struct PhotoEditorScreen: View {
                 try Task.checkCancellation()
                 data = value
                 let frame = try await PhotoRenderWorker.shared.render(data: value, recipe: .init(), options: .init(), preview: true)
-                original = UIImage(data: frame.data)
+                let decoded = await PhotoRenderWorker.shared.displayImage(frame.data)
+                try Task.checkCancellation(); original = decoded
                 thumbnailSource = frame.data
             } catch is CancellationError {} catch { self.error = error.localizedDescription }
         }
@@ -121,7 +122,8 @@ struct PhotoEditorScreen: View {
                 isRendering = true
                 let image = try await PhotoRenderWorker.shared.render(data: data, recipe: previewRecipe, options: .init(), preview: true)
                 try Task.checkCancellation()
-                preview = UIImage(data: image.data)
+                let decoded = await PhotoRenderWorker.shared.displayImage(image.data)
+                try Task.checkCancellation(); preview = decoded
                 isRendering = false
             } catch is CancellationError {} catch { isRendering = false; self.error = error.localizedDescription }
         }
@@ -251,7 +253,8 @@ private struct LookThumbnail: View {
                 var options = PhotoExportOptions(); options.maxDimension = 120
                 var recipe = PhotoEditRecipe(); recipe.look = look
                 if let result = try? await PhotoRenderWorker.shared.render(data: data, recipe: recipe, options: options, preview: true), !Task.isCancelled {
-                    image = UIImage(data: result.data)
+                    let decoded = await PhotoRenderWorker.shared.displayImage(result.data)
+                    guard !Task.isCancelled else { return }; image = decoded
                 }
             }
     }

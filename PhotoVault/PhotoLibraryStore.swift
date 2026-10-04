@@ -685,6 +685,22 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         return result
     }
 
+    func assetsAsync(in album: PhotoAlbum) async -> PHFetchResult<PHAsset> {
+        if let cached = albumFetchResults[album.id] { return cached }
+        let requestedRevision = libraryRevision
+        let result: PhotoFetchSnapshot = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let options = PHFetchOptions()
+                options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+                continuation.resume(returning: PhotoFetchSnapshot(result: PHAsset.fetchAssets(in: album.collection, options: options)))
+            }
+        }
+        guard !Task.isCancelled, requestedRevision == libraryRevision else { return result.result }
+        if albumFetchResults.count >= 64 { albumFetchResults.removeAll(keepingCapacity: true) }
+        albumFetchResults[album.id] = result.result
+        return result.result
+    }
+
     /// User albums that currently contain the asset, in the order the flat
     /// album list keeps them. Used by the grid context menu's remove option;
     /// runs a single PhotoKit containment query per call.

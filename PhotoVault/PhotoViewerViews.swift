@@ -359,7 +359,10 @@ private struct LivePhotoAssetViewer: View {
     @State private var livePhoto: PHLivePhoto?
     @State private var requestHandle: PhotoRequestHandle?
     @State private var errorMessage: String?
+    @Environment(\.photoRequestOwner) private var requestOwner
     @State private var loadAttempt = 0
+    @State private var resumesAfterBackground = false
+    @State private var requestGeneration = UUID()
 
     var body: some View {
         ZStack {
@@ -398,13 +401,25 @@ private struct LivePhotoAssetViewer: View {
         .task(id: "\(asset.localIdentifier)-\(loadAttempt)") {
             requestLivePhoto()
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            resumesAfterBackground = true
+            requestGeneration = UUID()
+            PhotoImageManager.shared.cancel(requestHandle); requestHandle = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            guard resumesAfterBackground else { return }
+            resumesAfterBackground = false
+            if livePhoto == nil { loadAttempt += 1 }
+        }
         .onDisappear {
+            requestGeneration = UUID()
             PhotoImageManager.shared.cancel(requestHandle)
             requestHandle = nil
         }
     }
 
     private func requestLivePhoto() {
+        let generation = UUID(); requestGeneration = generation
         PhotoImageManager.shared.cancel(requestHandle)
         livePhoto = nil
         errorMessage = nil
@@ -414,12 +429,13 @@ private struct LivePhotoAssetViewer: View {
             targetSize: targetSize,
             contentMode: contentMode,
             priority: requestPriority,
+            owner: requestOwner,
             isNetworkAccessAllowed: true
         ) { livePhoto, info in
             let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
             let error = info?[PHImageErrorKey] as? Error
             Task { @MainActor in
-                guard !cancelled else { return }
+                guard !cancelled, requestGeneration == generation else { return }
                 if let livePhoto {
                     self.livePhoto = livePhoto
                     self.onReady(true)
@@ -468,7 +484,10 @@ struct VideoAssetViewer: View {
     @State private var player: AVPlayer?
     @State private var requestHandle: PhotoRequestHandle?
     @State private var errorMessage: String?
+    @Environment(\.photoRequestOwner) private var requestOwner
     @State private var loadAttempt = 0
+    @State private var resumesAfterBackground = false
+    @State private var requestGeneration = UUID()
 
     var body: some View {
         ZStack {
@@ -518,15 +537,21 @@ struct VideoAssetViewer: View {
         .onChange(of: appScene.phase) { _, phase in
             if phase == .active {
                 audioSession.resumeAfterBackground()
+                if resumesAfterBackground && player == nil { loadAttempt += 1 }
+                resumesAfterBackground = false
                 player?.play()
             } else {
                 player?.pause()
                 if phase == .background {
+                    resumesAfterBackground = true
+                    requestGeneration = UUID()
+                    PhotoImageManager.shared.cancel(requestHandle); requestHandle = nil
                     audioSession.suspendForBackground()
                 }
             }
         }
         .onDisappear {
+            requestGeneration = UUID()
             PhotoImageManager.shared.cancel(requestHandle)
             requestHandle = nil
             player?.pause()
@@ -535,6 +560,7 @@ struct VideoAssetViewer: View {
     }
 
     private func requestPlayerItem() {
+        let generation = UUID(); requestGeneration = generation
         PhotoImageManager.shared.cancel(requestHandle)
         player?.pause()
         player = nil
@@ -543,12 +569,13 @@ struct VideoAssetViewer: View {
         requestHandle = PhotoImageManager.shared.requestPlayerItem(
             for: asset,
             priority: requestPriority,
+            owner: requestOwner,
             isNetworkAccessAllowed: true
         ) { item, info in
             let cancelled = (info?[PHImageCancelledKey] as? Bool) ?? false
             let error = info?[PHImageErrorKey] as? Error
             Task { @MainActor in
-                guard !cancelled else { return }
+                guard !cancelled, requestGeneration == generation else { return }
                 if let item {
                     let player = AVPlayer(playerItem: item)
                     player.isMuted = self.audioSession.isMuted
@@ -886,7 +913,7 @@ struct PhotoViewerView: View {
     @State private var slideshowLastRetarget = 0
     @State private var alert: PhotoVaultAlert?
     @StateObject private var neighborPrefetch = ViewerNeighborPrefetch()
-    @AppStorage("PhotoVault.viewer.albumDock.visible") private var isAlbumDockVisible = true
+    @AppStorage("PhotoVault.viewer.albumDock.visible.v2") private var isAlbumDockVisible = false
     @State private var favoriteSavingAssetIDs = Set<String>()
     @State private var favoriteFeedbackSignal = 0
 
@@ -1114,6 +1141,9 @@ struct PhotoViewerView: View {
             )
             updateNeighborPrefetch()
         }
+        .onReceive(NotificationCenter.default.publisher(for: PhotoImageManager.cacheInvalidatedNotification)) { _ in neighborPrefetch.stop() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in neighborPrefetch.stop() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in updateNeighborPrefetch() }
         .onDisappear {
             PagerDiagnostics.log(
                 "viewer disappear kind=fetch index=\(currentIndex) dismissing=\(isDismissing)"
@@ -1331,21 +1361,6 @@ struct PhotoViewerView: View {
             .accessibilityLabel("编辑与压缩")
             .accessibilityIdentifier("viewer-edit")
             Spacer()
-            Menu {
-                Button("备注 / 日记", systemImage: "text.bubble") { if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) } }
-                if currentAsset?.mediaType == .image {
-                    Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
-                }
-                Button("从照片库删除", systemImage: "trash", role: .destructive) {
-                    if let currentAsset {
-                        store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
-                    }
-                }
-            } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
-            .glassEffect(.regular.interactive(), in: Circle())
-            .accessibilityLabel("更多照片操作")
-            Spacer()
-
             viewerBarAction {
                 toggleCurrentFavorite()
             } label: {
@@ -1358,28 +1373,6 @@ struct PhotoViewerView: View {
             .foregroundStyle(isFavorite ? .red : .white)
             .accessibilityIdentifier("viewer-favorite")
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
-
-            Spacer()
-
-            viewerBarAction {
-                guard assets.count > 0 else { return }
-                let asset = assets.object(at: currentIndex)
-                if store.isInRecycleBin(asset) {
-                    store.removeFromRecycleBin(asset)
-                } else {
-                    store.addToRecycleBin(asset)
-                }
-            } label: {
-                Image(systemName: assets.count > 0
-                    && store.isInRecycleBin(assets.object(at: currentIndex))
-                    ? "trash.slash"
-                    : "trash")
-            }
-            .disabled(assets.count == 0)
-            .accessibilityLabel(assets.count > 0
-                && store.isInRecycleBin(assets.object(at: currentIndex))
-                ? "移出回收站"
-                : "加入回收站")
 
             Spacer()
 
@@ -1411,17 +1404,6 @@ struct PhotoViewerView: View {
             Spacer()
 
             viewerBarAction {
-                isShowingSlideshowOptions = true
-            } label: {
-                Image(systemName: "play.rectangle")
-            }
-            .disabled(assets.count == 0)
-            .accessibilityLabel("播放幻灯片")
-            .accessibilityIdentifier("viewer-slideshow")
-
-            Spacer()
-
-            viewerBarAction {
                 guard !isPreparingShare, assets.count > 0 else { return }
                 isPreparingShare = true
                 store.requestShareItems(for: [assets.object(at: currentIndex)]) { items, temporaryURLs in
@@ -1442,6 +1424,32 @@ struct PhotoViewerView: View {
                 }
             }
             .disabled(isPreparingShare || assets.count == 0)
+            .accessibilityIdentifier("viewer-share")
+            Spacer()
+            Menu {
+                if let currentAsset {
+                    Button(store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站", systemImage: "trash") {
+                        if store.isInRecycleBin(currentAsset) { store.removeFromRecycleBin(currentAsset) }
+                        else { store.addToRecycleBin(currentAsset) }
+                    }
+                }
+                Button("播放幻灯片", systemImage: "play.rectangle") { isShowingSlideshowOptions = true }
+                    .disabled(currentAsset == nil)
+                    .accessibilityIdentifier("viewer-slideshow")
+                Divider()
+                Button("备注 / 日记", systemImage: "text.bubble") { if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) } }
+                if currentAsset?.mediaType == .image {
+                    Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
+                }
+                Button("从照片库删除", systemImage: "trash", role: .destructive) {
+                    if let currentAsset {
+                        store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
+                    }
+                }
+            } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
+            .glassEffect(.regular.interactive(), in: Circle())
+            .accessibilityLabel("更多照片操作")
+            .accessibilityIdentifier("viewer-more")
         }
         .font(.title3.weight(.medium))
         .foregroundStyle(.white)
@@ -2782,7 +2790,7 @@ struct IndexedPhotoViewerView: View {
     @State private var slideshowLastAsset: PHAsset?
     @State private var alert: PhotoVaultAlert?
     @StateObject private var neighborPrefetch = ViewerNeighborPrefetch()
-    @AppStorage("PhotoVault.viewer.albumDock.visible") private var isAlbumDockVisible = true
+    @AppStorage("PhotoVault.viewer.albumDock.visible.v2") private var isAlbumDockVisible = false
     @State private var favoriteSavingAssetIDs = Set<String>()
     @State private var favoriteFeedbackSignal = 0
 
@@ -3010,6 +3018,9 @@ struct IndexedPhotoViewerView: View {
             )
             updateNeighborPrefetch()
         }
+        .onReceive(NotificationCenter.default.publisher(for: PhotoImageManager.cacheInvalidatedNotification)) { _ in neighborPrefetch.stop() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in neighborPrefetch.stop() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in updateNeighborPrefetch() }
         .onDisappear {
             PagerDiagnostics.log(
                 "viewer disappear kind=indexed index=\(currentIndex) dismissing=\(isDismissing)"
@@ -3219,21 +3230,6 @@ struct IndexedPhotoViewerView: View {
             .accessibilityLabel("编辑与压缩")
             .accessibilityIdentifier("viewer-edit")
             Spacer()
-            Menu {
-                Button("备注 / 日记", systemImage: "text.bubble") { if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) } }
-                if currentAsset?.mediaType == .image {
-                    Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
-                }
-                Button("从照片库删除", systemImage: "trash", role: .destructive) {
-                    if let currentAsset {
-                        store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
-                    }
-                }
-            } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
-            .glassEffect(.regular.interactive(), in: Circle())
-            .accessibilityLabel("更多照片操作")
-            Spacer()
-
             viewerBarAction {
                 toggleCurrentFavorite()
             } label: {
@@ -3246,25 +3242,6 @@ struct IndexedPhotoViewerView: View {
             .foregroundStyle(isFavorite ? .red : .white)
             .accessibilityIdentifier("viewer-favorite")
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
-
-            Spacer()
-
-            viewerBarAction {
-                guard let currentAsset else { return }
-                if store.isInRecycleBin(currentAsset) {
-                    store.removeFromRecycleBin(currentAsset)
-                } else {
-                    store.addToRecycleBin(currentAsset)
-                }
-            } label: {
-                Image(systemName: currentAsset.map {
-                    store.isInRecycleBin($0) ? "trash.slash" : "trash"
-                } ?? "trash")
-            }
-            .disabled(currentAsset == nil)
-            .accessibilityLabel(currentAsset.map {
-                store.isInRecycleBin($0) ? "移出回收站" : "加入回收站"
-            } ?? "加入回收站")
 
             Spacer()
 
@@ -3289,17 +3266,6 @@ struct IndexedPhotoViewerView: View {
             Spacer()
 
             viewerBarAction {
-                isShowingSlideshowOptions = true
-            } label: {
-                Image(systemName: "play.rectangle")
-            }
-            .disabled(currentAsset == nil || store.unsortedCount == 0)
-            .accessibilityLabel("播放幻灯片")
-            .accessibilityIdentifier("viewer-slideshow")
-
-            Spacer()
-
-            viewerBarAction {
                 guard !isPreparingShare, let currentAsset else { return }
                 isPreparingShare = true
                 store.requestShareItems(for: [currentAsset]) { items, temporaryURLs in
@@ -3318,6 +3284,32 @@ struct IndexedPhotoViewerView: View {
                 }
             }
             .disabled(isPreparingShare || currentAsset == nil)
+            .accessibilityIdentifier("viewer-share")
+            Spacer()
+            Menu {
+                if let currentAsset {
+                    Button(store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站", systemImage: "trash") {
+                        if store.isInRecycleBin(currentAsset) { store.removeFromRecycleBin(currentAsset) }
+                        else { store.addToRecycleBin(currentAsset) }
+                    }
+                }
+                Button("播放幻灯片", systemImage: "play.rectangle") { isShowingSlideshowOptions = true }
+                    .disabled(currentAsset == nil)
+                    .accessibilityIdentifier("viewer-slideshow")
+                Divider()
+                Button("备注 / 日记", systemImage: "text.bubble") { if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) } }
+                if currentAsset?.mediaType == .image {
+                    Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
+                }
+                Button("从照片库删除", systemImage: "trash", role: .destructive) {
+                    if let currentAsset {
+                        store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
+                    }
+                }
+            } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
+            .glassEffect(.regular.interactive(), in: Circle())
+            .accessibilityLabel("更多照片操作")
+            .accessibilityIdentifier("viewer-more")
         }
         .font(.title3.weight(.medium))
         .foregroundStyle(.white)
@@ -3467,6 +3459,8 @@ private struct SlideshowAssetPager: View {
         .onChange(of: contentMode.rawValue) { _, _ in
             updatePrefetch()
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in stopPrefetch() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in updatePrefetch() }
         .onDisappear(perform: stopPrefetch)
     }
 
@@ -3665,6 +3659,8 @@ private struct IndexedSlideshowAssetPager: View {
         .onChange(of: contentMode.rawValue) { _, _ in
             updatePrefetch()
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in stopPrefetch() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in updatePrefetch() }
         .onDisappear {
             // Invalidate in-flight page loads before tearing the prefetch
             // window down, so a late completion cannot restart it.

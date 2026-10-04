@@ -12,6 +12,7 @@ enum WorkspaceMediaScope: String, CaseIterable, Identifiable, Sendable {
 actor WorkspaceLibraryQuery {
     static let shared = WorkspaceLibraryQuery()
     func fetch(scope: WorkspaceMediaScope, oldestFirst: Bool, start: Date? = nil, end: Date? = nil) -> PhotoFetchSnapshot {
+        guard !Task.isCancelled else { return PhotoFetchSnapshot(result: PHFetchResult<PHAsset>()) }
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: oldestFirst)]
         if let start, let end {
@@ -33,6 +34,61 @@ actor WorkspaceLibraryQuery {
         case .all: break
         }
         return PhotoFetchSnapshot(result: PHAsset.fetchAssets(with: options))
+    }
+}
+
+/// Identifier queries run off the main actor; only a bounded page is materialized.
+struct WorkspaceAssetBatch: @unchecked Sendable { let assets: [String: PHAsset] }
+actor WorkspaceAssetQuery {
+    static let shared = WorkspaceAssetQuery()
+    func fetch(_ ids: [String]) -> PhotoFetchSnapshot {
+        guard !Task.isCancelled else { return PhotoFetchSnapshot(result: PHFetchResult<PHAsset>()) }
+        return PhotoFetchSnapshot(result: PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil))
+    }
+    func batch(_ ids: [String]) -> WorkspaceAssetBatch {
+        guard !Task.isCancelled else { return WorkspaceAssetBatch(assets: [:]) }
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        var values: [String: PHAsset] = [:]
+        result.enumerateObjects { asset, _, _ in values[asset.localIdentifier] = asset }
+        return WorkspaceAssetBatch(assets: values)
+    }
+    func matchingNotes(_ notes: [String: String], query: String) -> [String] {
+        guard !Task.isCancelled else { return [] }
+        return notes.keys.filter { notes[$0]?.localizedStandardContains(query) == true }.sorted()
+    }
+}
+
+struct WorkspaceIdentifierGrid: View {
+    let title: String
+    let ids: [String]
+    @ObservedObject var store: PhotoLibraryStore
+    @State private var assets: PHFetchResult<PHAsset>?
+    var body: some View {
+        PhotoGridScreen(title: title, assets: assets, store: store)
+            .task(id: WorkspaceIdentifierRequest(ids: ids, revision: store.libraryRevision)) {
+                let result = await WorkspaceAssetQuery.shared.fetch(ids)
+                guard !Task.isCancelled else { return }
+                assets = result.result
+            }
+    }
+}
+struct WorkspaceIdentifierRequest: Equatable { let ids: [String]; let revision: Int }
+
+/// Lazy rows resolve once when visible, rather than synchronously during body.
+struct WorkspaceIdentifierThumbnail: View {
+    let id: String
+    var revision: Int = 0
+    @State private var asset: PHAsset?
+    var body: some View {
+        Color(uiColor: .secondarySystemFill).overlay {
+            if let asset, asset.localIdentifier == id { WorkspaceThumbnail(asset: asset) }
+        }
+        .task(id: WorkspaceIdentifierRequest(ids: [id], revision: revision)) {
+            do { try await Task.sleep(for: .milliseconds(60)) } catch { return }
+            let result = await WorkspaceAssetQuery.shared.fetch([id])
+            guard !Task.isCancelled else { return }
+            asset = result.result.firstObject
+        }
     }
 }
 
@@ -109,8 +165,8 @@ struct LibraryTimelineContent: View {
                         VStack(alignment: .leading, spacing: 8) {
                             NavigationLink { LibraryPeriodScreen(period: period, store: store, scope: scope, oldestFirst: oldestFirst) } label: {
                                 VStack(alignment: .leading, spacing: 8) {
-                                    if let id = period.previews.first, let asset = WorkspacePhotoAccess.asset(id) {
-                                        WorkspaceThumbnail(asset: asset).frame(height: 100).clipShape(RoundedRectangle(cornerRadius: 14))
+                                    if let id = period.previews.first {
+                                        WorkspaceIdentifierThumbnail(id: id, revision: store.libraryRevision).frame(height: 100).clipShape(RoundedRectangle(cornerRadius: 14))
                                     }
                                     Text(period.start.formatted(mode == .years ? .dateTime.year() : .dateTime.year().month())).font(.headline)
                                     Text("\(period.count.formatted()) 项").font(.caption).foregroundStyle(.secondary)
@@ -129,11 +185,9 @@ struct LibraryTimelineContent: View {
                             }.accessibilityIdentifier("timeline-period")
                             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 3), count: 3), spacing: 3) {
                                 ForEach(period.previews, id: \.self) { id in
-                                    if let asset = WorkspacePhotoAccess.asset(id) {
-                                        NavigationLink { LibraryPeriodScreen(period: period, store: store, scope: scope, oldestFirst: oldestFirst) } label: {
-                                            WorkspaceThumbnail(asset: asset).frame(height: 100)
+                                    NavigationLink { LibraryPeriodScreen(period: period, store: store, scope: scope, oldestFirst: oldestFirst) } label: {
+                                            WorkspaceIdentifierThumbnail(id: id, revision: store.libraryRevision).frame(height: 100)
                                         }
-                                    }
                                 }
                             }.clipShape(RoundedRectangle(cornerRadius: 12))
                             if mode == .journal {

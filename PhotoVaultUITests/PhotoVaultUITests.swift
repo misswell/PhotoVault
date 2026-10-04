@@ -458,6 +458,10 @@ final class PhotoViewerDismissUITests: XCTestCase {
 
     func testZoomedPhotoPanDoesNotDismiss() throws {
         let app = launchToGrid()
+        // Earlier export tests can leave a new video at index 0. Exercise a
+        // photo's zoom recognizer rather than a video's dismiss gesture.
+        app.buttons["筛选与排序"].tap()
+        app.buttons["照片"].firstMatch.tap()
         openViewer(at: 0, in: app)
         app.pinch(withScale: 2, velocity: 1)
         let window = app.windows.firstMatch
@@ -995,6 +999,7 @@ final class SlideshowOptionsUITests: XCTestCase {
     ) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments += [
+            "-PhotoVault.library.browseMode", "expanded",
             "-PhotoVault.slideshow.interval", interval,
             "-PhotoVault.slideshow.fillsScreen", "NO",
             "-PhotoVault.slideshow.shuffles", "NO",
@@ -1124,6 +1129,7 @@ final class SlideshowOptionsUITests: XCTestCase {
         XCTAssertTrue(firstCell.waitForExistence(timeout: 20))
         firstCell.tap()
 
+        app.buttons["viewer-more"].tap()
         let slideshowButton = app.buttons["viewer-slideshow"]
         XCTAssertTrue(waitUntilHittable(slideshowButton, timeout: 15), "详情页应有播放幻灯片按钮")
         slideshowButton.tap()
@@ -1154,6 +1160,7 @@ final class SlideshowOptionsUITests: XCTestCase {
             interval: "3",
             extraArguments: ["-PhotoVault.slideshow.contentFilter", "all"]
         )
+        app.buttons["viewer-more"].tap()
         let slideshowButton = app.buttons["viewer-slideshow"]
         XCTAssertTrue(waitUntilHittable(slideshowButton, timeout: 15), "未整理详情页应有播放按钮")
         slideshowButton.tap()
@@ -1196,6 +1203,7 @@ final class SlideshowOptionsUITests: XCTestCase {
             return
         }
 
+        app.buttons["viewer-more"].tap()
         let slideshowButton = app.buttons["viewer-slideshow"]
         XCTAssertTrue(
             waitUntilHittable(slideshowButton, timeout: 5),
@@ -1226,6 +1234,7 @@ final class SlideshowOptionsUITests: XCTestCase {
     func testUnsortedDetailSlideshowHonoursContentFilter() {
         let app = openUnsortedViewer()
 
+        app.buttons["viewer-more"].tap()
         let slideshowButton = app.buttons["viewer-slideshow"]
         XCTAssertTrue(
             waitUntilHittable(slideshowButton, timeout: 5),

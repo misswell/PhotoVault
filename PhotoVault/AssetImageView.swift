@@ -17,6 +17,8 @@ struct AssetImageView: View {
     /// full-screen rectangle — back into its grid cell.
     let canvasBackground: Color?
 
+    @Environment(\.photoRequestOwner) private var requestOwner
+    @State private var resumesAfterBackground = false
     @State private var image: UIImage?
     @State private var requestHandle: PhotoRequestHandle?
     @State private var loadProgress: Double?
@@ -137,7 +139,17 @@ struct AssetImageView: View {
         // with every swipe; re-keying the task on that made each swipe cancel
         // an in-flight full-size PhotoKit request and issue an identical one.
         .task(id: "\(requestKey)-\(loadAttempt)") {
+            guard UIApplication.shared.applicationState != .background else { resumesAfterBackground = true; return }
             loadImage()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            resumesAfterBackground = true
+            cancelImageRequest()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            guard resumesAfterBackground else { return }
+            resumesAfterBackground = false
+            loadAttempt += 1
         }
         .onDisappear {
             cancelImageRequest()
@@ -146,7 +158,7 @@ struct AssetImageView: View {
 
     private func loadImage() {
         cancelImageRequest()
-        let requestKey = self.requestKey
+        let requestKey = "\(self.requestKey)-\(UUID().uuidString)"
         let isSameAsset = displayedAssetIdentifier == asset.localIdentifier
         displayedAssetIdentifier = asset.localIdentifier
         activeRequestKey = requestKey
@@ -187,6 +199,7 @@ struct AssetImageView: View {
             targetSize: targetSize,
             contentMode: contentMode,
             priority: requestPriority,
+            owner: requestOwner,
             cacheResult: cacheResult,
             cacheScope: cacheScope,
             progressHandler: { progress, error, _, _ in
@@ -359,6 +372,7 @@ struct ZoomableAssetView: View {
                 targetSize: targetSize,
                 contentMode: contentMode,
                 requestPriority: requestPriority,
+                usesPhotoKitCaching: false,
                 initialImage: initialImage,
                 onLoadStateChange: onLoadStateChange,
                 canvasBackground: canvasBackground

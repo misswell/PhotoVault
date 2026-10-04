@@ -225,7 +225,8 @@ final class PhotoCleanupModel: ObservableObject {
             defer { running = false; task = nil }
             do {
                 let snapshot = try await PhotoCleanupWorker.shared.scan(result) { [weak self] count, total in
-                    await MainActor.run { self?.processed = count; self?.total = total }
+                    guard !Task.isCancelled else { return }
+                    await MainActor.run { guard self?.running == true else { return }; self?.processed = count; self?.total = total }
                 }
                 let projection = await CleanupProjectionWorker.shared.project(snapshot)
                 try Task.checkCancellation()
@@ -278,11 +279,12 @@ struct PhotoCleanupScreen: View {
                         NavigationLink { CleanupStatisticsScreen(projection: projection) } label: { Label("每日空间统计 / 文件大小分布", systemImage: "chart.bar") }
                         NavigationLink { WorkspaceAlbumBrowser(store: store) } label: { Label("按相册清理", systemImage: "rectangle.stack") }
                         NavigationLink { RandomDayWorkspace(store: store) } label: { Label("随机整理某天", systemImage: "dice") }
-                        NavigationLink { EmptyAlbumScreen(store: store) } label: { Label("空相册和文件夹", systemImage: "rectangle.stack.badge.minus") }
+                        NavigationLink { EmptyAlbumScreen(store: store) } label: { Label("空相册和文件夹", systemImage: "folder.badge.minus") }
                     }
                 }
                 Section { NavigationLink { CompressionHistoryScreen(store: store) } label: { Label("压缩记录与对比", systemImage: "rectangle.split.2x1") } }
             }
+            .labelStyle(.titleAndIcon)
             .navigationTitle("清理相册")
             .task { await model.load() }
             .onChange(of: scene.phase) { _, value in if value == .background { model.stop() } }
@@ -303,9 +305,9 @@ private struct CleanupGroupList: View {
             Text("相似度仅用于发现候选；打开每组查看并选择要删除的照片。系统不会自动选择或删除原片。").font(.footnote).foregroundStyle(.secondary)
             ForEach(Array(groups.enumerated()), id: \.offset) { index, ids in
                 NavigationLink {
-                    PhotoGridScreen(title: "\(title) · 第 \(index + 1) 组", assets: PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil), store: store)
+                    WorkspaceIdentifierGrid(title: "\(title) · 第 \(index + 1) 组", ids: ids, store: store)
                 } label: {
-                    HStack { ForEach(Array(ids.prefix(4)), id: \.self) { id in if let asset = WorkspacePhotoAccess.asset(id) { WorkspaceThumbnail(asset: asset).frame(width: 55, height: 55).clipShape(RoundedRectangle(cornerRadius: 7)) } }; Spacer(); Text("\(ids.count) 项") }
+                    HStack { ForEach(Array(ids.prefix(4)), id: \.self) { id in WorkspaceIdentifierThumbnail(id: id, revision: store.libraryRevision).frame(width: 55, height: 55).clipShape(RoundedRectangle(cornerRadius: 7)) }; Spacer(); Text("\(ids.count) 项") }
                 }
             }
         }.navigationTitle(title)
@@ -321,20 +323,28 @@ private struct CleanupAssetList: View {
     @State private var page = 0
     private let pageSize = 200
     @State private var sorted: [ScannedMedia] = []
+    @State private var pageAssets: [String: PHAsset] = [:]
+    private var current: [ScannedMedia] { Array(sorted.dropFirst(page * pageSize).prefix(pageSize)) }
     var body: some View {
         List {
-            let current = Array(sorted.dropFirst(page * pageSize).prefix(pageSize))
-            NavigationLink("选择 / 压缩 / 删除这一页") { PhotoGridScreen(title: title, assets: PHAsset.fetchAssets(withLocalIdentifiers: current.map(\.id), options: nil), store: store) }
+            NavigationLink("选择 / 压缩 / 删除这一页") { WorkspaceIdentifierGrid(title: title, ids: current.map(\.id), store: store) }
             ForEach(current) { item in
-                if let asset = WorkspacePhotoAccess.asset(item.id) {
-                    NavigationLink { PhotoGridScreen(title: title, assets: PHAsset.fetchAssets(withLocalIdentifiers: [item.id], options: nil), store: store) } label: {
+                if let asset = pageAssets[item.id] {
+                    NavigationLink { WorkspaceIdentifierGrid(title: title, ids: [item.id], store: store) } label: {
                         HStack { WorkspaceThumbnail(asset: asset).frame(width: 54, height: 54).clipShape(RoundedRectangle(cornerRadius: 8)); VStack(alignment: .leading) { Text(item.date?.formatted(date: .abbreviated, time: .shortened) ?? "未知日期"); Text(item.bytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "云端 / 大小未知").font(.caption).foregroundStyle(.secondary) } }
                     }
                 }
             }
             HStack { Button("上一页") { page -= 1 }.disabled(page == 0); Spacer(); Text("\(page + 1) / \(max(1, (items.count + pageSize - 1) / pageSize))"); Spacer(); Button("下一页") { page += 1 }.disabled((page + 1) * pageSize >= items.count) }
         }.navigationTitle(title)
-        .task(id: "\(ascending)-\(items.count)") { sorted = await CleanupProjectionWorker.shared.sort(items, ascending: ascending) }
+        .task(id: "\(ascending)-\(items.count)") {
+            let result = await CleanupProjectionWorker.shared.sort(items, ascending: ascending)
+            guard !Task.isCancelled else { return }; sorted = result
+        }
+        .task(id: WorkspaceIdentifierRequest(ids: current.map(\.id), revision: store.libraryRevision)) {
+            let result = await WorkspaceAssetQuery.shared.batch(current.map(\.id))
+            guard !Task.isCancelled else { return }; pageAssets = result.assets
+        }
         .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("大小排序", systemImage: "arrow.up.arrow.down") { ascending.toggle(); page = 0 } } }
     }
 }

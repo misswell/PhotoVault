@@ -221,4 +221,67 @@ final class ReferenceWorkflowUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["照片地图"].waitForExistence(timeout: 10))
         capture("photo-map", app: app)
     }
+    func testViewerHasCompactActionsAndRestoresAfterBackground() {
+        let app = launch(["-PhotoVault.library.browseMode", "expanded", "-PhotoVault.viewer.albumDock.visible.v2", "NO", "-viewer-cancel-reentry-probe"])
+        openViewer(app)
+        let identifiers = ["viewer-edit", "viewer-favorite", "viewer-album-dock-toggle", "viewer-share", "viewer-more"]
+        var previousRight: CGFloat = 0
+        for id in identifiers {
+            let button = app.buttons[id]
+            XCTAssertTrue(button.isHittable, "\(id) 应可点击")
+            XCTAssertGreaterThanOrEqual(button.frame.width, 44)
+            XCTAssertGreaterThanOrEqual(button.frame.minX, previousRight - 1)
+            previousRight = button.frame.maxX
+        }
+        XCTAssertFalse(app.buttons["album-dock-create"].exists, "首次进入应收起相册快捷栏")
+        capture("compact-viewer", app: app)
+        let window = app.windows.firstMatch
+        let from = window.coordinate(withNormalizedOffset: CGVector(dx: 0.82, dy: 0.5))
+        let to = window.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5))
+        let before = app.staticTexts["viewer-counter"].label
+        from.press(forDuration: 0.1, thenDragTo: to)
+        expectation(for: NSPredicate(format: "label != %@", before), evaluatedWith: app.staticTexts["viewer-counter"])
+        waitForExpectations(timeout: 10)
+        let initial = app.staticTexts["viewer-counter"].label
+        XCUIDevice.shared.press(.home)
+        XCTAssertTrue(app.wait(for: .runningBackground, timeout: 5))
+        app.activate()
+        XCTAssertTrue(app.wait(for: .runningForeground, timeout: 10))
+        XCTAssertTrue(app.staticTexts["viewer-counter"].waitForExistence(timeout: 10))
+        XCTAssertEqual(app.staticTexts["viewer-counter"].label, initial)
+        let resumedWindow = app.windows.firstMatch
+        let resumedFrom = resumedWindow.coordinate(withNormalizedOffset: CGVector(dx: 0.82, dy: 0.5))
+        let resumedTo = resumedWindow.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.5))
+        resumedFrom.press(forDuration: 0.1, thenDragTo: resumedTo)
+        expectation(for: NSPredicate(format: "label != %@", initial), evaluatedWith: app.staticTexts["viewer-counter"])
+        waitForExpectations(timeout: 10)
+        app.buttons["viewer-more"].tap()
+        XCTAssertTrue(app.buttons["viewer-slideshow"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["从照片库删除"].exists)
+    }
+
+    func testMapPanningAndTabReturnReuseAnnotations() {
+        let app = launch(["-PhotoVault.library.browseMode", "expanded"])
+        XCTAssertTrue(app.tabBars.buttons["地图"].waitForExistence(timeout: 15))
+        app.tabBars.buttons["地图"].tap()
+        let map = app.descendants(matching: .any).matching(identifier: "photo-places-map").firstMatch
+        XCTAssertTrue(map.waitForExistence(timeout: 15))
+        let ready = NSPredicate(format: "value CONTAINS 'annotations=' AND NOT value ENDSWITH 'annotations=0'")
+        expectation(for: ready, evaluatedWith: map); waitForExpectations(timeout: 30)
+        let before = map.value as? String
+        map.swipeLeft(); map.swipeRight(); map.pinch(withScale: 2, velocity: 1)
+        XCTAssertEqual(map.value as? String, before, "移动相机不得重建地图标注")
+        capture("native-photo-map", app: app)
+        app.tabBars.buttons["清理"].tap(); app.tabBars.buttons["地图"].tap()
+        XCTAssertEqual(map.value as? String, before, "返回地图应复用已有地点，不重扫图库")
+        let marker = app.descendants(matching: .any).matching(identifier: "photo-map-marker").firstMatch
+        XCTAssertTrue(marker.waitForExistence(timeout: 10))
+        marker.tap()
+        let place = app.buttons["map-place-open"]
+        XCTAssertTrue(place.waitForExistence(timeout: 10))
+        place.tap()
+        XCTAssertTrue(app.navigationBars["拍摄地点"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.collectionViews["photo-grid"].cells.firstMatch.waitForExistence(timeout: 15))
+    }
+
 }

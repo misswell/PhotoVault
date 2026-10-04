@@ -259,6 +259,7 @@ final class ViewerPagingCollectionController: NSObject, UICollectionViewDataSour
     private var isZooming = false
     private var hasReportedPaging = false
     private var lastContentSignature = ""
+    private let requestOwner = UUID()
     private var hasInstalledDirectionProbe = false
 
     var onIndexChanged: ((Int) -> Void)?
@@ -349,6 +350,7 @@ final class ViewerPagingCollectionController: NSObject, UICollectionViewDataSour
             setCurrentIndex(clamped, animated: !isScrubbing)
         }
 
+        PhotoImageManager.shared.setCurrentViewerAsset(assetProvider(self.currentIndex)?.localIdentifier, owner: requestOwner)
         let signature = makeContentSignature()
         if signature != lastContentSignature {
             lastContentSignature = signature
@@ -362,6 +364,7 @@ final class ViewerPagingCollectionController: NSObject, UICollectionViewDataSour
         let clamped = min(max(0, index), max(0, pageCount - 1))
         if clamped != currentIndex {
             currentIndex = clamped
+            PhotoImageManager.shared.setCurrentViewerAsset(assetProvider(clamped)?.localIdentifier, owner: requestOwner)
             resetZoomState()
         }
         guard pageCount > 0, collectionView.bounds.width > 0 else { return }
@@ -384,6 +387,7 @@ final class ViewerPagingCollectionController: NSObject, UICollectionViewDataSour
     }
 
     func invalidate() {
+        PhotoImageManager.shared.setCurrentViewerAsset(nil, owner: requestOwner)
         collectionView.dataSource = nil
         collectionView.delegate = nil
         onIndexChanged = nil
@@ -419,13 +423,13 @@ final class ViewerPagingCollectionController: NSObject, UICollectionViewDataSour
         cell.configure(
             pageIndex: index,
             identity: identity,
-            rootView: pageRootView(
+            rootView: AnyView(pageRootView(
                 index,
                 index == currentIndex,
                 index == seedIndex,
                 { [weak self] ready in self?.handleReady(ready, index: index) },
                 { [weak self] zooming in self?.handleZooming(zooming, index: index) }
-            ),
+            ).environment(\.photoRequestOwner, requestOwner)),
             parent: parentController
         )
     }
@@ -586,6 +590,7 @@ final class ViewerPagingCollectionController: NSObject, UICollectionViewDataSour
         )
         guard index != currentIndex else { return }
         currentIndex = index
+        PhotoImageManager.shared.setCurrentViewerAsset(assetProvider(index)?.localIdentifier, owner: requestOwner)
         resetZoomState()
         onIndexChanged?(index)
     }

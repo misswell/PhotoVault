@@ -6,6 +6,9 @@ struct PhotoDiscoveryScreen: View {
     @ObservedObject private var workspace = PhotoWorkspaceStore.shared
     @State private var query = ""
     @State private var showSettings = false
+    @State private var noteIDs: [String] = []
+    @State private var noteAssets: [String: PHAsset] = [:]
+    @State private var noteLimit = 200
     @State private var anniversary: PhotoAnniversary?
     @State private var showNewAnniversary = false
     var body: some View {
@@ -13,14 +16,15 @@ struct PhotoDiscoveryScreen: View {
             List {
                 if !query.isEmpty {
                     Section("备注") {
-                        ForEach(workspace.notes.keys.filter { workspace.notes[$0]?.localizedStandardContains(query) == true }.sorted(), id: \.self) { id in
-                            if let asset = WorkspacePhotoAccess.asset(id) {
+                        ForEach(Array(noteIDs.prefix(noteLimit)), id: \.self) { id in
+                            if let asset = noteAssets[id] {
                                 NavigationLink {
-                                    PhotoGridScreen(title: "备注搜索", assets: PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil), store: store)
+                                    WorkspaceIdentifierGrid(title: "备注搜索", ids: [id], store: store)
                                 } label: { HStack { WorkspaceThumbnail(asset: asset).frame(width: 44, height: 44); Text(workspace.notes[id] ?? "").lineLimit(3) } }
                             }
                         }
                     }
+                    if noteIDs.count > noteLimit { Button("显示更多备注") { noteLimit += 200 } }
                     Section("日记") {
                         ForEach(workspace.journal.filter { $0.text.localizedStandardContains(query) }) { entry in
                             NavigationLink { JournalEditorSheet(entry: entry) } label: { Text(entry.text).lineLimit(3) }
@@ -28,7 +32,7 @@ struct PhotoDiscoveryScreen: View {
                     }
                     Section("相册") {
                         ForEach(store.albums.filter { $0.title.localizedStandardContains(query) }) { album in
-                            NavigationLink(album.title) { PhotoGridScreen(title: album.title, assets: store.assets(in: album), store: store, album: album) }
+                            NavigationLink(album.title) { WorkspaceAlbumGrid(album: album, store: store) }
                         }
                     }
                 } else {
@@ -64,6 +68,15 @@ struct PhotoDiscoveryScreen: View {
             }
             .navigationTitle("发现")
             .searchable(text: $query, prompt: "搜索日记、备注、相册")
+            .onChange(of: query) { _, _ in noteLimit = 200; noteIDs = []; noteAssets = [:] }
+            .task(id: NoteSearchRequest(query: query, notes: workspace.notes, limit: noteLimit, revision: store.libraryRevision)) {
+                guard !query.isEmpty else { noteIDs = []; noteAssets = [:]; return }
+                do { try await Task.sleep(for: .milliseconds(180)) } catch { return }
+                let matches = await WorkspaceAssetQuery.shared.matchingNotes(workspace.notes, query: query)
+                let resolved = await WorkspaceAssetQuery.shared.batch(Array(matches.prefix(noteLimit)))
+                guard !Task.isCancelled else { return }
+                noteIDs = matches; noteAssets = resolved.assets
+            }
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("设置", systemImage: "gearshape") { showSettings = true } } }
         }
         .sheet(isPresented: $showSettings) { PhotoVaultSettingsView(store: store) }
@@ -271,7 +284,7 @@ private struct WorkspaceAlbumRows: View {
     }
     private func link(_ album: PhotoAlbum, tile: Bool) -> some View {
         NavigationLink {
-            PhotoGridScreen(title: album.title, assets: store.assets(in: album), store: store, album: album)
+            WorkspaceAlbumGrid(album: album, store: store)
         } label: {
             if tile {
                 VStack(alignment: .leading, spacing: 6) {
@@ -289,5 +302,20 @@ private struct WorkspaceAlbumRows: View {
             }
         }
         .contextMenu { Button(store.quickAlbumIDs.contains(album.id) ? "取消星标" : "设为快速收藏") { store.toggleQuickAlbum(album.id) } }
+    }
+}
+
+private struct NoteSearchRequest: Equatable { let query: String; let notes: [String: String]; let limit: Int; let revision: Int }
+
+private struct WorkspaceAlbumGrid: View {
+    let album: PhotoAlbum
+    @ObservedObject var store: PhotoLibraryStore
+    @State private var assets: PHFetchResult<PHAsset>?
+    var body: some View {
+        PhotoGridScreen(title: album.title, assets: assets, store: store, album: album)
+            .task(id: "\(album.id):\(store.libraryRevision)") {
+                let result = await store.assetsAsync(in: album)
+                guard !Task.isCancelled else { return }; assets = result
+            }
     }
 }

@@ -92,6 +92,9 @@ final class PhotoEditProbe: ObservableObject {
             check(try JSONDecoder().decode(PhotoEditRecipe.self, from: encoded) == recipe, "recipe round trip")
             do { _ = try await PhotoRenderWorker.shared.render(data: Data(), recipe: .init(), options: options); check(false, "invalid data") }
             catch { check(true, "invalid data") }
+            for symbol in ["chart.pie.fill", "folder.badge.minus", "square.on.square", "doc.on.doc", "viewfinder", "photo", "video", "livephoto", "arrow.up.arrow.down", "chart.bar", "rectangle.stack", "dice", "rectangle.split.2x1", "arrow.trianglehead.2.clockwise.rotate.90"] {
+                check(UIImage(systemName: symbol) != nil, "cleanup symbol \(symbol)")
+            }
             let calendar = Calendar(identifier: .gregorian)
             let birthday = PhotoAnniversary(name: "Leap", date: calendar.date(from: DateComponents(year: 2000, month: 2, day: 29))!, isBirthday: true)
             check(birthday.daysUntilNext(from: calendar.date(from: DateComponents(year: 2026, month: 2, day: 27))!, calendar: calendar) == 1, "leap anniversary")

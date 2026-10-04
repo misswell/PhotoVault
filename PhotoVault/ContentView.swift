@@ -167,7 +167,7 @@ struct ContentView: View {
                 .tag(RootTab.library)
 
             PhotoCleanupScreen(store: store)
-                .tabItem { Label("清理", systemImage: "chart.donut") }
+                .tabItem { Label("清理", systemImage: "chart.pie.fill") }
                 .tag(RootTab.organizer)
 
             WorkspaceAlbumBrowser(store: store)
