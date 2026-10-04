@@ -650,6 +650,14 @@ enum LANFolderThumbnailDiskCache {
         return decoded
     }
 
+    /// Only derived thumbnails are removed; folder bookmarks and files remain.
+    static func purgeAll() {
+        let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("PhotoVault", isDirectory: true)
+            .appendingPathComponent("lan-thumbnails", isDirectory: true)
+        try? FileManager.default.removeItem(at: root)
+    }
+
     /// Drops a removed album's thumbnails from Caches.
     static func purge(folderID: UUID) {
         let directory = directory(for: folderID)

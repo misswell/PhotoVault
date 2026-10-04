@@ -1,5 +1,24 @@
 import XCTest
 
+/// Handles the first-launch system photo-permission alert. `simctl privacy
+/// grant photos` does not take effect on current iOS runtimes, so a fresh
+/// test simulator must answer the springboard alert in place; the grant
+/// persists for every later launch.
+/// Returns true when an alert was actually answered (the caller should
+/// relaunch so the app reads the new authorization).
+@discardableResult
+private func pvGrantPhotosPermissionIfNeeded() -> Bool {
+    let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+    for label in ["允许完全访问", "Allow Full Access"] {
+        let button = springboard.buttons[label]
+        if button.waitForExistence(timeout: 4) {
+            button.tap()
+            return true
+        }
+    }
+    return false
+}
+
 /// UI regression for the viewer's dismissal interaction.
 ///
 /// The viewer's zoom-out is a system transition, and the failure this suite
@@ -662,21 +681,20 @@ final class PhotoViewerDismissUITests: XCTestCase {
             app.cells["photo-cell-0"].waitForExistence(timeout: 20),
             "第一张应可见"
         )
+        let grid = app.collectionViews["photo-grid"]
+        // Capture geometry before opening, without filtering on isHittable:
+        // doing so after dismissal would silently exclude a blocked cell.
+        let visibleIDs = grid.cells.allElementsBoundByIndex.filter {
+            $0.identifier.hasPrefix("photo-cell-") && grid.frame.contains($0.frame)
+        }.map(\.identifier)
+        XCTAssertGreaterThanOrEqual(visibleIDs.count, 6, "种子图库应覆盖视口多个位置")
         openViewer(at: 0, in: app)
         app.buttons["viewer-close"].tap()
 
-        // 跨整屏取样：残留的透明遮罩往往只盖住一部分，只查 firstMatch 会漏。
-        for index in [0, 5, 15] {
-            let cell = app.cells["photo-cell-\(index)"]
-            XCTAssertTrue(
-                cell.waitForExistence(timeout: 10),
-                "退出后 cell \(index) 应仍在视口内"
-            )
-            XCTAssertTrue(
-                cell.isHittable,
-                "退出后 cell \(index) 必须可命中 —— 不得残留拦截触摸的遮罩，"
-                    + "也不得等 zoom-out 结束才恢复"
-            )
+        for id in visibleIDs {
+            let cell = app.cells[id]
+            XCTAssertTrue(cell.waitForExistence(timeout: 10), "退出后 \(id) 应仍在视口内")
+            XCTAssertTrue(cell.isHittable, "退出后 \(id) 必须可命中，不得残留拦截触摸的遮罩")
         }
     }
 
@@ -795,6 +813,10 @@ final class PhotoViewerDismissUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments += ["-viewer-cancel-reentry-probe"]
         app.launch()
+        if pvGrantPhotosPermissionIfNeeded() {
+            app.terminate()
+            app.launch()
+        }
 
         let libraryCell = app.cells.firstMatch
         XCTAssertTrue(
@@ -911,6 +933,10 @@ final class SlideshowOptionsUITests: XCTestCase {
             "-PhotoVault.slideshow.photosOnly", "NO",
         ]
         app.launch()
+        if pvGrantPhotosPermissionIfNeeded() {
+            app.terminate()
+            app.launch()
+        }
 
         let grid = app.collectionViews["photo-grid"]
         if grid.waitForExistence(timeout: 15) { return app }
@@ -973,6 +999,10 @@ final class SlideshowOptionsUITests: XCTestCase {
             "-PhotoVault.slideshow.shuffles", "NO",
         ] + extraArguments
         app.launch()
+        if pvGrantPhotosPermissionIfNeeded() {
+            app.terminate()
+            app.launch()
+        }
 
         XCTAssertTrue(
             app.cells.firstMatch.waitForExistence(timeout: 20),

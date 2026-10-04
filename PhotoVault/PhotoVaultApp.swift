@@ -47,7 +47,7 @@ struct PhotoVaultApp: App {
 ///
 /// `@Environment(\.scenePhase)` cannot be trusted everywhere in this app. The
 /// detail page is hosted by a `UIHostingController` that
-/// `PhotoViewerPresentationBridge` creates by hand and presents itself, and a
+/// `PhotoViewerNavigator` pushes by hand onto a UIKit navigation stack, and a
 /// SwiftUI hierarchy with no `Scene` behind it reads that environment key's
 /// **default** value — `.background`. Everything inside the viewer therefore
 /// believed the app was backgrounded: a slideshow started from a detail page

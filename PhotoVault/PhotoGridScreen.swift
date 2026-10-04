@@ -4,7 +4,14 @@ import UIKit
 
 struct PhotoGridScreen: View {
     let title: String
-    let assets: PHFetchResult<PHAsset>?
+    let sourceAssets: PHFetchResult<PHAsset>?
+    @State private var queryAssets: PHFetchResult<PHAsset>?
+    @State private var mediaScope = WorkspaceMediaScope.all
+    @State private var oldestFirst = false
+    @AppStorage("PhotoVault.library.browseMode") private var browseModeRaw = LibraryBrowseMode.expanded.rawValue
+    private var browseMode: LibraryBrowseMode { LibraryBrowseMode(rawValue: browseModeRaw) ?? .expanded }
+    private var allowsTimeline: Bool { album == nil && title == "图库" }
+    private var assets: PHFetchResult<PHAsset>? { queryAssets ?? sourceAssets }
     @ObservedObject var store: PhotoLibraryStore
     let album: PhotoAlbum?
 
@@ -37,7 +44,7 @@ struct PhotoGridScreen: View {
         album: PhotoAlbum? = nil
     ) {
         self.title = title
-        self.assets = assets
+        self.sourceAssets = assets
         self.store = store
         self.album = album
     }
@@ -51,6 +58,8 @@ struct PhotoGridScreen: View {
                         systemImage: "photo.on.rectangle.angled",
                         description: Text("照片出现在系统照片库后，会自动显示在这里。")
                     )
+                } else if allowsTimeline && !browseMode.isGrid {
+                    LibraryTimelineContent(assets: assets, mode: browseMode, store: store)
                 } else {
                     PhotoGridView(
                         assets: assets,
@@ -90,11 +99,33 @@ struct PhotoGridScreen: View {
                 .frame(width: 0, height: 0)
         )
         .navigationTitle(title)
+        .safeAreaInset(edge: .bottom) {
+            if allowsTimeline && !selectionMode {
+                Picker("浏览方式", selection: $browseModeRaw) {
+                    ForEach(LibraryBrowseMode.allCases) { mode in Text(mode.title).tag(mode.rawValue) }
+                }
+                .pickerStyle(.segmented).padding(8).background(.bar)
+                .accessibilityIdentifier("library-browse-modes")
+            }
+        }
+        .onChange(of: browseModeRaw) { _, value in
+            if value == LibraryBrowseMode.compact.rawValue {
+                UserDefaults.standard.set(50.0, forKey: PhotoGridPreferences.preferredCellSideKey)
+            } else if value == LibraryBrowseMode.expanded.rawValue {
+                UserDefaults.standard.set(125.0, forKey: PhotoGridPreferences.preferredCellSideKey)
+            }
+        }
+        .task(id: "\(mediaScope.rawValue)-\(oldestFirst)-\(store.libraryRevision)") {
+            guard allowsTimeline else { return }
+            if mediaScope == .all && !oldestFirst { queryAssets = nil; return }
+            let result = await WorkspaceLibraryQuery.shared.fetch(scope: mediaScope, oldestFirst: oldestFirst)
+            if !Task.isCancelled { queryAssets = result.result }
+        }
+
         #if DEBUG
         // Runs the memory-vs-SQL filter parity check when the app is launched
         // with `--pv-slideshow-filter-probe`, once the index has something in
-        // it. The viewer transition has its own probe, driven from
-        // `PhotoViewerPresentationBridge`.
+        // it.
         .task(id: assets?.count ?? 0) {
             guard assets != nil else { return }
             await SlideshowFilterProbe.runIfRequested(store: store)
@@ -102,6 +133,7 @@ struct PhotoGridScreen: View {
         #endif
         .onAppear {
             photoVaultTrace("grid screen appear title=\(title)")
+            if let album { PhotoWorkspaceStore.shared.visitAlbum(album.id) }
         }
         .onDisappear {
             photoVaultTrace("grid screen disappear title=\(title)")
@@ -127,6 +159,16 @@ struct PhotoGridScreen: View {
             }
 
             ToolbarItemGroup(placement: .topBarTrailing) {
+                if allowsTimeline && !selectionMode {
+                    Menu {
+                        Picker("显示内容", selection: $mediaScope) {
+                            ForEach(WorkspaceMediaScope.allCases) { Text($0.title).tag($0) }
+                        }
+                        Toggle("最早优先", isOn: $oldestFirst)
+                    } label: { Image(systemName: "line.3.horizontal.decrease") }
+                    .accessibilityLabel("筛选与排序")
+                }
+
                 if selectionMode,
                    let assets,
                    assets.count <= 2_000,
@@ -377,6 +419,10 @@ struct PhotoGridScreen: View {
         }
     }
 
+    /// Opens the viewer: build this session's transition state, wrap the
+    /// SwiftUI viewer in a hosting controller, and push. No pending queue, no
+    /// phase guard — UIKit serializes and interrupts its own transitions, so
+    /// opening while another viewer is still zooming out just works.
     private func presentViewer(with context: PhotoOpenContext) {
         photoVaultTrace(
             "grid_tap index=\(context.index) "
@@ -638,6 +684,9 @@ struct UnsortedPhotosScreen: View {
         }
     }
 
+    /// Opens the viewer: fresh per-session transition state, hosting
+    /// controller, push. UIKit serializes this against any transition still
+    /// in flight — no pending queue, no phase guard.
     private func openViewer(asset: PHAsset, index: Int, previewImage: UIImage?) {
         photoVaultTrace(
             "grid_tap index=\(index) "

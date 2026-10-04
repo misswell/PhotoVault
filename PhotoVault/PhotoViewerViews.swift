@@ -455,7 +455,7 @@ private struct LivePhotoUIKitView: UIViewRepresentable {
     }
 }
 
-private struct VideoAssetViewer: View {
+struct VideoAssetViewer: View {
     let asset: PHAsset
     let requestPriority: PhotoRequestPriority
     let transparentCanvas: Bool
@@ -863,6 +863,9 @@ struct PhotoViewerView: View {
     @State private var currentIndex: Int
     @State private var controlsVisible = true
     @State private var isShowingInfo = false
+    @State private var editorAsset: WorkspaceAsset?
+    @State private var noteAsset: WorkspaceAsset?
+    @State private var textAsset: WorkspaceAsset?
     @State private var isPreparingShare = false
     @State private var isFavorite: Bool
     @State private var filmstripPosition: Int?
@@ -1004,6 +1007,7 @@ struct PhotoViewerView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .statusBarHidden(!controlsVisible || isDismissing)
         .persistentSystemOverlays(.automatic)
+        .modifier(ViewerWorkspaceSheets(asset: currentAsset, store: store, editor: $editorAsset, note: $noteAsset, text: $textAsset))
         .sheet(isPresented: $isShowingInfo) {
             if assets.count > 0 {
                 PhotoInfoView(asset: assets.object(at: currentIndex))
@@ -1321,6 +1325,26 @@ struct PhotoViewerView: View {
     private var bottomBar: some View {
         HStack(spacing: 0) {
             viewerBarAction {
+                if let currentAsset { editorAsset = WorkspaceAsset(asset: currentAsset) }
+            } label: { Image(systemName: "slider.horizontal.3") }
+            .disabled(currentAsset == nil)
+            .accessibilityLabel("编辑与压缩")
+            .accessibilityIdentifier("viewer-edit")
+            Spacer()
+            Menu {
+                Button("备注 / 日记", systemImage: "text.bubble") { if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) } }
+                if currentAsset?.mediaType == .image {
+                    Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
+                }
+                Button("从照片库删除", systemImage: "trash", role: .destructive) {
+                    if let currentAsset { store.deleteAssets([currentAsset]) { result in handle(result) } }
+                }
+            } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
+            .glassEffect(.regular.interactive(), in: Circle())
+            .accessibilityLabel("更多照片操作")
+            Spacer()
+
+            viewerBarAction {
                 toggleCurrentFavorite()
             } label: {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
@@ -1420,7 +1444,7 @@ struct PhotoViewerView: View {
         .font(.title3.weight(.medium))
         .foregroundStyle(.white)
         .buttonStyle(.plain)
-        .padding(.horizontal, 26)
+        .padding(.horizontal, 12)
         .padding(.bottom, 8)
     }
 
@@ -2735,6 +2759,9 @@ struct IndexedPhotoViewerView: View {
     @State private var assetsByIndex: [Int: PHAsset] = [:]
     @State private var controlsVisible = true
     @State private var isShowingInfo = false
+    @State private var editorAsset: WorkspaceAsset?
+    @State private var noteAsset: WorkspaceAsset?
+    @State private var textAsset: WorkspaceAsset?
     @State private var isPreparingShare = false
     @State private var isFavorite = false
     @State private var isScrubbingFilmstrip = false
@@ -2876,6 +2903,7 @@ struct IndexedPhotoViewerView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .statusBarHidden(!controlsVisible || isDismissing)
         .persistentSystemOverlays(.automatic)
+        .modifier(ViewerWorkspaceSheets(asset: currentAsset, store: store, editor: $editorAsset, note: $noteAsset, text: $textAsset))
         .sheet(isPresented: $isShowingInfo) {
             if let currentAsset {
                 PhotoInfoView(asset: currentAsset)
@@ -3183,6 +3211,26 @@ struct IndexedPhotoViewerView: View {
     private var bottomBar: some View {
         HStack(spacing: 0) {
             viewerBarAction {
+                if let currentAsset { editorAsset = WorkspaceAsset(asset: currentAsset) }
+            } label: { Image(systemName: "slider.horizontal.3") }
+            .disabled(currentAsset == nil)
+            .accessibilityLabel("编辑与压缩")
+            .accessibilityIdentifier("viewer-edit")
+            Spacer()
+            Menu {
+                Button("备注 / 日记", systemImage: "text.bubble") { if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) } }
+                if currentAsset?.mediaType == .image {
+                    Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
+                }
+                Button("从照片库删除", systemImage: "trash", role: .destructive) {
+                    if let currentAsset { store.deleteAssets([currentAsset]) { result in handle(result) } }
+                }
+            } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
+            .glassEffect(.regular.interactive(), in: Circle())
+            .accessibilityLabel("更多照片操作")
+            Spacer()
+
+            viewerBarAction {
                 toggleCurrentFavorite()
             } label: {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
@@ -3270,7 +3318,7 @@ struct IndexedPhotoViewerView: View {
         .font(.title3.weight(.medium))
         .foregroundStyle(.white)
         .buttonStyle(.plain)
-        .padding(.horizontal, 26)
+        .padding(.horizontal, 12)
         .padding(.bottom, 8)
     }
 

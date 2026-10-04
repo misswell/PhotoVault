@@ -163,6 +163,10 @@ struct LANFolderGridScreen: View {
     @State private var hasAutoPresentedPicker = false
     @State private var reauthDirectory: URL?
     @State private var viewerIndex: Int?
+    /// Pushes/pops the viewer on the folder detail's navigation stack, so the
+    /// folder viewer gets the same system zoom transition and interactive
+    /// pull-down dismissal as the album, unsorted and search viewers.
+    @State private var navigator = PhotoViewerNavigator()
     /// Folder slideshows are set up in the same sheet as album slideshows,
     /// minus the content filters: a folder is `[URL]`-backed, so orientation
     /// and resolution are not known without decoding every file.
@@ -211,7 +215,7 @@ struct LANFolderGridScreen: View {
                         // array for a folder that can hold thousands of files.
                         ForEach(files.indices, id: \.self) { index in
                             Button {
-                                viewerIndex = index
+                                openViewer(at: index)
                             } label: {
                                 Color.clear
                                     .aspectRatio(1, contentMode: .fit)
@@ -233,6 +237,7 @@ struct LANFolderGridScreen: View {
                 }
             }
         }
+        .background(PhotoViewerNavigationAnchor(navigator: navigator))
         .navigationTitle(folder.name)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -270,27 +275,6 @@ struct LANFolderGridScreen: View {
                 initialDirectory: reauthDirectory
             )
         }
-        .fullScreenCover(
-            isPresented: Binding(
-                get: { viewerIndex != nil },
-                set: { if !$0 { viewerIndex = nil } }
-            )
-        ) {
-            // Never gate the content on folderURL: re-entering a folder
-            // replays LANFolderSessionCache without resolving the bookmark,
-            // so folderURL stays nil here and an empty full-screen cover
-            // would trap the user with no close button. The disk thumbnail
-            // cache already falls back to absolute-path keys when rootURL
-            // doesn't prefix-match, so the fallback root is safe.
-            if let viewerBinding {
-                LANFolderViewerScreen(
-                    files: files,
-                    folderID: folder.id,
-                    rootURL: folderURL ?? URL(fileURLWithPath: "/"),
-                    index: viewerBinding
-                )
-            }
-        }
         .sheet(isPresented: $isShowingSlideshowOptions) {
             SlideshowOptionsSheet(
                 title: "\(folder.name)幻灯片",
@@ -317,12 +301,27 @@ struct LANFolderGridScreen: View {
         }
     }
 
-    private var viewerBinding: Binding<Int>? {
-        guard viewerIndex != nil else { return nil }
-        return Binding(
-            get: { viewerIndex ?? 0 },
+    /// Opens the folder viewer by pushing it onto the folder detail's
+    /// navigation stack. The LazyVGrid has no collection view to resolve a
+    /// zoom source cell from, so the transition zooms from the window center;
+    /// the interactive pull-down dismissal behaves like every other entry.
+    private func openViewer(at index: Int) {
+        guard files.indices.contains(index) else { return }
+        viewerIndex = index
+        let indexBinding = Binding(
+            get: { viewerIndex ?? index },
             set: { viewerIndex = $0 }
         )
+        navigator.open(
+            request: PhotoViewerRequest(index: index, assetIdentifier: files[index].absoluteString, previewImage: nil),
+            gridTransitionCoordinator: nil
+        ) { state, close in
+            AnyView(LANFolderViewerScreen(
+                files: files, folderID: folder.id,
+                rootURL: folderURL ?? URL(fileURLWithPath: "/"),
+                index: indexBinding, transitionState: state, onClose: close
+            ))
+        }
     }
 
     private struct EnumerationResult: Sendable {
@@ -518,18 +517,14 @@ struct LANFolderViewerScreen: View {
     let folderID: UUID
     let rootURL: URL
     @Binding var index: Int
-
-    @Environment(\.dismiss) private var dismiss
-    @State private var dragOffset: CGSize = .zero
-
-    private var dismissProgress: CGFloat {
-        min(max(dragOffset.height / 420, 0), 1)
-    }
+    /// Popping is owned by the navigation stack the viewer was pushed onto;
+    /// the close button routes through it like every other exit.
+    let transitionState: PhotoViewerTransitionState
+    let onClose: () -> Void
 
     var body: some View {
         ZStack {
             Color.black
-                .opacity(1 - Double(dismissProgress) * 0.7)
                 .ignoresSafeArea()
 
             // Same interaction model as the album viewer: continuous
@@ -538,35 +533,13 @@ struct LANFolderViewerScreen: View {
                 files: files,
                 folderID: folderID,
                 rootURL: rootURL,
-                currentIndex: $index,
-                onDismissDragChanged: { translation in
-                    guard translation.height > 0,
-                          translation.height > abs(translation.width) * 1.15
-                    else { return }
-                    dragOffset = CGSize(
-                        width: translation.width * 0.18,
-                        height: max(0, translation.height)
-                    )
-                },
-                onDismissDragEnded: { translation, predicted, cancelled in
-                    let shouldDismiss = !cancelled
-                        && (translation.height > 150 || predicted.height > 280)
-                    if shouldDismiss {
-                        dismiss()
-                    } else {
-                        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-                            dragOffset = .zero
-                        }
-                    }
-                }
+                currentIndex: $index
             )
-            .offset(dragOffset)
-            .scaleEffect(1 - dismissProgress * 0.08)
 
             VStack {
                 HStack {
                     Button {
-                        dismiss()
+                        onClose()
                     } label: {
                         Image(systemName: "xmark")
                             .font(.headline.weight(.semibold))
@@ -614,12 +587,12 @@ struct LANFolderViewerScreen: View {
                     index: $index
                 )
             }
-            .opacity(Double(1 - dismissProgress))
         }
         .onAppear {
             prefetchNeighbors(around: index)
         }
         .onChange(of: index) { _, newValue in
+            transitionState.update(index: newValue, assetIdentifier: files.indices.contains(newValue) ? files[newValue].absoluteString : nil)
             prefetchNeighbors(around: newValue)
         }
     }
@@ -698,354 +671,33 @@ private struct LANFolderFilmstrip: View {
 
 // MARK: - URL pager
 
-/// URL-driven sibling of the album viewer's NativePhotoPager: a
-/// UIPageViewController that keeps the current page plus its neighbors
-/// alive, writes swipes back into the index binding, supports programmatic
-/// jumps, and arbitrates the vertical dismiss drag against its own
-/// horizontal scroll gesture.
-private struct LANFolderPager: UIViewControllerRepresentable {
+/// URL-driven sibling of the album viewer's pager: both run on the shared
+/// `ViewerPagerEngine` (a horizontal paging UICollectionView). The engine
+/// keeps the current page and its neighbors alive via cell reuse, writes
+/// swipes back into the index binding at settle, and refuses vertical pans so
+/// the system zoom dismissal owns the pull-down.
+private struct LANFolderPager: View {
     let files: [URL]
     let folderID: UUID
     let rootURL: URL
     @Binding var currentIndex: Int
-    let onDismissDragChanged: (CGSize) -> Void
-    let onDismissDragEnded: (CGSize, CGSize, Bool) -> Void
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(currentIndex: $currentIndex)
-    }
-
-    func makeUIViewController(context: Context) -> UIPageViewController {
-        let controller = UIPageViewController(
-            transitionStyle: .scroll,
-            navigationOrientation: .horizontal
-        )
-        controller.dataSource = context.coordinator
-        controller.delegate = context.coordinator
-        context.coordinator.attach(controller: controller)
-        context.coordinator.update(
-            files: files,
-            folderID: folderID,
-            rootURL: rootURL,
-            currentIndex: currentIndex,
-            onDismissDragChanged: onDismissDragChanged,
-            onDismissDragEnded: onDismissDragEnded
-        )
-        return controller
-    }
-
-    func updateUIViewController(
-        _ controller: UIPageViewController,
-        context: Context
-    ) {
-        context.coordinator.update(
-            files: files,
-            folderID: folderID,
-            rootURL: rootURL,
-            currentIndex: currentIndex,
-            onDismissDragChanged: onDismissDragChanged,
-            onDismissDragEnded: onDismissDragEnded
-        )
-    }
-
-    static func dismantleUIViewController(
-        _ uiViewController: UIPageViewController,
-        coordinator: Coordinator
-    ) {
-        coordinator.invalidate()
-    }
-
-    @MainActor
-    final class Coordinator: NSObject, UIPageViewControllerDataSource,
-        UIPageViewControllerDelegate, UIGestureRecognizerDelegate {
-        private weak var pageController: UIPageViewController?
-        private var files: [URL] = []
-        private var folderID = UUID()
-        private var rootURL: URL?
-        private var pageCount = 0
-        private var displayedIndex: Int?
-        private var pages: [Int: LANFolderPageController] = [:]
-        private var currentIndexBinding: Binding<Int>
-        private var pendingProgrammaticIndex: Int?
-        private var isManualTransitionInProgress = false
-        private var dismissPanGesture: UIPanGestureRecognizer?
-        private var onDismissDragChanged: (CGSize) -> Void = { _ in }
-        private var onDismissDragEnded: (CGSize, CGSize, Bool) -> Void = { _, _, _ in }
-
-        init(currentIndex: Binding<Int>) {
-            currentIndexBinding = currentIndex
-        }
-
-        func attach(controller: UIPageViewController) {
-            pageController = controller
-            let dismissPan = UIPanGestureRecognizer(
-                target: self,
-                action: #selector(handleDismissPan(_:))
-            )
-            dismissPan.delegate = self
-            dismissPan.cancelsTouchesInView = false
-            dismissPan.maximumNumberOfTouches = 1
-            controller.view.addGestureRecognizer(dismissPan)
-            dismissPanGesture = dismissPan
-
-            // Decide vertical dismissal before UIKit's horizontal scroll
-            // view is allowed to begin; a horizontal pan makes this
-            // recognizer fail and the page controller owns the gesture.
-            if let pageScrollView = controller.view.subviews
-                .compactMap({ $0 as? UIScrollView })
-                .first {
-                pageScrollView.panGestureRecognizer.require(toFail: dismissPan)
-            }
-        }
-
-        func invalidate() {
-            guard pageController != nil || !pages.isEmpty else { return }
-            // Detach before releasing hosted pages so a late UIKit callback
-            // cannot write into a screen that is already going away.
-            pageController?.dataSource = nil
-            pageController?.delegate = nil
-            pageController?.view.isUserInteractionEnabled = false
-            if let dismissPanGesture {
-                dismissPanGesture.delegate = nil
-                dismissPanGesture.view?.removeGestureRecognizer(dismissPanGesture)
-                self.dismissPanGesture = nil
-            }
-            pages.removeAll()
-            pendingProgrammaticIndex = nil
-            displayedIndex = nil
-            onDismissDragChanged = { _ in }
-            onDismissDragEnded = { _, _, _ in }
-            files = []
-            pageController = nil
-        }
-
-        func update(
-            files: [URL],
-            folderID: UUID,
-            rootURL: URL,
-            currentIndex: Int,
-            onDismissDragChanged: @escaping (CGSize) -> Void,
-            onDismissDragEnded: @escaping (CGSize, CGSize, Bool) -> Void
-        ) {
-            self.files = files
-            self.folderID = folderID
-            self.rootURL = rootURL
-            self.onDismissDragChanged = onDismissDragChanged
-            self.onDismissDragEnded = onDismissDragEnded
-            pageCount = max(0, files.count)
-
-            guard pageCount > 0, let pageController else { return }
-            let clampedIndex = min(max(0, currentIndex), pageCount - 1)
-
-            guard let displayedIndex else {
-                setInitialPage(to: clampedIndex)
-                return
-            }
-
-            if displayedIndex != clampedIndex {
-                // Do not restart the same transition while SwiftUI re-renders
-                // around an in-flight jump.
-                if pendingProgrammaticIndex == clampedIndex { return }
-                guard pendingProgrammaticIndex == nil,
-                      !isManualTransitionInProgress
-                else { return }
-                guard let visiblePage = pageController.viewControllers?
-                    .first as? LANFolderPageController
-                else { return }
-
-                let direction: UIPageViewController.NavigationDirection =
-                    clampedIndex > visiblePage.index ? .forward : .reverse
-                guard let targetPage = page(at: clampedIndex) else { return }
-                pendingProgrammaticIndex = clampedIndex
-                pageController.setViewControllers(
-                    [targetPage],
-                    direction: direction,
-                    animated: true
-                ) { [weak self] _ in
-                    guard let self else { return }
-                    self.pendingProgrammaticIndex = nil
-                    self.displayedIndex = clampedIndex
-                    self.refreshPages(around: clampedIndex)
-                }
-            }
-        }
-
-        private func setInitialPage(to index: Int) {
-            guard let pageController, let initialPage = page(at: index) else { return }
-            pageController.setViewControllers(
-                [initialPage],
-                direction: .forward,
-                animated: false
-            )
-            displayedIndex = index
-            refreshPages(around: index)
-        }
-
-        private func page(at index: Int) -> LANFolderPageController? {
-            guard index >= 0, index < pageCount else { return nil }
-            if let existing = pages[index] {
-                return existing
-            }
-            let page = LANFolderPageController(
-                index: index,
-                rootView: makePageView(for: index)
-            )
-            pages[index] = page
-            return page
-        }
-
-        private func makePageView(for index: Int) -> AnyView {
-            guard files.indices.contains(index) else {
-                return AnyView(Color.black)
-            }
-            return AnyView(
-                ZStack {
-                    Color.black
-                    LANFolderImageView(
-                        url: files[index],
-                        folderID: folderID,
-                        rootURL: rootURL ?? URL(fileURLWithPath: "/"),
-                        maxPixelSize: 2048,
-                        fillsContainer: false
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+    var body: some View {
+        GeometryReader { proxy in
+            ViewerPagingCollectionRepresentable(
+                pageCount: files.count, currentIndex: currentIndex, isScrubbing: false,
+                assetProvider: { _ in nil },
+                pageIdentity: { index in files.indices.contains(index) ? files[index].absoluteString : "missing" },
+                pageRootView: { index, _, _, _, _ in
+                    guard files.indices.contains(index) else { return AnyView(Color.black) }
+                    return AnyView(LANFolderImageView(url: files[index], folderID: folderID, rootURL: rootURL,
+                                                     maxPixelSize: 2048, fillsContainer: false))
+                },
+                targetSize: proxy.size, contentMode: .aspectFit, neighborPriority: .slideshow,
+                initialPreviewImage: nil, initialAssetIdentifier: nil,
+                onIndexChanged: { currentIndex = $0 }, onMediaReady: nil, onZoomingChanged: nil, onPagingChanged: nil
             )
         }
-
-        private func refreshPages(around index: Int) {
-            let nearbyIndexes = Set(
-                [index - 1, index, index + 1]
-                    .filter { $0 >= 0 && $0 < pageCount }
-            )
-            for nearbyIndex in nearbyIndexes {
-                if let existing = pages[nearbyIndex] {
-                    existing.rootView = makePageView(for: nearbyIndex)
-                } else {
-                    _ = page(at: nearbyIndex)
-                }
-            }
-            pages = pages.filter { nearbyIndexes.contains($0.key) }
-        }
-
-        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
-            guard gestureRecognizer === dismissPanGesture,
-                  let dismissPan = gestureRecognizer as? UIPanGestureRecognizer,
-                  !isManualTransitionInProgress,
-                  pendingProgrammaticIndex == nil
-            else { return false }
-
-            let coordinateView = dismissPan.view?.window ?? dismissPan.view
-            let velocity = dismissPan.velocity(in: coordinateView)
-            let translation = dismissPan.translation(in: coordinateView)
-            let horizontalVelocity = abs(velocity.x)
-            let downwardVelocity = velocity.y
-            let isClearlyDownward: Bool
-            if max(horizontalVelocity, abs(downwardVelocity)) >= 80 {
-                isClearlyDownward = downwardVelocity > 0
-                    && downwardVelocity > horizontalVelocity * 1.3
-            } else {
-                isClearlyDownward = translation.y > 0
-                    && translation.y > abs(translation.x) * 1.3
-            }
-            return isClearlyDownward
-        }
-
-        @objc private func handleDismissPan(_ recognizer: UIPanGestureRecognizer) {
-            guard let view = recognizer.view else { return }
-            let coordinateView = view.window ?? view.superview ?? view
-            let translationPoint = recognizer.translation(in: coordinateView)
-            let velocity = recognizer.velocity(in: coordinateView)
-            let translation = CGSize(
-                width: translationPoint.x,
-                height: translationPoint.y
-            )
-            let projectionDuration: CGFloat = 0.2
-            let predicted = CGSize(
-                width: translationPoint.x + velocity.x * projectionDuration,
-                height: translationPoint.y + velocity.y * projectionDuration
-            )
-
-            switch recognizer.state {
-            case .began, .changed:
-                onDismissDragChanged(translation)
-            case .ended:
-                onDismissDragEnded(translation, predicted, false)
-            case .cancelled, .failed:
-                onDismissDragEnded(translation, predicted, true)
-            default:
-                break
-            }
-        }
-
-        func pageViewController(
-            _ pageViewController: UIPageViewController,
-            willTransitionTo pendingViewControllers: [UIViewController]
-        ) {
-            isManualTransitionInProgress = true
-        }
-
-        func pageViewController(
-            _ pageViewController: UIPageViewController,
-            viewControllerBefore viewController: UIViewController
-        ) -> UIViewController? {
-            guard let photoPage = viewController as? LANFolderPageController else {
-                return nil
-            }
-            return page(at: photoPage.index - 1)
-        }
-
-        func pageViewController(
-            _ pageViewController: UIPageViewController,
-            viewControllerAfter viewController: UIViewController
-        ) -> UIViewController? {
-            guard let photoPage = viewController as? LANFolderPageController else {
-                return nil
-            }
-            return page(at: photoPage.index + 1)
-        }
-
-        func pageViewController(
-            _ pageViewController: UIPageViewController,
-            didFinishAnimating finished: Bool,
-            previousViewControllers: [UIViewController],
-            transitionCompleted completed: Bool
-        ) {
-            isManualTransitionInProgress = false
-
-            guard finished, completed,
-                  let visiblePage = pageViewController.viewControllers?
-                  .first as? LANFolderPageController
-            else {
-                if let stableIndex = displayedIndex {
-                    refreshPages(around: stableIndex)
-                }
-                return
-            }
-
-            let newIndex = visiblePage.index
-            pendingProgrammaticIndex = nil
-            displayedIndex = newIndex
-            if currentIndexBinding.wrappedValue != newIndex {
-                currentIndexBinding.wrappedValue = newIndex
-            }
-            refreshPages(around: newIndex)
-        }
-    }
-}
-
-@MainActor
-private final class LANFolderPageController: UIHostingController<AnyView> {
-    let index: Int
-
-    init(index: Int, rootView: AnyView) {
-        self.index = index
-        super.init(rootView: rootView)
-    }
-
-    @available(*, unavailable)
-    required dynamic init?(coder aDecoder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
     }
 }
 

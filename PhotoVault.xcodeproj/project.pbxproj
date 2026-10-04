@@ -58,6 +58,17 @@
 		A10000000000000000000060 /* SigLIP2Text.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000060 /* SigLIP2Text.mlpackage */; };
 		A10000000000000000000061 /* SigLIP2Vision.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000061 /* SigLIP2Vision.mlpackage */; };
 		A10000000000000000000062 /* tokenizer-v1.bin in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000062 /* tokenizer-v1.bin */; };
+		A10000000000000000000080 /* PhotoWorkspaceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000080 /* PhotoWorkspaceStore.swift */; };
+		A10000000000000000000081 /* PhotoEditEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000081 /* PhotoEditEngine.swift */; };
+		A10000000000000000000082 /* PhotoEditorScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000082 /* PhotoEditorScreen.swift */; };
+		A10000000000000000000083 /* PhotoCompressionViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000083 /* PhotoCompressionViews.swift */; };
+		A10000000000000000000084 /* ViewerWorkspaceActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000084 /* ViewerWorkspaceActions.swift */; };
+		A10000000000000000000085 /* LibraryTimelineViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000085 /* LibraryTimelineViews.swift */; };
+		A10000000000000000000086 /* PhotoDiscoveryViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000086 /* PhotoDiscoveryViews.swift */; };
+		A10000000000000000000087 /* PhotoCleanupViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000087 /* PhotoCleanupViews.swift */; };
+		A10000000000000000000088 /* PhotoMapScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000088 /* PhotoMapScreen.swift */; };
+		A10000000000000000000089 /* PhotoEditProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000089 /* PhotoEditProbe.swift */; };
+		A20000000000000000000004 /* ReferenceWorkflowUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* ReferenceWorkflowUITests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -125,6 +136,17 @@
 		B20000000000000000000001 /* PhotoVaultUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoVaultUITests.swift; sourceTree = "<group>"; };
 		B20000000000000000000003 /* AIPhotoAccessGrantUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AIPhotoAccessGrantUITests.swift; sourceTree = "<group>"; };
 		B20000000000000000000002 /* PhotoVaultUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PhotoVaultUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		B10000000000000000000080 /* PhotoWorkspaceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoWorkspaceStore.swift; sourceTree = "<group>"; };
+		B10000000000000000000081 /* PhotoEditEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoEditEngine.swift; sourceTree = "<group>"; };
+		B10000000000000000000082 /* PhotoEditorScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoEditorScreen.swift; sourceTree = "<group>"; };
+		B10000000000000000000083 /* PhotoCompressionViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoCompressionViews.swift; sourceTree = "<group>"; };
+		B10000000000000000000084 /* ViewerWorkspaceActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewerWorkspaceActions.swift; sourceTree = "<group>"; };
+		B10000000000000000000085 /* LibraryTimelineViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryTimelineViews.swift; sourceTree = "<group>"; };
+		B10000000000000000000086 /* PhotoDiscoveryViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoDiscoveryViews.swift; sourceTree = "<group>"; };
+		B10000000000000000000087 /* PhotoCleanupViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoCleanupViews.swift; sourceTree = "<group>"; };
+		B10000000000000000000088 /* PhotoMapScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoMapScreen.swift; sourceTree = "<group>"; };
+		B10000000000000000000089 /* PhotoEditProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoEditProbe.swift; sourceTree = "<group>"; };
+		B20000000000000000000004 /* ReferenceWorkflowUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReferenceWorkflowUITests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -183,6 +205,16 @@
 				B10000000000000000000021 /* ViewerPerformanceTrace.swift */,
 				B10000000000000000000022 /* ViewerNeighborPrefetch.swift */,
 				B10000000000000000000063 /* ViewerAlbumDock.swift */,
+				B10000000000000000000088 /* PhotoMapScreen.swift */,
+				B10000000000000000000087 /* PhotoCleanupViews.swift */,
+				B10000000000000000000086 /* PhotoDiscoveryViews.swift */,
+				B10000000000000000000085 /* LibraryTimelineViews.swift */,
+				B10000000000000000000084 /* ViewerWorkspaceActions.swift */,
+				B10000000000000000000083 /* PhotoCompressionViews.swift */,
+				B10000000000000000000082 /* PhotoEditorScreen.swift */,
+				B10000000000000000000081 /* PhotoEditEngine.swift */,
+				B10000000000000000000089 /* PhotoEditProbe.swift */,
+				B10000000000000000000080 /* PhotoWorkspaceStore.swift */,
 				B10000000000000000000023 /* PhotoGridPlaceholder.swift */,
 				B10000000000000000000010 /* Info.plist */,
 				B10000000000000000000013 /* Assets.xcassets */,
@@ -239,6 +271,7 @@
 		D20000000000000000000001 /* PhotoVaultUITests */ = {
 			isa = PBXGroup;
 			children = (
+				B20000000000000000000004 /* ReferenceWorkflowUITests.swift */,
 				B20000000000000000000001 /* PhotoVaultUITests.swift */,
 				B20000000000000000000003 /* AIPhotoAccessGrantUITests.swift */,
 			);
@@ -383,6 +416,16 @@
 				A10000000000000000000021 /* ViewerPerformanceTrace.swift in Sources */,
 				A10000000000000000000022 /* ViewerNeighborPrefetch.swift in Sources */,
 				A10000000000000000000063 /* ViewerAlbumDock.swift in Sources */,
+				A10000000000000000000088 /* PhotoMapScreen.swift in Sources */,
+				A10000000000000000000087 /* PhotoCleanupViews.swift in Sources */,
+				A10000000000000000000086 /* PhotoDiscoveryViews.swift in Sources */,
+				A10000000000000000000085 /* LibraryTimelineViews.swift in Sources */,
+				A10000000000000000000084 /* ViewerWorkspaceActions.swift in Sources */,
+				A10000000000000000000083 /* PhotoCompressionViews.swift in Sources */,
+				A10000000000000000000082 /* PhotoEditorScreen.swift in Sources */,
+				A10000000000000000000081 /* PhotoEditEngine.swift in Sources */,
+				A10000000000000000000089 /* PhotoEditProbe.swift in Sources */,
+				A10000000000000000000080 /* PhotoWorkspaceStore.swift in Sources */,
 				A10000000000000000000023 /* PhotoGridPlaceholder.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -391,6 +434,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A20000000000000000000004 /* ReferenceWorkflowUITests.swift in Sources */,
 				A20000000000000000000001 /* PhotoVaultUITests.swift in Sources */,
 				A20000000000000000000002 /* AIPhotoAccessGrantUITests.swift in Sources */,
 			);
@@ -461,7 +505,7 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconLight AppIconDark";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 36;
+				CURRENT_PROJECT_VERSION = 37;
 				DEVELOPMENT_TEAM = U8U443D7ZL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoVault/Info.plist;
@@ -484,7 +528,7 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconLight AppIconDark";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 36;
+				CURRENT_PROJECT_VERSION = 37;
 				DEVELOPMENT_TEAM = U8U443D7ZL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoVault/Info.plist;

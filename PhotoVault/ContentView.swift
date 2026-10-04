@@ -23,13 +23,20 @@ private final class SidebarDerivationMemo<Value> {
 }
 
 struct ContentView: View {
+#if DEBUG
+    @ObservedObject private var editProbe = PhotoEditProbe.shared
+#endif
     private enum RootTab: Hashable {
         case library
         case organizer
+        case albums
+        case map
+        case discovery
     }
 
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var store = PhotoLibraryStore()
+    @AppStorage("PhotoVault.appearance") private var appearance = "system"
     @State private var selectedRootTab = RootTab.library
     @State private var selection: PhotoSection? = .library
     @State private var columnVisibility: NavigationSplitViewVisibility = .automatic
@@ -111,6 +118,17 @@ struct ContentView: View {
                 PhotoPermissionView(store: store)
             }
         }
+#if DEBUG
+        .overlay(alignment: .topLeading) {
+            if ProcessInfo.processInfo.arguments.contains("--pv-edit-probe") {
+                Text(editProbe.result).font(.system(size: 1)).foregroundStyle(.clear)
+                    .frame(width: 1, height: 1).allowsHitTesting(false)
+                    .accessibilityIdentifier("photo-edit-probe-result")
+            }
+        }
+        .task { await editProbe.runIfRequested() }
+#endif
+        .preferredColorScheme(appearance == "dark" ? .dark : (appearance == "light" ? .light : nil))
         .task {
             photoVaultTraceLaunch("content task begin")
             store.start()
@@ -148,11 +166,21 @@ struct ContentView: View {
                 }
                 .tag(RootTab.library)
 
-            RandomPhotoOrganizerView(store: store)
-                .tabItem {
-                    Label("整理", systemImage: "rectangle.stack.badge.play")
-                }
+            PhotoCleanupScreen(store: store)
+                .tabItem { Label("清理", systemImage: "chart.donut") }
                 .tag(RootTab.organizer)
+
+            WorkspaceAlbumBrowser(store: store)
+                .tabItem { Label("相册", systemImage: "rectangle.stack") }
+                .tag(RootTab.albums)
+
+            PhotoMapScreen(store: store)
+                .tabItem { Label("地图", systemImage: "map") }
+                .tag(RootTab.map)
+
+            PhotoDiscoveryScreen(store: store)
+                .tabItem { Label("发现", systemImage: "sparkle.magnifyingglass") }
+                .tag(RootTab.discovery)
         }
         .tint(.blue)
     }
@@ -1577,6 +1605,8 @@ struct PhotoVaultSettingsView: View {
     private var slideshowTransitionRawValue = SlideshowTransitionStyle.fade.rawValue
     @AppStorage(AppIconPreference.storageKey)
     private var appIconPreferenceRawValue = AppIconPreference.system.rawValue
+    @AppStorage("PhotoVault.appearance") private var appearance = "system"
+    @State private var cacheCleared = false
     @State private var isDeletingRecycleBin = false
     @State private var alert: PhotoVaultAlert?
 
@@ -1628,6 +1658,25 @@ struct PhotoVaultSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("界面风格") {
+                    Picker("外观", selection: $appearance) {
+                        Text("跟随系统").tag("system")
+                        Text("浅色").tag("light")
+                        Text("深色").tag("dark")
+                    }
+                }
+                Section("权限与导出") {
+                    Link("照片、网络与通知权限", destination: URL(string: UIApplication.openSettingsURLString)!)
+                    ShareLink(item: PhotoWorkspaceStore.shared.journalExport()) { Label("导出日记和备注", systemImage: "square.and.arrow.up") }
+                    Button("清理图片缓存") {
+                        PhotoImageManager.shared.dropTransientCaches()
+                        LANFolderImageCache.shared.removeAll()
+                        Task.detached(priority: .utility) { LANFolderThumbnailDiskCache.purgeAll() }
+                        cacheCleared = true
+                    }
+                    if cacheCleared { Text("图片内存缓存已释放，文件夹缩略图缓存将在后台清理。").font(.caption).foregroundStyle(.secondary) }
+                }
+
                 Section("启动时打开") {
                     Picker("启动页面", selection: $startupDestinationRawValue) {
                         Text("首页")

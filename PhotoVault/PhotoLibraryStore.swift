@@ -106,7 +106,7 @@ enum PhotoRecycleBinStore {
 
 /// Declining the system delete prompt surfaces as this PhotoKit error code.
 /// It is a deliberate no-op, not a failure.
-private func isUserCancelledPhotoChange(_ error: Error) -> Bool {
+func isUserCancelledPhotoChange(_ error: Error) -> Bool {
     let nsError = error as NSError
     return nsError.domain == PHPhotosErrorDomain
         && nsError.code == PHPhotosError.userCancelled.rawValue
@@ -127,7 +127,11 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     /// evaluation of the root view — on a cold `photolibraryd` that call was
     /// sitting directly in front of the app's first frame.
     @Published private(set) var authorizationStatus: PHAuthorizationStatus
-    @Published private(set) var allPhotos: PHFetchResult<PHAsset>?
+    @Published private(set) var allPhotos: PHFetchResult<PHAsset>? {
+        didSet { libraryRevision &+= 1 }
+    }
+    /// Includes metadata edits whose library count and newest identifier stay unchanged.
+    private(set) var libraryRevision = 0
     @Published private(set) var albums: [PhotoAlbum] = [] {
         didSet { albumStructureRevision &+= 1 }
     }
@@ -1737,12 +1741,21 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             }
             let newToken = library.currentChangeToken
 
+            // Immutable snapshots for the main-queue closure below: capturing
+            // the `var`s directly would be a by-reference capture across
+            // isolation boundaries, which the Swift 6 concurrency diagnostics
+            // flag as a data race.
+            let capturedChangedAssets = changedAssets
+            let capturedDeletedIDs = deletedIDs
+            let capturedChangedCollectionIDs = changedCollectionIDs
+            let capturedDeletedCollectionIDs = deletedCollectionIDs
+
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.indexGeneration == generation else { return }
-                self.removeFromRecycleBin(ids: deletedIDs)
+                self.removeFromRecycleBin(ids: capturedDeletedIDs)
                 self.indexStore.upsertAssets(
-                    changedAssets,
-                    deletedIDs: deletedIDs,
+                    capturedChangedAssets,
+                    deletedIDs: capturedDeletedIDs,
                     librarySignature: librarySignature,
                     generation: generation
                 ) { [weak self] result in
@@ -1751,16 +1764,16 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                     case .failure(let error):
                         self.failIndexing(error)
                     case .success:
-                        let collectionIDsToRefresh = changedCollectionIDs
-                            .subtracting(deletedCollectionIDs)
-                        if !collectionIDsToRefresh.isEmpty || !deletedCollectionIDs.isEmpty {
+                        let collectionIDsToRefresh = capturedChangedCollectionIDs
+                            .subtracting(capturedDeletedCollectionIDs)
+                        if !collectionIDsToRefresh.isEmpty || !capturedDeletedCollectionIDs.isEmpty {
                             let changedUserAlbums = userAlbums.filter {
                                 collectionIDsToRefresh.contains($0.localIdentifier)
                             }
                             let currentUserAlbumIDs = Set(
                                 changedUserAlbums.map(\.localIdentifier)
                             )
-                            let removedOrNonUserAlbumIDs = deletedCollectionIDs.union(
+                            let removedOrNonUserAlbumIDs = capturedDeletedCollectionIDs.union(
                                 collectionIDsToRefresh.subtracting(currentUserAlbumIDs)
                             )
                             self.indexStore.updateAlbumMemberships(
