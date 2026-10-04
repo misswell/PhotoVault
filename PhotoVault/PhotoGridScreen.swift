@@ -8,6 +8,7 @@ struct PhotoGridScreen: View {
     @State private var queryAssets: PHFetchResult<PHAsset>?
     @State private var mediaScope = WorkspaceMediaScope.all
     @State private var oldestFirst = false
+    @State private var gridSideOverride: CGFloat?
     @AppStorage("PhotoVault.library.browseMode") private var browseModeRaw = LibraryBrowseMode.expanded.rawValue
     private var browseMode: LibraryBrowseMode { LibraryBrowseMode(rawValue: browseModeRaw) ?? .expanded }
     private var allowsTimeline: Bool { album == nil && title == "图库" }
@@ -52,17 +53,18 @@ struct PhotoGridScreen: View {
     var body: some View {
         Group {
             if let assets {
-                if assets.count == 0 {
+                if allowsTimeline && !browseMode.isGrid {
+                    LibraryTimelineContent(assets: assets, mode: browseMode, scope: mediaScope, oldestFirst: oldestFirst, store: store)
+                } else if assets.count == 0 {
                     ContentUnavailableView(
                         "还没有照片",
                         systemImage: "photo.on.rectangle.angled",
                         description: Text("照片出现在系统照片库后，会自动显示在这里。")
                     )
-                } else if allowsTimeline && !browseMode.isGrid {
-                    LibraryTimelineContent(assets: assets, mode: browseMode, store: store)
                 } else {
                     PhotoGridView(
                         assets: assets,
+                        preferredCellSideOverride: allowsTimeline ? gridSideOverride : nil,
                         isActive: !viewerNavigator.isGridInteractionBlocked
                             && slideshowLaunch == nil,
                         selectionMode: selectionMode,
@@ -111,8 +113,10 @@ struct PhotoGridScreen: View {
         .onChange(of: browseModeRaw) { _, value in
             if value == LibraryBrowseMode.compact.rawValue {
                 UserDefaults.standard.set(50.0, forKey: PhotoGridPreferences.preferredCellSideKey)
+                gridSideOverride = 50
             } else if value == LibraryBrowseMode.expanded.rawValue {
                 UserDefaults.standard.set(125.0, forKey: PhotoGridPreferences.preferredCellSideKey)
+                gridSideOverride = 125
             }
         }
         .task(id: "\(mediaScope.rawValue)-\(oldestFirst)-\(store.libraryRevision)") {

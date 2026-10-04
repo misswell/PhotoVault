@@ -499,6 +499,25 @@ final class AIPhotoSearchStore: @unchecked Sendable {
         }
     }
 
+    /// Reconcile a completed Photos full scan without discarding embeddings
+    /// belonging to surviving assets. Keyset pages stay valid as rows are deleted.
+    func removeMetadataAbsent(from seen: Set<String>) throws {
+        var cursor = ""
+        while true {
+            let page = try readQueue.sync {
+                try withReadOrWriteDatabase {
+                    let statement = try prepareStatement("SELECT asset_id FROM ai_asset WHERE asset_id > ? ORDER BY asset_id LIMIT 500")
+                    defer { sqlite3_finalize(statement) }
+                    try bindText(cursor, at: 1, to: statement)
+                    return try collectStrings(statement)
+                }
+            }
+            guard let last = page.last else { return }
+            try removeAssets(assetIDs: page.filter { !seen.contains($0) })
+            cursor = last
+        }
+    }
+
     /// Asset ids still needing an embedding, oldest first so a partial run makes
     /// visible progress rather than repeatedly indexing recent photos.
     func pendingAssetIDs(limit: Int) throws -> [String] {

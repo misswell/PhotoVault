@@ -530,6 +530,30 @@ do {
 }
 
 // ---------------------------------------------------------------------------
+section("full scan reconciliation across multiple keyset pages")
+do {
+    let paths = (database: workDirectory.appendingPathComponent("reconcile.sqlite"), embeddings: workDirectory.appendingPathComponent("reconcile.bin"))
+    let reconciled = AIPhotoSearchStore(databaseURL: paths.database, embeddingURL: paths.embeddings)
+    try reconciled.open(dimension: dimension, sourceModelSHA256: modelHash)
+    let records = (0..<1_205).map { metadata($0) }
+    try reconciled.upsertMetadata(records)
+    for index in [0, 501, 1_204] {
+        _ = try reconciled.storeEmbedding(assetID: assetID(index), vector: vector(for: index))
+        try reconciled.storeText(assetID: assetID(index), text: "reconcile searchable text")
+    }
+    let survivors = Set([assetID(0), assetID(1_204)])
+    try reconciled.removeMetadataAbsent(from: survivors)
+    let stats = try reconciled.stats()
+    check(stats.totalAssets == 2 && stats.embeddedAssets == 2, "full scan removes absent rows across page boundaries")
+    check(Set(try reconciled.candidateAssetIDs(filter: .init())) == survivors, "survivor embeddings retain their asset ownership")
+    check(try reconciled.metadata(for: [assetID(501)]).isEmpty, "deleted metadata is absent")
+    check(!((try reconciled.assetIDsMatchingText(terms: ["reconcile"], limit: 20)).contains(assetID(501))), "deleted OCR text is absent")
+    try reconciled.removeMetadataAbsent(from: survivors)
+    check(try reconciled.stats().totalAssets == 2, "full scan reconciliation is idempotent")
+    try reconciled.removeMetadataAbsent(from: [])
+    check(try reconciled.stats().totalAssets == 0 && reconciled.stats().embeddedAssets == 0, "empty library clears all metadata and embeddings")
+}
+
 print("\nchecks: \(checks), failures: \(failures)")
 if failures == 0 {
     print("RESULT: all \(checks) search-index checks passed")

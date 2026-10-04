@@ -1337,7 +1337,9 @@ struct PhotoViewerView: View {
                     Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
                 }
                 Button("从照片库删除", systemImage: "trash", role: .destructive) {
-                    if let currentAsset { store.deleteAssets([currentAsset]) { result in handle(result) } }
+                    if let currentAsset {
+                        store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
+                    }
                 }
             } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
             .glassEffect(.regular.interactive(), in: Circle())
@@ -3223,7 +3225,9 @@ struct IndexedPhotoViewerView: View {
                     Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
                 }
                 Button("从照片库删除", systemImage: "trash", role: .destructive) {
-                    if let currentAsset { store.deleteAssets([currentAsset]) { result in handle(result) } }
+                    if let currentAsset {
+                        store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
+                    }
                 }
             } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
             .glassEffect(.regular.interactive(), in: Circle())

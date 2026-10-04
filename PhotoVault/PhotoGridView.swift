@@ -317,6 +317,7 @@ private func photoGridContextMenu(
 /// callbacks, while UIKit provides recycling, prefetching and fast scrolling.
 struct PhotoGridView: UIViewRepresentable {
     let assets: PHFetchResult<PHAsset>
+    let preferredCellSideOverride: CGFloat?
     let isActive: Bool
     let selectionMode: Bool
     let selectedIDs: Set<String>
@@ -334,6 +335,7 @@ struct PhotoGridView: UIViewRepresentable {
 
     init(
         assets: PHFetchResult<PHAsset>,
+        preferredCellSideOverride: CGFloat? = nil,
         isActive: Bool,
         selectionMode: Bool,
         selectedIDs: Set<String>,
@@ -354,6 +356,7 @@ struct PhotoGridView: UIViewRepresentable {
         self.selectionMode = selectionMode
         self.selectedIDs = selectedIDs
         self.transitionCoordinator = transitionCoordinator
+        self.preferredCellSideOverride = preferredCellSideOverride
         self.onOpen = onOpen
         self.onToggleSelection = onToggleSelection
         self.onFavorite = onFavorite
@@ -395,6 +398,7 @@ struct PhotoGridView: UIViewRepresentable {
     }
 
     func updateUIView(_ collectionView: UICollectionView, context: Context) {
+        context.coordinator.applyPreferredSideOverride(preferredCellSideOverride)
         context.coordinator.update(
             collectionView: collectionView,
             assets: assets,
@@ -431,6 +435,20 @@ struct PhotoGridView: UIViewRepresentable {
         private var selectedIDs: Set<String>
         private var thumbnailSize = CGSize(width: 160, height: 160)
         private var preferredCellSide = PhotoGridMetrics.restoredPreferredCellSide()
+        private var lastPreferredSideOverride: CGFloat?
+        private var hasConfiguredPreferredSideOverride = false
+
+        func applyPreferredSideOverride(_ side: CGFloat?) {
+            if !hasConfiguredPreferredSideOverride {
+                // The initial size comes from the persisted pinch preference.
+                hasConfiguredPreferredSideOverride = true
+                lastPreferredSideOverride = side
+                return
+            }
+            guard side != lastPreferredSideOverride else { return }
+            lastPreferredSideOverride = side
+            if let side { preferredCellSide = PhotoGridMetrics.clampedPreferredSide(side) }
+        }
         private var isFastScrolling = false
         private var needsReloadOnActivation = false
         private var selectionPanDriver: PhotoSelectionPanDriver?

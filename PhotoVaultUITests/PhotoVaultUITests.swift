@@ -45,7 +45,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
     @discardableResult
     private func launchToGrid(arguments: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments += arguments
+        app.launchArguments += ["-PhotoVault.library.browseMode", "expanded"] + arguments
         app.launch()
         grantPhotoAccessIfNeeded()
 
@@ -811,7 +811,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
     /// 两套查看器共用同一座 UIKit 呈现桥，各自都要回归。
     func testUnsortedViewerPullDownDismissalKeepsGridAlive() throws {
         let app = XCUIApplication()
-        app.launchArguments += ["-viewer-cancel-reentry-probe"]
+        app.launchArguments += ["-viewer-cancel-reentry-probe", "-PhotoVault.library.browseMode", "expanded"]
         app.launch()
         if pvGrantPhotosPermissionIfNeeded() {
             app.terminate()
@@ -917,6 +917,7 @@ final class SlideshowOptionsUITests: XCTestCase {
     private func launchToGrid(interval: String = "12") -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments += [
+            "-PhotoVault.library.browseMode", "expanded",
             "-PhotoVault.slideshow.interval", interval,
             "-PhotoVault.slideshow.fillsScreen", "NO",
             "-PhotoVault.slideshow.shuffles", "NO",

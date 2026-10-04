@@ -923,6 +923,14 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         _ assets: [PHAsset],
         completion: @escaping @MainActor (Result<Void, Error>) -> Void = { _ in }
     ) {
+        deleteAssets(assets, onDeleted: {}, completion: completion)
+    }
+
+    func deleteAssets(
+        _ assets: [PHAsset],
+        onDeleted: @escaping @MainActor () -> Void,
+        completion: @escaping @MainActor (Result<Void, Error>) -> Void
+    ) {
         guard !assets.isEmpty else {
             completion(.success(()))
             return
@@ -935,6 +943,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             case .success:
                 self?.removeFromRecycleBin(ids: assets.map(\.localIdentifier))
                 self?.optimisticallyRemoveAssets(assets)
+                onDeleted()
                 completion(result)
             case .failure(let error):
                 // Declining the system delete prompt is a deliberate no-op:

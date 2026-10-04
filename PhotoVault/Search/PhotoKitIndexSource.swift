@@ -101,26 +101,19 @@ struct PhotoKitMetadataSync {
 
         do {
             let fetch = try PHPhotoLibrary.shared().fetchPersistentChanges(since: storedToken)
-            var isFirst = true
             // `PHPersistentChangeFetchResult` is enumerated incrementally; each
             // change carries its own token, so the newest one is kept rather
             // than the fetch result's.
             for change in fetch {
                 try apply(change, into: &result)
-                isFirst = false
-            }
-            if isFirst {
-                // No changes: still record the token PhotoKit reports, which may
-                // have advanced even with nothing to apply. Skipping this would
-                // re-examine the same range on every launch.
-                try store.setChangeToken(try currentToken())
-            } else {
-                try store.setChangeToken(try currentToken())
             }
         } catch {
-            // An expired token is expected after a restore or a long gap, and is
-            // the only correct trigger for a full rescan. Any other error is
+            // Missing Photos change history requires a full rescan. Other errors are
             // reported rather than silently escalated into a rescan.
+            let photoError = error as NSError
+            guard photoError.domain == PHPhotosErrorDomain,
+                  photoError.code == PHPhotosError.Code.persistentChangeTokenExpired.rawValue
+                    || photoError.code == PHPhotosError.Code.persistentChangeDetailsUnavailable.rawValue else { throw error }
             try store.setChangeToken(nil)
             result = PhotoMetadataSyncResult(isLimited: Self.isLimited)
             try fullScan(into: &result)
@@ -183,9 +176,12 @@ struct PhotoKitMetadataSync {
         return count
     }
 
-    /// A full library scan, used only when the token has expired.
+    /// A full library scan, used when no valid change history is available.
     private func fullScan(into result: inout PhotoMetadataSyncResult) throws {
         result.didFullScan = true
+        // Capture before fetching. Changes during this scan must be replayed
+        // next time instead of skipped by a token read at the end.
+        let boundaryToken = try currentToken()
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let fetch = PHAsset.fetchAssets(with: options)
@@ -193,15 +189,20 @@ struct PhotoKitMetadataSync {
 
         var records: [AIPhotoSearchStore.AssetMetadata] = []
         records.reserveCapacity(min(fetch.count, 2_000))
-        fetch.enumerateObjects { asset, index, _ in
+        var seen = Set<String>()
+        seen.reserveCapacity(fetch.count)
+        for index in 0..<fetch.count {
+            let asset = fetch.object(at: index)
+            seen.insert(asset.localIdentifier)
             records.append(Self.metadata(for: asset))
             // Written in chunks so a 100k library never exists as one array.
             if records.count >= 2_000 || index == fetch.count - 1 {
-                try? self.store.upsertMetadata(records)
+                try store.upsertMetadata(records)
                 records.removeAll(keepingCapacity: true)
             }
         }
-        try store.setChangeToken(try currentToken())
+        try store.removeMetadataAbsent(from: seen)
+        try store.setChangeToken(boundaryToken)
     }
 
     static func metadata(for asset: PHAsset) -> AIPhotoSearchStore.AssetMetadata {

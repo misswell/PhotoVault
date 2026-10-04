@@ -82,10 +82,15 @@ final class ReferenceWorkflowUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["compression-saved"].waitForExistence(timeout: 30))
         app.buttons["查看对比"].tap()
         let record = app.buttons["compression-history-record"].firstMatch
-        XCTAssertTrue(record.waitForExistence(timeout: 10)); record.tap()
+        XCTAssertTrue(record.waitForExistence(timeout: 10))
+        let recordID = record.value as? String
+        record.tap()
         let revert = app.buttons["compression-revert"]
         XCTAssertTrue(revert.waitForExistence(timeout: 10)); capture("reversible-edit", app: app); revert.tap()
         XCTAssertTrue(revert.waitForNonExistence(timeout: 20))
+        if let recordID {
+            XCTAssertTrue(app.buttons.matching(NSPredicate(format: "identifier == 'compression-history-record' AND value == %@", recordID)).firstMatch.waitForNonExistence(timeout: 10), "还原后的旧压缩记录应被移除")
+        }
     }
 
     func testVideoCompressionSavesAndCanComparePlayback() {
@@ -117,6 +122,76 @@ final class ReferenceWorkflowUITests: XCTestCase {
         }
         modes.buttons["展开"].tap()
         XCTAssertTrue(app.collectionViews["photo-grid"].waitForExistence(timeout: 10))
+    }
+
+    func testCompactAndExpandedImmediatelyChangeCellSize() {
+        let app = launch()
+        let modes = app.segmentedControls["library-browse-modes"]
+        XCTAssertTrue(modes.waitForExistence(timeout: 15))
+        modes.buttons["紧凑"].tap()
+        let cell = app.collectionViews["photo-grid"].cells["photo-cell-0"]
+        XCTAssertTrue(cell.waitForExistence(timeout: 10))
+        let compactWidth = cell.frame.width
+        modes.buttons["展开"].tap()
+        expectation(for: NSPredicate { _, _ in cell.frame.width > compactWidth * 1.5 }, evaluatedWith: cell)
+        waitForExpectations(timeout: 10)
+        let expandedWidth = cell.frame.width
+        modes.buttons["紧凑"].tap()
+        expectation(for: NSPredicate { _, _ in cell.frame.width < expandedWidth / 1.5 }, evaluatedWith: cell)
+        waitForExpectations(timeout: 10)
+    }
+
+    func testVideoTimelineDrilldownPreservesFilter() {
+        let app = launch()
+        XCTAssertTrue(app.buttons["筛选与排序"].waitForExistence(timeout: 15))
+        app.buttons["筛选与排序"].tap(); app.buttons["视频"].firstMatch.tap()
+        let modes = app.segmentedControls["library-browse-modes"]
+        modes.buttons["月"].tap()
+        let period = app.buttons["timeline-period"].firstMatch
+        XCTAssertTrue(period.waitForExistence(timeout: 15)); period.tap()
+        let grid = app.collectionViews["photo-grid"]
+        XCTAssertTrue(grid.waitForExistence(timeout: 15))
+        XCTAssertGreaterThan(grid.cells.count, 0)
+        XCTAssertEqual(grid.cells.matching(NSPredicate(format: "label == '照片'")).count, 0, "视频月份不能混入照片")
+    }
+
+    func testViewerDeleteCancellationAndConfirmedDeletion() {
+        let app = launch(["-PhotoVault.library.browseMode", "expanded"])
+        openViewer(app)
+        func prompt() -> XCUIElement {
+            app.buttons["更多照片操作"].tap()
+            app.buttons["从照片库删除"].firstMatch.tap()
+            let local = app.sheets.firstMatch
+            if local.waitForExistence(timeout: 5) { return local }
+            let system = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
+            XCTAssertTrue(system.waitForExistence(timeout: 10)); return system
+        }
+        let cancelled = prompt()
+        let cancel = cancelled.buttons.matching(NSPredicate(format: "label IN %@", ["取消", "Cancel", "Don’t Allow", "Don't Allow", "不允许"])).firstMatch
+        XCTAssertTrue(cancel.exists); cancel.tap()
+        XCTAssertTrue(app.buttons["viewer-edit"].exists, "取消删除应保留查看器")
+        let confirmed = prompt()
+        let delete = confirmed.buttons.matching(NSPredicate(format: "label CONTAINS '删除' OR label CONTAINS 'Delete'")).firstMatch
+        XCTAssertTrue(delete.exists); delete.tap()
+        XCTAssertTrue(app.buttons["viewer-edit"].waitForNonExistence(timeout: 20), "确认删除后应返回网格")
+        let cell = app.collectionViews["photo-grid"].cells["photo-cell-0"]
+        XCTAssertTrue(cell.waitForExistence(timeout: 15)); XCTAssertTrue(cell.isHittable); cell.tap()
+        XCTAssertTrue(app.buttons["viewer-edit"].waitForExistence(timeout: 10), "删除后网格应可再次打开照片")
+    }
+
+    func testSmallSlowHorizontalDragBouncesBack() {
+        let app = launch(["-PhotoVault.library.browseMode", "expanded"])
+        openViewer(app)
+        let counter = app.staticTexts["viewer-counter"]
+        let before = counter.label
+        let window = app.windows.firstMatch
+        let start = window.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.4))
+        let end = window.coordinate(withNormalizedOffset: CGVector(dx: 0.63, dy: 0.4))
+        start.press(forDuration: 0.05, thenDragTo: end, withVelocity: XCUIGestureVelocity(rawValue: 60), thenHoldForDuration: 0.2)
+        XCTAssertEqual(counter.label, before, "12% 宽度的慢拖应回弹，不应误翻页")
+        app.swipeLeft()
+        expectation(for: NSPredicate(format: "label != %@", before), evaluatedWith: counter)
+        waitForExpectations(timeout: 10)
     }
 
     func testNoteSavedAndSearchableInDiscovery() {

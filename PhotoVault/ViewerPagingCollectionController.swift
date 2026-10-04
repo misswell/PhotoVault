@@ -562,9 +562,8 @@ final class ViewerPagingCollectionController: NSObject, UICollectionViewDataSour
     }
 
     /// Fraction of the viewport a slow drag must cover before the page turns.
-    /// Keep this short so a deliberate swipe commits without requiring the
-    /// long travel of UIScrollView's default half-page threshold.
-    static let pagingCommitFraction: CGFloat = 0.06
+    /// Match the system Photos threshold; a small slow movement bounces back.
+    static let pagingCommitFraction: CGFloat = 0.30
 
     private func finishPaging() {
         if hasReportedPaging {

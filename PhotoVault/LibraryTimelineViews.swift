@@ -11,13 +11,19 @@ enum WorkspaceMediaScope: String, CaseIterable, Identifiable, Sendable {
 
 actor WorkspaceLibraryQuery {
     static let shared = WorkspaceLibraryQuery()
-    func fetch(scope: WorkspaceMediaScope, oldestFirst: Bool) -> PhotoFetchSnapshot {
+    func fetch(scope: WorkspaceMediaScope, oldestFirst: Bool, start: Date? = nil, end: Date? = nil) -> PhotoFetchSnapshot {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: oldestFirst)]
+        if let start, let end {
+            options.predicate = NSPredicate(format: "creationDate >= %@ AND creationDate < %@", start as NSDate, end as NSDate)
+        }
+        func addPredicate(_ predicate: NSPredicate) {
+            options.predicate = options.predicate.map { NSCompoundPredicate(andPredicateWithSubpredicates: [$0, predicate]) } ?? predicate
+        }
         switch scope {
-        case .photos: options.predicate = NSPredicate(format: "mediaType = %d", PHAssetMediaType.image.rawValue)
-        case .videos: options.predicate = NSPredicate(format: "mediaType = %d", PHAssetMediaType.video.rawValue)
-        case .favorites: options.predicate = NSPredicate(format: "favorite = YES")
+        case .photos: addPredicate(NSPredicate(format: "mediaType = %d", PHAssetMediaType.image.rawValue))
+        case .videos: addPredicate(NSPredicate(format: "mediaType = %d", PHAssetMediaType.video.rawValue))
+        case .favorites: addPredicate(NSPredicate(format: "favorite = YES"))
         case .screenshots, .live:
             let subtype: PHAssetCollectionSubtype = scope == .screenshots ? .smartAlbumScreenshots : .smartAlbumLivePhotos
             if let album = PHAssetCollection.fetchAssetCollections(with: .smartAlbum, subtype: subtype, options: nil).firstObject {
@@ -51,7 +57,7 @@ struct PhotoFetchSnapshot: @unchecked Sendable { let result: PHFetchResult<PHAss
 
 actor LibraryTimelineWorker {
     static let shared = LibraryTimelineWorker()
-    func periods(_ snapshot: PhotoFetchSnapshot, mode: LibraryBrowseMode) throws -> [LibraryPeriod] {
+    func periods(_ snapshot: PhotoFetchSnapshot, mode: LibraryBrowseMode, journalDates: [Date] = [], oldestFirst: Bool = false) throws -> [LibraryPeriod] {
         let calendar = Calendar.current
         let component: Calendar.Component = mode == .years ? .year : (mode == .months ? .month : .day)
         var groups: [Date: (end: Date, count: Int, previews: [String])] = [:]
@@ -64,20 +70,32 @@ actor LibraryTimelineWorker {
             if group.previews.count < 6 { group.previews.append(asset.localIdentifier) }
             groups[interval.start] = group
         }
-        return groups.map { LibraryPeriod(start: $0.key, end: $0.value.end, count: $0.value.count, previews: $0.value.previews) }.sorted { $0.start > $1.start }
+        if mode == .journal {
+            for date in journalDates {
+                guard let interval = calendar.dateInterval(of: .day, for: date), groups[interval.start] == nil else { continue }
+                groups[interval.start] = (interval.end, 0, [])
+            }
+        }
+        return groups.map { LibraryPeriod(start: $0.key, end: $0.value.end, count: $0.value.count, previews: $0.value.previews) }
+            .sorted { oldestFirst ? $0.start < $1.start : $0.start > $1.start }
     }
 
-    func fetch(start: Date, end: Date) -> PhotoFetchSnapshot {
-        let options = PHFetchOptions()
-        options.predicate = NSPredicate(format: "creationDate >= %@ AND creationDate < %@", start as NSDate, end as NSDate)
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        return PhotoFetchSnapshot(result: PHAsset.fetchAssets(with: options))
-    }
+}
+
+private struct TimelineRequest: Equatable {
+    let mode: LibraryBrowseMode
+    let assets: ObjectIdentifier
+    let revision: Int
+    let journalDates: [Date]
+    let scope: WorkspaceMediaScope
+    let oldestFirst: Bool
 }
 
 struct LibraryTimelineContent: View {
     let assets: PHFetchResult<PHAsset>
     let mode: LibraryBrowseMode
+    var scope: WorkspaceMediaScope = .all
+    var oldestFirst = false
     @ObservedObject var store: PhotoLibraryStore
     @ObservedObject private var workspace = PhotoWorkspaceStore.shared
     @State private var periods: [LibraryPeriod] = []
@@ -89,7 +107,7 @@ struct LibraryTimelineContent: View {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: mode == .years ? 100 : 130))], spacing: 18) {
                     ForEach(periods) { period in
                         VStack(alignment: .leading, spacing: 8) {
-                            NavigationLink { LibraryPeriodScreen(period: period, store: store) } label: {
+                            NavigationLink { LibraryPeriodScreen(period: period, store: store, scope: scope, oldestFirst: oldestFirst) } label: {
                                 VStack(alignment: .leading, spacing: 8) {
                                     if let id = period.previews.first, let asset = WorkspacePhotoAccess.asset(id) {
                                         WorkspaceThumbnail(asset: asset).frame(height: 100).clipShape(RoundedRectangle(cornerRadius: 14))
@@ -97,8 +115,8 @@ struct LibraryTimelineContent: View {
                                     Text(period.start.formatted(mode == .years ? .dateTime.year() : .dateTime.year().month())).font(.headline)
                                     Text("\(period.count.formatted()) 项").font(.caption).foregroundStyle(.secondary)
                                 }.foregroundStyle(.primary)
-                            }.buttonStyle(.plain)
-                            if mode == .months { MiniMonthCalendar(month: period.start, store: store) }
+                            }.buttonStyle(.plain).accessibilityIdentifier("timeline-period")
+                            if mode == .months { MiniMonthCalendar(month: period.start, store: store, scope: scope, oldestFirst: oldestFirst) }
                         }
                     }
                 }.padding()
@@ -106,13 +124,13 @@ struct LibraryTimelineContent: View {
                 LazyVStack(spacing: 18) {
                     ForEach(periods) { period in
                         VStack(alignment: .leading, spacing: 10) {
-                            NavigationLink { LibraryPeriodScreen(period: period, store: store) } label: {
+                            NavigationLink { LibraryPeriodScreen(period: period, store: store, scope: scope, oldestFirst: oldestFirst) } label: {
                                 HStack { Text(period.start.formatted(date: .complete, time: .omitted)).font(.headline); Spacer(); Text("\(period.count) 项").foregroundStyle(.secondary); Image(systemName: "chevron.right") }.foregroundStyle(.primary)
-                            }
+                            }.accessibilityIdentifier("timeline-period")
                             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 3), count: 3), spacing: 3) {
                                 ForEach(period.previews, id: \.self) { id in
                                     if let asset = WorkspacePhotoAccess.asset(id) {
-                                        NavigationLink { LibraryPeriodScreen(period: period, store: store) } label: {
+                                        NavigationLink { LibraryPeriodScreen(period: period, store: store, scope: scope, oldestFirst: oldestFirst) } label: {
                                             WorkspaceThumbnail(asset: asset).frame(height: 100)
                                         }
                                     }
@@ -137,10 +155,10 @@ struct LibraryTimelineContent: View {
             else if periods.isEmpty { ContentUnavailableView("没有拍摄日期", systemImage: "calendar") }
         }
         .accessibilityIdentifier("library-timeline")
-        .task(id: "\(mode.rawValue)-\(ObjectIdentifier(assets))") {
-            loading = true
+        .task(id: TimelineRequest(mode: mode, assets: ObjectIdentifier(assets), revision: store.libraryRevision, journalDates: mode == .journal ? workspace.journal.map(\.date) : [], scope: scope, oldestFirst: oldestFirst)) {
+            loading = true; error = nil
             do {
-                let result = try await LibraryTimelineWorker.shared.periods(PhotoFetchSnapshot(result: assets), mode: mode)
+                let result = try await LibraryTimelineWorker.shared.periods(PhotoFetchSnapshot(result: assets), mode: mode, journalDates: workspace.journal.map(\.date), oldestFirst: oldestFirst)
                 try Task.checkCancellation(); periods = result; loading = false
             } catch is CancellationError {} catch { self.error = error.localizedDescription; loading = false }
         }
@@ -150,11 +168,13 @@ struct LibraryTimelineContent: View {
 struct LibraryPeriodScreen: View {
     let period: LibraryPeriod
     @ObservedObject var store: PhotoLibraryStore
+    var scope: WorkspaceMediaScope = .all
+    var oldestFirst = false
     @State private var assets: PHFetchResult<PHAsset>?
     var body: some View {
         PhotoGridScreen(title: period.start.formatted(date: .abbreviated, time: .omitted), assets: assets, store: store)
-            .task(id: "\(period.id)-\(store.libraryRevision)") {
-                let result = await LibraryTimelineWorker.shared.fetch(start: period.start, end: period.end)
+            .task(id: "\(period.id)-\(store.libraryRevision)-\(scope.rawValue)-\(oldestFirst)") {
+                let result = await WorkspaceLibraryQuery.shared.fetch(scope: scope, oldestFirst: oldestFirst, start: period.start, end: period.end)
                 if !Task.isCancelled { assets = result.result }
             }
     }
@@ -163,6 +183,8 @@ struct LibraryPeriodScreen: View {
 private struct MiniMonthCalendar: View {
     let month: Date
     @ObservedObject var store: PhotoLibraryStore
+    var scope: WorkspaceMediaScope = .all
+    var oldestFirst = false
     private var calendar: Calendar { .current }
     var body: some View {
         let offset = (calendar.component(.weekday, from: month) - calendar.firstWeekday + 7) % 7
@@ -173,7 +195,7 @@ private struct MiniMonthCalendar: View {
                 else {
                     let day = calendar.date(byAdding: .day, value: index - offset, to: month)!
                     NavigationLink {
-                        LibraryPeriodScreen(period: LibraryPeriod(start: day, end: calendar.date(byAdding: .day, value: 1, to: day)!, count: 0, previews: []), store: store)
+                        LibraryPeriodScreen(period: LibraryPeriod(start: day, end: calendar.date(byAdding: .day, value: 1, to: day)!, count: 0, previews: []), store: store, scope: scope, oldestFirst: oldestFirst)
                     } label: {
                         Text("\(index - offset + 1)").font(.system(size: 9, weight: calendar.isDateInToday(day) ? .bold : .regular)).foregroundStyle(calendar.isDateInToday(day) ? .blue : .secondary)
                     }

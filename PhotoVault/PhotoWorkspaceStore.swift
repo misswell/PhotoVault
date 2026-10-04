@@ -165,6 +165,11 @@ final class PhotoWorkspaceStore: ObservableObject {
         persist(recentAlbumIDs, key: "recentAlbums")
     }
 
+    func removeReplacedCompression(for assetID: String) {
+        compressionHistory.removeAll { $0.replaced && $0.resultID == assetID }
+        persist(compressionHistory, key: "compression")
+    }
+
     func saveLook(_ recipe: PhotoEditRecipe, named name: String) {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }

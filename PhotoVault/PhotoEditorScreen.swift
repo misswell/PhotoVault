@@ -227,8 +227,12 @@ struct PhotoEditorScreen: View {
     private func sliderChanged(_ editing: Bool) { if editing { beginSlider() } else { endSlider() } }
     private func setRatio(_ text: String) {
         let parts = text.split(separator: ":").compactMap { Double($0) }
-        guard parts.count == 2, let preview else { return }
-        let ratio = parts[0] / parts[1] / (preview.size.width / preview.size.height)
+        // Preview rendering is asynchronous; after a quick rotation it can
+        // still show the old orientation. Geometry comes from the recipe.
+        guard parts.count == 2, let original else { return }
+        let originalRatio = original.size.width / original.size.height
+        let imageRatio = recipe.quarterTurns % 2 == 0 ? originalRatio : 1 / originalRatio
+        let ratio = parts[0] / parts[1] / imageRatio
         change { value in
             let w = min(1, ratio), h = min(1, 1 / ratio)
             value.crop = PhotoCrop(x: (1 - w) / 2, y: (1 - h) / 2, width: w, height: h)

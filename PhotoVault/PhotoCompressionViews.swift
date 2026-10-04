@@ -10,6 +10,7 @@ struct PhotoCompressionSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var options = PhotoExportOptions()
     @State private var rendered: RenderedPhoto?
+    @State private var preparedRequest: PhotoCompressionRequest?
     @State private var sourceImage: UIImage?
     @State private var resultImage: UIImage?
     @State private var busy = false
@@ -89,7 +90,7 @@ struct PhotoCompressionSheet: View {
                                 .accessibilityIdentifier("compression-replace")
                         }
                         Button("查看对比") { showHistory = true }.buttonStyle(.bordered).disabled(saved == nil)
-                    }.disabled(busy || rendering || rendered == nil)
+                    }.disabled(busy || rendering || rendered == nil || preparedRequest != PhotoCompressionRequest(recipe: recipe, options: options))
                     if options.format == .png { Text("PNG 无损结果使用另存保存。").font(.caption).foregroundStyle(.secondary) }
                     if saved != nil { Label("已保存到照片库", systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.caption).accessibilityIdentifier("compression-saved") }
                 }.padding().frame(maxWidth: .infinity).background(.bar)
@@ -101,18 +102,22 @@ struct PhotoCompressionSheet: View {
                 sourceImage = UIImage(data: source.data)
             }
         }
-        .task(id: options) {
-            rendering = true; saved = nil
+        .task(id: PhotoCompressionRequest(recipe: recipe, options: options)) {
+            let request = PhotoCompressionRequest(recipe: recipe, options: options)
+            rendering = true; saved = nil; rendered = nil; preparedRequest = nil; resultImage = nil
             do {
                 try await Task.sleep(for: .milliseconds(180))
-                let result = try await PhotoRenderWorker.shared.render(data: data, recipe: recipe, options: options)
+                let result = try await PhotoRenderWorker.shared.render(data: data, recipe: request.recipe, options: request.options)
                 try Task.checkCancellation()
-                rendered = result
-                var previewOptions = options; previewOptions.maxDimension = 1400
+                var previewOptions = request.options; previewOptions.maxDimension = 1400
                 let small = try await PhotoRenderWorker.shared.render(data: result.data, recipe: .init(), options: previewOptions, preview: true)
                 try Task.checkCancellation()
-                resultImage = UIImage(data: small.data); rendering = false
-            } catch is CancellationError {} catch { rendering = false; self.error = error.localizedDescription }
+                guard request == PhotoCompressionRequest(recipe: recipe, options: options) else { return }
+                rendered = result; preparedRequest = request; resultImage = UIImage(data: small.data); rendering = false
+            } catch is CancellationError {} catch {
+                guard !Task.isCancelled else { return }
+                rendering = false; self.error = error.localizedDescription
+            }
         }
         .sheet(isPresented: $showHistory) { NavigationStack { CompressionHistoryScreen(store: store) } }
         .alert("无法保存", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
@@ -130,7 +135,7 @@ struct PhotoCompressionSheet: View {
     }
 
     private func save(replace: Bool) {
-        guard !busy, let rendered else { return }
+        guard !busy, !rendering, preparedRequest == PhotoCompressionRequest(recipe: recipe, options: options), let rendered else { return }
         busy = true
         let albums = store.userAlbums(containing: asset)
         Task {
@@ -161,7 +166,7 @@ struct CompressionHistoryScreen: View {
                             if record.replaced { Text("可还原编辑").font(.caption2).foregroundStyle(.blue) }
                         }
                     }
-                }.accessibilityIdentifier("compression-history-record")
+                }.accessibilityIdentifier("compression-history-record").accessibilityValue(record.id.uuidString)
             }
         }
         .overlay { if workspace.compressionHistory.isEmpty { ContentUnavailableView("还没有压缩记录", systemImage: "arrow.down.right.and.arrow.up.left", description: Text("在照片详情中打开编辑并保存，结果会显示在这里。")) } }
@@ -208,7 +213,11 @@ struct CompressionHistoryScreen: View {
         deleting = true
         Task {
             defer { deleting = false }
-            do { try await PHPhotoLibrary.shared().performChanges { @Sendable in PHAssetChangeRequest(for: asset).revertAssetContentToOriginal() }; selected = nil }
+            do {
+                try await PHPhotoLibrary.shared().performChanges { @Sendable in PHAssetChangeRequest(for: asset).revertAssetContentToOriginal() }
+                workspace.removeReplacedCompression(for: record.resultID)
+                selected = nil
+            }
             catch { self.error = error.localizedDescription }
         }
     }
@@ -270,7 +279,7 @@ struct VideoCompressionSheet: View {
                 Section("分辨率") {
                     Picker("最长边", selection: $resolution) {
                         ForEach(PhotoExportOptions.resolutions, id: \.self) { value in Text(PhotoExportOptions.resolutionTitle(value)).tag(value) }
-                    }
+                    }.disabled(busy)
                     Text("使用系统视频编码器，保留声音、拍摄时间、位置、收藏和相册。不会放大原视频。").font(.footnote).foregroundStyle(.secondary)
                 }
                 if saved { Label("已保存到照片库", systemImage: "checkmark.circle.fill").foregroundStyle(.green).accessibilityIdentifier("video-compression-saved")
@@ -289,14 +298,16 @@ struct VideoCompressionSheet: View {
         .alert("无法压缩", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) { Button("好") { error = nil } } message: { Text(error ?? "") }
     }
     private func compress() {
+        guard !busy else { return }
         busy = true; saved = false
+        let selectedResolution = resolution
         let albums = store.userAlbums(containing: asset)
         Task {
             defer { busy = false }
             do {
                 let input = try await WorkspacePhotoAccess.editingInput(asset)
                 guard let avAsset = input.audiovisualAsset else { throw MediaWorkspaceError.unavailable }
-                let targetEdge = resolution == 0 ? max(asset.pixelWidth, asset.pixelHeight) : resolution
+                let targetEdge = selectedResolution == 0 ? max(asset.pixelWidth, asset.pixelHeight) : selectedResolution
                 let edge = min(targetEdge, max(asset.pixelWidth, asset.pixelHeight))
                 let preset: String = edge <= 854 ? AVAssetExportPreset640x480 : (edge <= 1280 ? AVAssetExportPreset1280x720 : (edge <= 1920 ? AVAssetExportPreset1920x1080 : AVAssetExportPreset3840x2160))
                 guard let session = AVAssetExportSession(asset: avAsset, presetName: preset),

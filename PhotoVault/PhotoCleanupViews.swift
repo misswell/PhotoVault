@@ -26,7 +26,7 @@ struct CleanupSnapshot: Codable, Sendable {
     let similarGroups: [[String]]
 }
 
-struct CleanupDay: Sendable { let date: Date; let bytes: Int64 }
+struct CleanupDay: Sendable { let date: Date; let bytes: Int64; let unknownCount: Int }
 struct CleanupBucket: Sendable { let name: String; let count: Int }
 struct CleanupProjection: Sendable {
     let bytes: Int64
@@ -52,11 +52,50 @@ actor CleanupProjectionWorker {
             "live": items.filter { $0.live && ($0.bytes ?? 0) >= 3_000_000 }
         ]
         let days = Dictionary(grouping: items.filter { $0.date != nil }, by: { Calendar.current.startOfDay(for: $0.date!) })
-            .map { CleanupDay(date: $0.key, bytes: $0.value.reduce(0) { $0 + ($1.bytes ?? 0) }) }.sorted { $0.date > $1.date }
+            .map { CleanupDay(date: $0.key, bytes: $0.value.reduce(0) { $0 + ($1.bytes ?? 0) }, unknownCount: $0.value.filter { $0.bytes == nil }.count) }.sorted { $0.date > $1.date }
         let ranges: [(String, Range<Int64>)] = [("< 1 MB", 0..<1_000_000), ("1–5 MB", 1_000_000..<5_000_000), ("5–20 MB", 5_000_000..<20_000_000), ("20–100 MB", 20_000_000..<100_000_000), ("≥ 100 MB", 100_000_000..<Int64.max)]
         let buckets = ranges.map { name, range in CleanupBucket(name: name, count: items.filter { $0.bytes.map { range.contains($0) } ?? false }.count) }
         return CleanupProjection(bytes: items.reduce(0) { $0 + ($1.bytes ?? 0) }, measuredCount: items.filter { $0.bytes != nil }.count,
                                  duplicates: duplicates, categories: categories, days: days, buckets: buckets)
+    }
+}
+
+/// Six disjoint hash bands guarantee that a pair within five differing bits
+/// shares a band. Candidate lookup spans the library without an all-pairs scan.
+struct CleanupSimilarityIndex {
+    private struct Candidate { let id: String; let hash: UInt64; let ratio: Double }
+    private struct Band: Hashable { let index: Int; let value: UInt64 }
+    private var buckets: [Band: [Candidate]] = [:]
+    private var exact: [UInt64: [Candidate]] = [:]
+    private var groupByID: [String: Int] = [:]
+    private(set) var groups: [[String]] = []
+
+    mutating func add(id: String, hash: UInt64, ratio: Double) {
+        let candidate = Candidate(id: id, hash: hash, ratio: ratio)
+        let identical = exact[hash]?.first { abs($0.ratio - ratio) < 0.05 }
+        let bands = (0..<6).map { index in
+            let shift = index * 11
+            let bits = min(11, 64 - shift)
+            return Band(index: index, value: (hash >> shift) & ((1 << bits) - 1))
+        }
+        var match = identical
+        if match == nil {
+            for band in bands {
+                if let found = buckets[band]?.last(where: { abs($0.ratio - ratio) < 0.05 && ($0.hash ^ hash).nonzeroBitCount <= 5 }) {
+                    match = found; break
+                }
+            }
+        }
+        if let match {
+            if let group = groupByID[match.id] { groups[group].append(id); groupByID[id] = group }
+            else { groupByID[match.id] = groups.count; groupByID[id] = groups.count; groups.append([match.id, id]) }
+        }
+        // Identical hashes with a matching aspect ratio already have a lookup
+        // representative; avoid huge candidate buckets for repeated images.
+        if identical == nil {
+            exact[hash, default: []].append(candidate)
+            for band in bands { buckets[band, default: []].append(candidate) }
+        }
     }
 }
 
@@ -65,22 +104,20 @@ actor PhotoCleanupWorker {
     private var cacheURL: URL {
         let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("PhotoVault", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory.appendingPathComponent("cleanup-v1.json")
+        return directory.appendingPathComponent("cleanup-v2.json")
     }
     func load() -> CleanupSnapshot? {
         guard let data = try? Data(contentsOf: cacheURL) else { return nil }
         return try? JSONDecoder().decode(CleanupSnapshot.self, from: data)
     }
-    func scan(_ assets: PhotoFetchSnapshot, progress: @escaping @Sendable (Int, Int) async -> Void) async -> CleanupSnapshot {
+    func scan(_ assets: PhotoFetchSnapshot, progress: @escaping @Sendable (Int, Int) async -> Void) async throws -> CleanupSnapshot {
         let old = load()
         let cached = Dictionary((old?.items ?? []).map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
         var items: [ScannedMedia] = []
-        var similar: [[String]] = []
-        var groupByID: [String: Int] = [:]
-        var recent: [(id: String, hash: UInt64, ratio: Double, date: Date?)] = []
+        var similarity = CleanupSimilarityIndex()
         var lastProgress = Date.distantPast
         for index in 0..<assets.result.count {
-            if Task.isCancelled { break }
+            try Task.checkCancellation()
             let asset = assets.result.object(at: index)
             let item: ScannedMedia
             if let previous = cached[asset.localIdentifier], previous.modified == asset.modificationDate, previous.bytes != nil {
@@ -93,27 +130,25 @@ actor PhotoCleanupWorker {
                 let hash = asset.mediaType == .image ? url.flatMap(Self.perceptualHash) : nil
                 // Exact duplicate detection streams local files. Never asks
                 // PhotoKit to download an iCloud original during a scan.
-                let digest = asset.mediaType == .image && !asset.mediaSubtypes.contains(.photoLive) ? url.flatMap(Self.digest) : nil
+                let digest = !asset.mediaSubtypes.contains(.photoLive) ? url.flatMap(Self.digest) : nil
                 item = ScannedMedia(id: asset.localIdentifier, date: asset.creationDate, modified: asset.modificationDate,
                                     bytes: bytes, kind: asset.mediaType.rawValue, live: asset.mediaSubtypes.contains(.photoLive), screenshot: asset.mediaSubtypes.contains(.photoScreenshot),
                                     width: asset.pixelWidth, height: asset.pixelHeight, hash: hash, digest: digest)
             }
             items.append(item)
             if let hash = item.hash, item.height > 0 {
-                let ratio = Double(item.width) / Double(item.height)
-                if let match = recent.last(where: { abs($0.ratio - ratio) < 0.05 && ($0.hash ^ hash).nonzeroBitCount <= 5 }) {
-                    if let group = groupByID[match.id] { similar[group].append(item.id); groupByID[item.id] = group }
-                    else { groupByID[match.id] = similar.count; groupByID[item.id] = similar.count; similar.append([match.id, item.id]) }
-                }
-                recent.append((item.id, hash, ratio, item.date))
-                if recent.count > 100 { recent.removeFirst(recent.count - 100) }
+                similarity.add(id: item.id, hash: hash, ratio: Double(item.width) / Double(item.height))
             }
             if Date().timeIntervalSince(lastProgress) > 0.3 {
                 await progress(index + 1, assets.result.count); lastProgress = .now
             }
         }
-        let snapshot = CleanupSnapshot(date: .now, libraryCount: assets.result.count, items: items, similarGroups: similar)
-        if let data = try? JSONEncoder().encode(snapshot) { try? data.write(to: cacheURL, options: .atomic) }
+        try Task.checkCancellation()
+        let snapshot = CleanupSnapshot(date: .now, libraryCount: assets.result.count, items: items, similarGroups: similarity.groups)
+        if let data = try? JSONEncoder().encode(snapshot) {
+            try Task.checkCancellation()
+            try? data.write(to: cacheURL, options: .atomic)
+        }
         await progress(items.count, assets.result.count)
         return snapshot
     }
@@ -187,11 +222,19 @@ final class PhotoCleanupModel: ObservableObject {
         running = true; processed = 0; total = assets.count
         let result = PhotoFetchSnapshot(result: assets)
         task = Task {
-            let snapshot = await PhotoCleanupWorker.shared.scan(result) { [weak self] count, total in
-                await MainActor.run { self?.processed = count; self?.total = total }
+            defer { running = false; task = nil }
+            do {
+                let snapshot = try await PhotoCleanupWorker.shared.scan(result) { [weak self] count, total in
+                    await MainActor.run { self?.processed = count; self?.total = total }
+                }
+                let projection = await CleanupProjectionWorker.shared.project(snapshot)
+                try Task.checkCancellation()
+                self.projection = projection; self.snapshot = snapshot
+            } catch is CancellationError {
+                // Preserve the last complete snapshot when paused or hidden.
+            } catch {
+                PagerDiagnostics.log("cleanup_scan_failed \(error.localizedDescription)")
             }
-            self.projection = await CleanupProjectionWorker.shared.project(snapshot)
-            self.snapshot = snapshot; running = false; task = nil
         }
     }
     func stop() { task?.cancel() }
@@ -306,7 +349,12 @@ private struct CleanupStatisticsScreen: View {
                 Chart(buckets, id: \.name) { item in BarMark(x: .value("文件数", item.count), y: .value("大小", item.name)).foregroundStyle(.blue) }.frame(height: 180)
             }
             Section("每日空间统计") {
-                ForEach(daily, id: \.date) { day in LabeledContent(day.date.formatted(date: .abbreviated, time: .omitted), value: ByteCountFormatter.string(fromByteCount: day.bytes, countStyle: .file)) }
+                ForEach(daily, id: \.date) { day in
+                    VStack(alignment: .leading, spacing: 4) {
+                        LabeledContent(day.date.formatted(date: .abbreviated, time: .omitted), value: day.unknownCount > 0 && day.bytes == 0 ? "大小未知" : ByteCountFormatter.string(fromByteCount: day.bytes, countStyle: .file))
+                        if day.unknownCount > 0 { Text("\(day.unknownCount) 项大小未知，未计入已读取大小").font(.caption).foregroundStyle(.secondary) }
+                    }
+                }
             }
         }.navigationTitle("空间统计")
     }
@@ -360,11 +408,13 @@ private struct RandomDayWorkspace: View {
             else { ContentUnavailableView("没有可整理的日期", systemImage: "calendar") }
         }
         .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("换一天", systemImage: "dice") { period = days.randomElement() }.disabled(days.isEmpty) } }
-        .task {
-            defer { loading = false }
+        .task(id: store.libraryRevision) {
             guard let assets = store.allPhotos else { return }
+            loading = true
             if let result = try? await LibraryTimelineWorker.shared.periods(PhotoFetchSnapshot(result: assets), mode: .days), !Task.isCancelled {
-                days = result; period = result.randomElement()
+                days = result
+                period = result.first { $0.id == period?.id } ?? result.randomElement()
+                loading = false
             }
         }
     }

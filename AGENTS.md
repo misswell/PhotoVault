@@ -309,3 +309,12 @@
 - 当前会话验证可用的 ASC 认证配置是 `asc --profile agentspace-notary`，凭据在系统钥匙串。`octoshrink` 配置在本次验证返回 401，不能沿用。
 - 当前本机有效的 Apple Distribution 证书 SHA-1 为 `3BE6CD6933C59C13A627BD8F36EF580CB4430F75`，本次新建并验证了 `PhotoVault AppStore 1.1.1` 描述文件（对应 bundle `com.misswell.PhotoVault`）。旧 `PhotoVault AppStore 17` 绑定的证书在本机没有可用私钥；以上当前记录优先于旧发布记录。
 - 使用手动签名归档并以 `method=app-store-connect`、`destination=export` 导出。生成 GitHub IPA 不代表上传 TestFlight，也不代表通过 App Store 审核。上传须另行按发布约定执行。
+
+## 整体审查回归规则（2026-10-04）
+
+- 智能搜索全扫必须传播批次写失败，开始前捕获 change token，完成后清理缺失资产（包括向量与 OCR）；增量只提交已处理的 change token。仅 PhotoKit 历史过期/不可读错误才兜底全扫，不能用末尾 `currentChangeToken` 越过未处理变化。
+- 清理扫描取消不能覆盖完整缓存或按完成状态发布；相似候选不能只比较最近 100 张，重复文件检测应包含本机视频，每日统计需标出未知大小。
+- 时间线下钻必须携带媒体筛选和排序；日记日期即使没有照片也要显示。派生日期分组按图库 revision 更新。
+- 压缩结果必须与当前配方/导出选项一致，失败或参数切换后旧结果不可保存；视频导出期间锁定参数。还原成功要同步移除旧覆盖编辑历史。
+- Core Image 的 `cropped(to:)` 本身会向外取整，小数边界必须先对齐内部有效像素，缩放也需明确整数输出尺寸。
+- 查看器测试应固定网格模式；时间线测试不能用只读的 launch argument 固定浏览模式后再试图通过 Picker 修改它。系统删除确认在模拟器可能是英文 `Don’t Allow` / `Delete`，不可只匹配中文取消。

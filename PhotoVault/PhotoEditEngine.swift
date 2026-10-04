@@ -141,6 +141,11 @@ struct RenderedPhoto: Sendable {
     let height: Int
 }
 
+struct PhotoCompressionRequest: Equatable, Sendable {
+    let recipe: PhotoEditRecipe
+    let options: PhotoExportOptions
+}
+
 /// Prepared completely before the Photos transaction; the callback only reads it.
 private struct PreparedPhotoOutput: @unchecked Sendable { let value: PHContentEditingOutput }
 
@@ -156,16 +161,16 @@ actor PhotoRenderWorker {
             throw MediaWorkspaceError.unavailable
         }
         if preview {
-            let scale = min(1, 1400 / max(image.extent.width, image.extent.height))
-            image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            image = Self.resized(image, maximumDimension: 1400)
         }
         image = Self.apply(recipe, to: image)
         if options.maxDimension > 0 {
-            let scale = min(1, Double(options.maxDimension) / max(image.extent.width, image.extent.height))
-            image = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            image = Self.resized(image, maximumDimension: CGFloat(options.maxDimension))
         }
         try Task.checkCancellation()
-        let rect = image.extent.integral
+        // Expand no fractional crop beyond its valid pixels: integral rounds
+        // outwards and introduces a transparent (black in JPEG) border.
+        let rect = image.extent
         guard let cg = context.createCGImage(image, from: rect) else { throw MediaWorkspaceError.encoding }
         let output = NSMutableData()
         let type = preview ? UTType.jpeg : options.format.type
@@ -196,6 +201,26 @@ actor PhotoRenderWorker {
         return RenderedPhoto(data: output as Data, width: cg.width, height: cg.height)
     }
 
+    nonisolated private static func resized(_ image: CIImage, maximumDimension: CGFloat) -> CIImage {
+        let extent = image.extent
+        let scale = min(1, maximumDimension / max(extent.width, extent.height))
+        let width = max(1, floor(extent.width * scale + 0.000001))
+        let height = max(1, floor(extent.height * scale + 0.000001))
+        let normalized = image.transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
+        return normalized.clampedToExtent()
+            .transformed(by: CGAffineTransform(scaleX: width / extent.width, y: height / extent.height))
+            .cropped(to: CGRect(x: 0, y: 0, width: width, height: height))
+    }
+
+    nonisolated private static func pixelCrop(_ image: CIImage, to rect: CGRect) -> CIImage {
+        // CIImage.cropped(to:) rounds outwards internally, even before render.
+        let x = ceil(rect.minX - 0.000001), y = ceil(rect.minY - 0.000001)
+        let width = floor(rect.maxX + 0.000001) - x
+        let height = floor(rect.maxY + 0.000001) - y
+        let aligned = width >= 1 && height >= 1 ? CGRect(x: x, y: y, width: width, height: height) : rect.integral.intersection(image.extent)
+        return image.cropped(to: aligned)
+    }
+
     nonisolated static func apply(_ recipe: PhotoEditRecipe, to source: CIImage) -> CIImage {
         var image = source
         if recipe.automatic {
@@ -216,12 +241,12 @@ actor PhotoRenderWorker {
             image = image.transformed(by: rotation)
             // A conservative inscribed rectangle removes transparent corners.
             let factor = 1 / (abs(cos(angle)) + abs(sin(angle)) * max(extent.width / extent.height, extent.height / extent.width))
-            image = image.cropped(to: CGRect(x: extent.midX - extent.width * factor / 2,
+            image = pixelCrop(image, to: CGRect(x: extent.midX - extent.width * factor / 2,
                                             y: extent.midY - extent.height * factor / 2,
                                             width: extent.width * factor, height: extent.height * factor))
         }
         let crop = recipe.crop.clamped, extent = image.extent
-        image = image.cropped(to: CGRect(x: extent.minX + crop.x * extent.width,
+        image = pixelCrop(image, to: CGRect(x: extent.minX + crop.x * extent.width,
                                         y: extent.minY + (1 - crop.y - crop.height) * extent.height,
                                         width: crop.width * extent.width, height: crop.height * extent.height))
         if let filter = recipe.look.filterName { image = image.applyingFilter(filter) }

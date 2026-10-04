@@ -40,6 +40,17 @@ final class PhotoEditProbe: ObservableObject {
             recipe = .init(); recipe.crop = PhotoCrop(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
             let cropped = try await PhotoRenderWorker.shared.render(data: data, recipe: recipe, options: options)
             check(cropped.width == 60 && cropped.height == 40, "crop geometry")
+            recipe.crop = PhotoCrop(x: 0.13, y: 0.17, width: 0.333, height: 0.417)
+            var fractionalOptions = options; fractionalOptions.format = .png
+            let fractional = try await PhotoRenderWorker.shared.render(data: data, recipe: recipe, options: fractionalOptions)
+            check(fractional.width == 39 && fractional.height == 32, "fractional crop stays inside valid pixels")
+            if let source = CGImageSourceCreateWithData(fractional.data as CFData, nil), let result = CGImageSourceCreateImageAtIndex(source, 0, nil) {
+                var pixels = [UInt8](repeating: 0, count: result.width * result.height * 4)
+                pixels.withUnsafeMutableBytes { buffer in
+                    CGContext(data: buffer.baseAddress, width: result.width, height: result.height, bitsPerComponent: 8, bytesPerRow: result.width * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)?.draw(result, in: CGRect(x: 0, y: 0, width: result.width, height: result.height))
+                }
+                check(stride(from: 3, to: pixels.count, by: 4).allSatisfy { pixels[$0] == 255 }, "fractional crop has no transparent border")
+            }
             recipe = .init(); recipe.angle = 15
             let straightened = try await PhotoRenderWorker.shared.render(data: data, recipe: recipe, options: options)
             check(straightened.width > 50 && straightened.height > 30, "straighten geometry")
@@ -84,6 +95,34 @@ final class PhotoEditProbe: ObservableObject {
             let calendar = Calendar(identifier: .gregorian)
             let birthday = PhotoAnniversary(name: "Leap", date: calendar.date(from: DateComponents(year: 2000, month: 2, day: 29))!, isBirthday: true)
             check(birthday.daysUntilNext(from: calendar.date(from: DateComponents(year: 2026, month: 2, day: 27))!, calendar: calendar) == 1, "leap anniversary")
+            let diaryDate = calendar.date(from: DateComponents(year: 1990, month: 1, day: 2))!
+            let periods = try await LibraryTimelineWorker.shared.periods(PhotoFetchSnapshot(result: PHFetchResult<PHAsset>()), mode: .journal, journalDates: [diaryDate])
+            check(periods.count == 1 && periods.first?.count == 0 && periods.first?.start == calendar.startOfDay(for: diaryDate), "journal date without photos")
+            var similarity = CleanupSimilarityIndex()
+            let firstHash: UInt64 = 0xDEAD_BEEF_1357_2468
+            similarity.add(id: "first", hash: firstHash, ratio: 1.5)
+            for index in 1...200 { similarity.add(id: "unrelated-\(index)", hash: UInt64(index) &* 0x9E37_79B9_7F4A_7C15, ratio: 1.5) }
+            similarity.add(id: "far", hash: firstHash ^ 0x1F, ratio: 1.5)
+            similarity.add(id: "wrong-ratio", hash: firstHash, ratio: 0.5)
+            check(similarity.groups.contains { $0.contains("first") && $0.contains("far") }, "similar images beyond 100 item window")
+            check(!similarity.groups.contains { $0.contains("wrong-ratio") && $0.contains("first") }, "similarity respects aspect ratio")
+            func media(_ id: String, bytes: Int64?, digest: String? = nil) -> ScannedMedia {
+                ScannedMedia(id: id, date: diaryDate, modified: nil, bytes: bytes, kind: PHAssetMediaType.video.rawValue, live: false, screenshot: false, width: 640, height: 480, hash: nil, digest: digest)
+            }
+            let projection = await CleanupProjectionWorker.shared.project(CleanupSnapshot(date: .now, libraryCount: 3, items: [media("known", bytes: 100, digest: "same"), media("duplicate", bytes: 100, digest: "same"), media("cloud", bytes: nil)], similarGroups: []))
+            check(projection.bytes == 200 && projection.days.first?.unknownCount == 1, "unknown daily media excluded and counted")
+            check(projection.duplicates.contains { Set($0) == ["known", "duplicate"] }, "duplicate video projection")
+            let cleanupAssets = await WorkspaceLibraryQuery.shared.fetch(scope: .all, oldestFirst: false)
+            if cleanupAssets.result.count > 0 {
+                let cachedDate = await PhotoCleanupWorker.shared.load()?.date
+                let cancelled = Task {
+                    try await PhotoCleanupWorker.shared.scan(cleanupAssets) { _, _ in
+                        withUnsafeCurrentTask { $0?.cancel() }
+                    }
+                }
+                do { _ = try await cancelled.value; check(false, "cleanup cancellation") } catch { check(error is CancellationError, "cleanup cancellation") }
+                check(await PhotoCleanupWorker.shared.load()?.date == cachedDate, "cleanup cancellation preserves complete cache")
+            }
         } catch { failures.append(error.localizedDescription) }
         result = "checks=\(checks) failures=\(failures.count)"
         PagerDiagnostics.log("photo_edit_probe \(result) \(failures.joined(separator: ", "))")
