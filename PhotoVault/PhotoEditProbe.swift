@@ -126,6 +126,8 @@ final class PhotoEditProbe: ObservableObject {
                 do { _ = try await cancelled.value; check(false, "cleanup cancellation") } catch { check(error is CancellationError, "cleanup cancellation") }
                 check(await PhotoCleanupWorker.shared.load()?.date == cachedDate, "cleanup cancellation preserves complete cache")
             }
+            let longScreenshot = try await LongScreenshotEngine.shared.runProbe()
+            check(longScreenshot.contains("failures=0"), "long screenshot: \(longScreenshot)")
         } catch { failures.append(error.localizedDescription) }
         result = "checks=\(checks) failures=\(failures.count)"
         PagerDiagnostics.log("photo_edit_probe \(result) \(failures.joined(separator: ", "))")

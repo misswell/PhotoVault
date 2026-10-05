@@ -69,6 +69,8 @@
 		A10000000000000000000088 /* PhotoMapScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000088 /* PhotoMapScreen.swift */; };
 		A10000000000000000000089 /* PhotoEditProbe.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000089 /* PhotoEditProbe.swift */; };
 		A20000000000000000000004 /* ReferenceWorkflowUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* ReferenceWorkflowUITests.swift */; };
+		A10000000000000000000090 /* LongScreenshotEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000090 /* LongScreenshotEngine.swift */; };
+		A10000000000000000000091 /* LongScreenshotScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000091 /* LongScreenshotScreen.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -147,6 +149,8 @@
 		B10000000000000000000088 /* PhotoMapScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoMapScreen.swift; sourceTree = "<group>"; };
 		B10000000000000000000089 /* PhotoEditProbe.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoEditProbe.swift; sourceTree = "<group>"; };
 		B20000000000000000000004 /* ReferenceWorkflowUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReferenceWorkflowUITests.swift; sourceTree = "<group>"; };
+		B10000000000000000000090 /* LongScreenshotEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LongScreenshotEngine.swift; sourceTree = "<group>"; };
+		B10000000000000000000091 /* LongScreenshotScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LongScreenshotScreen.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -214,6 +218,8 @@
 				B10000000000000000000082 /* PhotoEditorScreen.swift */,
 				B10000000000000000000081 /* PhotoEditEngine.swift */,
 				B10000000000000000000089 /* PhotoEditProbe.swift */,
+				B10000000000000000000091 /* LongScreenshotScreen.swift */,
+				B10000000000000000000090 /* LongScreenshotEngine.swift */,
 				B10000000000000000000080 /* PhotoWorkspaceStore.swift */,
 				B10000000000000000000023 /* PhotoGridPlaceholder.swift */,
 				B10000000000000000000010 /* Info.plist */,
@@ -425,6 +431,8 @@
 				A10000000000000000000082 /* PhotoEditorScreen.swift in Sources */,
 				A10000000000000000000081 /* PhotoEditEngine.swift in Sources */,
 				A10000000000000000000089 /* PhotoEditProbe.swift in Sources */,
+				A10000000000000000000091 /* LongScreenshotScreen.swift in Sources */,
+				A10000000000000000000090 /* LongScreenshotEngine.swift in Sources */,
 				A10000000000000000000080 /* PhotoWorkspaceStore.swift in Sources */,
 				A10000000000000000000023 /* PhotoGridPlaceholder.swift in Sources */,
 			);
@@ -505,7 +513,7 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconLight AppIconDark";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 41;
+				CURRENT_PROJECT_VERSION = 42;
 				DEVELOPMENT_TEAM = U8U443D7ZL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoVault/Info.plist;
@@ -528,7 +536,7 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconLight AppIconDark";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 41;
+				CURRENT_PROJECT_VERSION = 42;
 				DEVELOPMENT_TEAM = U8U443D7ZL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoVault/Info.plist;

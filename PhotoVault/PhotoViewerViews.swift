@@ -1330,6 +1330,8 @@ struct PhotoViewerView: View {
                     .frame(width: 46, height: 46)
                     .contentShape(Rectangle())
             }
+            .accessibilityLabel("信息")
+            .accessibilityIdentifier("viewer-info")
 
             Button(action: toggleFullScreen) {
                 Image(systemName: isFullScreen
@@ -3199,6 +3201,8 @@ struct IndexedPhotoViewerView: View {
                     .contentShape(Rectangle())
             }
             .disabled(currentAsset == nil)
+            .accessibilityLabel("信息")
+            .accessibilityIdentifier("viewer-info")
 
             Button(action: toggleFullScreen) {
                 Image(systemName: isFullScreen

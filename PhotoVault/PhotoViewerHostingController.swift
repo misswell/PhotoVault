@@ -85,19 +85,25 @@ final class PhotoViewerHostingController: UIHostingController<AnyView> {
     init(sessionID: UUID, transitionState: PhotoViewerTransitionState, rootView: AnyView) {
         self.sessionID = sessionID
         self.transitionState = transitionState
+        // UIHostingController reconciles navigation preferences after loading.
+        // Keep SwiftUI and UIKit in agreement before the first zoom frame.
+        let content = AnyView(rootView.navigationBarBackButtonHidden(true).toolbar(.hidden, for: .navigationBar))
         #if DEBUG
         let debugStatus = PhotoViewerDebugStatus()
         self.debugStatus = debugStatus
-        super.init(rootView: AnyView(rootView.overlay(alignment: .topLeading) {
+        super.init(rootView: AnyView(content.overlay(alignment: .topLeading) {
             PhotoViewerDebugStatusView(status: debugStatus)
         }))
         #else
-        super.init(rootView: rootView)
+        super.init(rootView: content)
         #endif
         // Opaque black so the aspect-fit letterbox reads as a black canvas at
         // rest: the transition's dimming only covers the animated/interactive
         // phases, so a clear background would show the grid through it.
         view.backgroundColor = .black
+        // SwiftUI can briefly expose the navigation bar during a zoom. The
+        // viewer owns its close button, so never synthesize a second back item.
+        navigationItem.setHidesBackButton(true, animated: false)
         // The viewer is full-screen and owns its own top bar.
         hidesBottomBarWhenPushed = true
     }

@@ -46,6 +46,39 @@ final class ReferenceWorkflowUITests: XCTestCase {
         waitForExpectations(timeout: 60)
     }
 
+    func testLongScreenshotPreviewAndSave() {
+        let app = launch(["--pv-long-screenshot-fixture"])
+        let generate = app.buttons["long-screenshot-auto"]
+        XCTAssertTrue(generate.waitForExistence(timeout: 15)); generate.tap()
+        let preview = app.buttons["long-screenshot-preview"]
+        for _ in 0..<4 {
+            if preview.exists { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(preview.waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["160 × 520 · PNG"].exists)
+        capture("long-screenshot", app: app)
+        preview.tap()
+        XCTAssertTrue(app.navigationBars["长截图预览"].waitForExistence(timeout: 10))
+        app.navigationBars.buttons.firstMatch.tap()
+        let save = app.buttons["long-screenshot-save"]
+        XCTAssertTrue(save.isEnabled); save.tap()
+        expectation(for: NSPredicate(format: "label CONTAINS %@", "已保存"), evaluatedWith: save)
+        waitForExpectations(timeout: 20)
+    }
+
+    func testViewerInfoKeepsSheetAndGridNavigationControls() {
+        let app = launch(["-PhotoVault.library.browseMode", "expanded"])
+        openViewer(app)
+        app.buttons["viewer-info"].tap()
+        XCTAssertTrue(app.navigationBars["照片信息"].waitForExistence(timeout: 10))
+        let done = app.buttons["完成"].firstMatch
+        XCTAssertTrue(done.isHittable); done.tap()
+        app.buttons["viewer-close"].tap()
+        XCTAssertTrue(app.collectionViews["photo-grid"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.navigationBars.firstMatch.isHittable)
+    }
+
     func testEditorCropUndoCompressionSaveAndHistory() {
         let app = launch(["-PhotoVault.library.browseMode", "expanded"])
         openViewer(app)

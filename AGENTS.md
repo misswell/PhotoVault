@@ -326,3 +326,10 @@
 - 清理/时间线/发现列表的 PhotoKit ID 查询不得放在 `body` 或导航目标求值中，使用后台 `WorkspaceAssetQuery`，清理当前页最多 200 条批量解析；异步发布前校验取消。
 - 查看器请求的排队优先级按 pager owner 隔离；当前照片变化只调整队列，不能为提高优先级重新启动下载。后台取消的请求回前台时恢复；不能因为 cell 已有低清帧就判定请求完成，只有最终帧可以直接复用，恢复中保留旧帧并校验请求代次。缓存条目必须保留 degraded 质量标记；低清命中只负责即时展示，仍要请求高清，不能伪装成最终结果。清缓存和内存警告保留正在显示的帧和可见请求。
 - 缩放回归必须先筛选照片：真实导出用例会留下最新视频，不能把视频的正常下拉退出误判为照片缩放失效。前后台回归重新查询前台窗口坐标，不复用激活前的坐标。
+
+## 截图与返回按钮回归（2026-10-05）
+
+- Viewer 的系统返回项必须同时在 SwiftUI root（`navigationBarBackButtonHidden(true)`、navigation bar hidden 偏好）与 UIKit `navigationItem` 创建阶段声明隐藏。单独初始化 `setHidesBackButton` 会被 UIHostingController 的偏好同步覆盖；已用中断会话 probe 检查 active/retired 两个 controller 的隐藏值。
+- 长截图入口在发现页。生成图保存到普通“长截图”相册，不能强行设置 PhotoKit 系统 screenshot subtype。
+- 长截图输入用有归属的 FileRepresentation 文件，后台 ImageIO 降采样，逐张合成；输出最多 12MP/32768px 高度。自动接缝需有纹理及明显匹配优势，无法确认时保留内容，提供手动调整。
+- 重选/失败输入、失效/取消输出及时清理；分享防重且持有独立副本直到 ActivityPresenter 关闭；保存与导航取消的拼接任务独立。预览返回不得重复导入同一 PhotosPicker 选择并清掉成品。

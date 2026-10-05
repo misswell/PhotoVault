@@ -113,7 +113,13 @@ struct ContentView: View {
     var body: some View {
         Group {
             if store.canReadPhotos {
+                #if DEBUG
+                if ProcessInfo.processInfo.arguments.contains("--pv-long-screenshot-fixture") {
+                    NavigationStack { LongScreenshotScreen() }
+                } else { rootTabView }
+                #else
                 rootTabView
+                #endif
             } else {
                 PhotoPermissionView(store: store)
             }

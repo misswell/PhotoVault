@@ -533,6 +533,8 @@ final class PhotoViewerNavigator: NSObject, ObservableObject {
                 && isGridInteractionBlocked
                 && navigationController?.topViewController === active
                 && retired.sessionID != active.sessionID
+                && active.navigationItem.hidesBackButton
+                && retired.navigationItem.hidesBackButton
             if !passed { failures += 1 }
             photoVaultTraceLaunch("viewer_session_probe step=\(step) passed=\(passed)")
         }

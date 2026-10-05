@@ -312,6 +312,7 @@ enum PhotoEditSaver {
             try await PhotoRenderWorker.shared.write(bytes, to: destination)
             output.adjustmentData = PHAdjustmentData(formatIdentifier: "com.misswell.PhotoVault.edit", formatVersion: "1", data: try JSONEncoder().encode(recipe))
             let prepared = PreparedPhotoOutput(value: output)
+            try Task.checkCancellation()
             try await PHPhotoLibrary.shared().performChanges { @Sendable in
                 PHAssetChangeRequest(for: asset).contentEditingOutput = prepared.value
             }
@@ -333,12 +334,14 @@ enum PhotoEditSaver {
                 }
                 // Live Photo edits are reversible in place and retain motion.
                 let prepared = PreparedPhotoOutput(value: output)
+                try Task.checkCancellation()
                 try await PHPhotoLibrary.shared().performChanges { @Sendable in
                     PHAssetChangeRequest(for: asset).contentEditingOutput = prepared.value
                 }
                 resultID = asset.localIdentifier
             } else {
                 let box = CreatedAssetID()
+                try Task.checkCancellation()
                 try await PHPhotoLibrary.shared().performChanges { @Sendable in
                     let request = PHAssetCreationRequest.forAsset()
                     request.addResource(with: .photo, fileURL: url, options: nil)

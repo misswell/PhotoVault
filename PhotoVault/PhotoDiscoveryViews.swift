@@ -37,6 +37,7 @@ struct PhotoDiscoveryScreen: View {
                     }
                 } else {
                     Section("快捷访问") {
+                        NavigationLink { LongScreenshotScreen() } label: { Label("长截图", systemImage: "rectangle.portrait.on.rectangle.portrait") }
                         NavigationLink { SmartSearchScreen(store: store) } label: { Label("智能搜图", systemImage: "sparkle.magnifyingglass") }
                         NavigationLink { RandomPhotoOrganizerView(store: store) } label: { Label("随机漫游", systemImage: "shuffle") }
                         NavigationLink { OnThisDayScreen(store: store) } label: { Label("往年今日", systemImage: "clock.arrow.circlepath") }
