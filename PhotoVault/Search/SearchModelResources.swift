@@ -2,25 +2,8 @@
 //  SearchModelResources.swift
 //  PhotoVault
 //
-//  Locates the bundled SigLIP2 artifacts and builds the encoders from them.
-//
-//  Why this file exists at all
-//  ---------------------------
-//  The model files are **not in git** -- the W8 build is 364 MB, reproducible
-//  from `tools/models/install_models.py`. So there is a state this app can
-//  legitimately be in where the code is present and correct but the model is
-//  simply not there: a fresh clone, or a build that skipped the install step.
-//
-//  That state must be *legible*. The failure it replaces is the bad one: a
-//  `Bundle.main.url(forResource:)` returning nil and being force-unwrapped, or a
-//  search that silently returns nothing because the encoder was never created.
-//  Here it produces a specific error naming the missing file and the command
-//  that installs it.
-//
-//  The manifest is read rather than trusted from a constant for the same reason
-//  the encoders read their dimension from the model's own output description:
-//  the numbers that matter belong to the artifact, not to this source file. If
-//  the installed model is a different build, the manifest says so.
+//  Loads the optional, verified SigLIP2 installation from Application Support.
+//  Models are never downloaded automatically or included in the shipping app.
 //
 
 import Foundation
@@ -33,13 +16,9 @@ enum SearchModelResourcesError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notInstalled(let name):
-            """
-            the search model "\(name)" is not in this build's resources. \
-            Run `python tools/models/install_models.py` and rebuild -- the model \
-            files are deliberately kept out of git because they total 364 MB.
-            """
+            "智能搜索模型尚未下载或文件不完整（\(name)）。请在设置或智能搜索页下载模型。"
         case .manifestUnreadable(let detail):
-            "the search model manifest could not be read: \(detail)"
+            "无法读取模型信息：\(detail)"
         }
     }
 }
@@ -65,18 +44,16 @@ struct SearchModelManifest: Decodable, Equatable, Sendable {
 
 struct SearchModelResources: Sendable {
 
-    /// Names without extensions: Xcode compiles `SigLIP2Vision.mlpackage` into
-    /// `SigLIP2Vision.mlmodelc`, so the bundle never contains the extension the
-    /// conversion produced.
+    /// Downloaded mlpackages are compiled on the device before installation.
     static let visionModelName = "SigLIP2Vision"
     static let textModelName = "SigLIP2Text"
     static let tokenizerName = "tokenizer-v1"
     static let manifestName = "SearchModelManifest"
 
-    let bundle: Bundle
+    let directory: URL
 
-    init(bundle: Bundle = .main) {
-        self.bundle = bundle
+    init(directory: URL = SearchModelInstallation.directory) {
+        self.directory = directory
     }
 
     /// `true` when every artifact is present.
@@ -84,16 +61,12 @@ struct SearchModelResources: Sendable {
     /// Checked before any encoder is constructed so an uninstalled model is one
     /// clear state rather than three separate failures.
     var isInstalled: Bool {
-        (try? visionModelURL()) != nil
-            && (try? textModelURL()) != nil
-            && (try? tokenizerURL()) != nil
+        SearchModelInstallation.isInstalled(at: directory)
     }
 
     private func url(named name: String, extension ext: String) throws -> URL {
-        // `subdirectory: nil` because the resources are flattened into the
-        // bundle root: the Models group is a *group*, not a folder reference, so
-        // it does not survive as a directory.
-        guard let url = bundle.url(forResource: name, withExtension: ext) else {
+        let url = directory.appendingPathComponent("\(name).\(ext)")
+        guard isInstalled, FileManager.default.fileExists(atPath: url.path) else {
             throw SearchModelResourcesError.notInstalled("\(name).\(ext)")
         }
         return url
@@ -141,9 +114,7 @@ struct SearchModelResources: Sendable {
 
     // MARK: - Constructing the encoders
 
-    /// `compileIfNeeded` is false throughout: the bundle contains `.mlmodelc`,
-    /// which `MLModel` loads directly. Compiling an already-compiled model would
-    /// copy 359 MB for nothing.
+    /// Installation already compiled the models; loading never copies weights.
     func makeVisionEncoder(
         computeUnits: MLComputeUnits = .all
     ) throws -> SigLIP2VisionEncoder {

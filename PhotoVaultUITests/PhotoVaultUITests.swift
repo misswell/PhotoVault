@@ -1,5 +1,65 @@
 import XCTest
 
+@MainActor
+final class SearchModelDownloadUITests: XCTestCase {
+    private func showSidebar(in app: XCUIApplication) {
+        for label in ["Show Sidebar", "显示侧栏", "显示侧边栏"] {
+            let button = app.buttons[label].firstMatch
+            if button.exists && button.isHittable { button.tap(); return }
+        }
+    }
+
+    func testOptionalModelAndSettingsEntry() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments += ["-PhotoVault.startup.destination", "home"]
+        app.launch()
+        pvGrantPhotosPermissionIfNeeded()
+        showSidebar(in: app)
+        let searchRow = app.staticTexts["智能搜索"].firstMatch
+        XCTAssertTrue(searchRow.waitForExistence(timeout: 20))
+        searchRow.tap()
+        let download = app.buttons["search-model-download"]
+        XCTAssertTrue(download.waitForExistence(timeout: 10), "未下载模型时提供可选下载入口")
+        XCTAssertFalse(app.buttons["search-model-cancel"].exists, "进入智能搜索不能自动下载")
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "照片不会上传")).firstMatch.exists)
+
+        showSidebar(in: app)
+        let library = app.staticTexts["图库"].firstMatch
+        XCTAssertTrue(library.exists)
+        library.tap()
+        XCTAssertTrue(app.collectionViews["photo-grid"].waitForExistence(timeout: 15), "未下载不影响图库")
+        showSidebar(in: app)
+        let settings = app.buttons["设置"].firstMatch
+        XCTAssertTrue(settings.exists)
+        settings.tap()
+        // Settings initially uses a medium sheet; expand it to reach the section.
+        app.swipeUp()
+        XCTAssertTrue(download.waitForExistence(timeout: 10), "设置面板共用模型下载入口")
+        XCTAssertFalse(app.buttons["search-model-cancel"].exists)
+    }
+
+    func testDownloadCanBeCancelled() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments += ["-PhotoVault.startup.destination", "home"]
+        app.launch()
+        pvGrantPhotosPermissionIfNeeded()
+        showSidebar(in: app)
+        let search = app.staticTexts["智能搜索"].firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 20))
+        search.tap()
+        let download = app.buttons["search-model-download"]
+        XCTAssertTrue(download.waitForExistence(timeout: 10))
+        download.tap()
+        let cancel = app.buttons["search-model-cancel"]
+        XCTAssertTrue(cancel.waitForExistence(timeout: 5))
+        cancel.tap()
+        XCTAssertTrue(download.waitForExistence(timeout: 10), "取消后应允许重新下载")
+        XCTAssertFalse(cancel.exists)
+    }
+}
+
 /// Handles the first-launch system photo-permission alert. `simctl privacy
 /// grant photos` does not take effect on current iOS runtimes, so a fresh
 /// test simulator must answer the springboard alert in place; the grant

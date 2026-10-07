@@ -333,3 +333,12 @@
 - 长截图入口在发现页。生成图保存到普通“长截图”相册，不能强行设置 PhotoKit 系统 screenshot subtype。
 - 长截图输入用有归属的 FileRepresentation 文件，后台 ImageIO 降采样，逐张合成；输出最多 12MP/32768px 高度。自动接缝需有纹理及明显匹配优势，无法确认时保留内容，提供手动调整。
 - 重选/失败输入、失效/取消输出及时清理；分享防重且持有独立副本直到 ActivityPresenter 关闭；保存与导航取消的拼接任务独立。预览返回不得重复导入同一 PhotosPicker 选择并清掉成品。
+
+
+## 智能搜索可选模型下载（1.1.5）
+
+- 模型不得随 App 打包。`PhotoVault/Models` 只用于 `package_download.py` 生成 Release 资产，`register_search_sources.py` 必须始终排除模型资源。干净克隆无需模型即可构建。
+- 设置与智能搜索页共用 `SearchModelDownloadStore`，只在用户点击后下载；默认不联网、不编译、不建立 AI 索引。下载后由用户点击“建立索引”。
+- `SearchModelCatalog.swift` 固定不可变 Release URL、每个文件大小与 SHA-256；模型更新必须用新 tag，不得覆盖旧模型资产。
+- 下载先后台校验，设备端 Core ML 编译与维度校验成功后整体发布至 Application Support；禁止让半套文件被读取。取消/失败清理暂存目录，重试清理上次进程中断的 `.download-*`；模型排除 iCloud 备份，不随图片缓存清理。
+- 验证入口：`tools/models/download_test/main.swift`（文件校验/取消/编译/发布），`bundle_test` 的第二个参数改为下载后的模型目录；UI 回归 `SearchModelDownloadUITests` 验证可选入口、普通图库和取消下载。

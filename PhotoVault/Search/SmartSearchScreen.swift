@@ -19,6 +19,7 @@ import SwiftUI
 
 struct SmartSearchScreen: View {
     @State private var model = SmartSearchModel()
+    @State private var downloads = SearchModelDownloadStore.shared
     @State private var draft = ""
     @FocusState private var isFieldFocused: Bool
     @Environment(\.scenePhase) private var scenePhase
@@ -56,7 +57,7 @@ struct SmartSearchScreen: View {
             prompt: "描述你想找的照片"
         )
         .onSubmit(of: .search) { model.search(draft) }
-        .task { await model.prepare() }
+        .task(id: downloads.isInstalled) { await model.prepare() }
         .background(
             PhotoViewerNavigationAnchor(navigator: viewerNavigator)
                 .frame(width: 0, height: 0)
@@ -97,8 +98,8 @@ struct SmartSearchScreen: View {
                 Button("暂停") { model.cancelIndexing() }
                     .font(.caption)
                     .buttonStyle(.borderless)
-            } else if let progress = model.indexProgress, !progress.isComplete {
-                Button("继续建立索引") { model.startIndexing() }
+            } else if model.isReady, model.indexProgress?.isComplete != true {
+                Button(model.indexProgress == nil ? "建立索引" : "继续建立索引") { model.startIndexing() }
                     .font(.caption)
                     .buttonStyle(.borderless)
             }
@@ -112,6 +113,13 @@ struct SmartSearchScreen: View {
     @ViewBuilder
     private var content: some View {
         switch model.phase {
+        case .modelRequired:
+            ScrollView {
+                SearchModelDownloadControl()
+                    .padding(24)
+                    .frame(maxWidth: 560, alignment: .leading)
+                    .frame(maxWidth: .infinity)
+            }
         case .preparingModel:
             ContentUnavailableView(
                 "正在载入模型",
@@ -119,11 +127,13 @@ struct SmartSearchScreen: View {
                 description: Text("首次载入需要几秒钟，之后会常驻内存。")
             )
         case .failed(let message):
-            ContentUnavailableView(
-                "无法搜索",
-                systemImage: "exclamationmark.triangle",
-                description: Text(message)
-            )
+            ContentUnavailableView {
+                Label("无法搜索", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(message)
+            } actions: {
+                Button("重试载入") { Task { await model.prepare() } }
+            }
         default:
             if model.query.isEmpty {
                 emptyState

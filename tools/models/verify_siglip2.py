@@ -762,6 +762,8 @@ def mode_privacy(args) -> int:
     ]
     found_network = []
     for path in sources:
+        if path.name == "SearchModelDownload.swift":
+            continue  # Only immutable model assets may be downloaded.
         text = path.read_text()
         for token in network:
             for number, line in enumerate(text.splitlines(), 1):
@@ -772,20 +774,32 @@ def mode_privacy(args) -> int:
                 if token in line:
                     found_network.append(f"{path.name}:{number} {token}")
     c.check(not found_network,
-            "no networking API appears anywhere in the search stack",
+            "search, indexing and ranking contain no networking APIs",
             "; ".join(found_network[:4]))
+
+    downloader = (search / "SearchModelDownload.swift").read_text()
+    c.check("session.download(for:" in downloader and
+            not any(token in downloader for token in
+                    ("httpBody", "uploadTask", "PHAsset", "PhotoSearchEngine", "EmbeddingMatrixReader")),
+            "the optional downloader only fetches model files and cannot access photos or query results")
 
     # ---- 2. no remote endpoints ------------------------------------------
     found_urls = []
     for path in sources:
+        if path.name == "SearchModelCatalog.swift":
+            continue
         for number, line in enumerate(path.read_text().splitlines(), 1):
             stripped = line.strip()
             if stripped.startswith("//") or stripped.startswith("///"):
                 continue
             if "http://" in line or "https://" in line:
                 found_urls.append(f"{path.name}:{number}")
-    c.check(not found_urls, "and no remote endpoint is referenced",
+    c.check(not found_urls, "and search has no remote endpoint",
             "; ".join(found_urls[:4]))
+    catalog = (search / "SearchModelCatalog.swift").read_text()
+    c.check(bool(re.search(r'https://github.com/misswell/PhotoVault/releases/download/v\d+\.\d+\.\d+/', catalog))
+            and "sha256:" in catalog,
+            "model downloads use a pinned Release and per-file hashes")
 
     # ---- 3. system frameworks only ---------------------------------------
     allowed = {
@@ -865,22 +879,15 @@ def mode_privacy(args) -> int:
 
 
 def mode_bundle(args) -> int:
-    """Verify the model artifacts that are actually inside the built app.
+    """Run encoder parity checks against the optional model installation.
 
-    Every other mode here checks the pipeline: Python reference, converted
-    mlpackage, Swift port. All of them passed while the app still had no model in
-    it, because "the mlpackage is correct" and "the app can load what shipped"
-    are separate claims. This mode loads the `.mlmodelc` files out of the built
-    `PhotoVault.app` and runs them.
-
-    The decisive check is cos("CAT", "cat") ~= 0.8616. That one number proves the
-    bundled tokenizer and the bundled text tower are the *pair* that was
-    validated: a mismatched vocabulary, a case-folding normalizer, or a stale
-    model would each move it.
+    First run download_test to populate build/search-model-validation/installed.
+    The app path is still used to ensure that a real app has been built.
     """
     repo = HERE.parent.parent
     sources = [
         repo / "PhotoVault" / "Search" / "SearchModelResources.swift",
+        repo / "PhotoVault" / "Search" / "SearchModelDownload.swift",
         repo / "PhotoVault" / "Search" / "SigLIP2VisionEncoder.swift",
         repo / "PhotoVault" / "Search" / "SigLIP2TextEncoder.swift",
         repo / "PhotoVault" / "Search" / "SigLIP2Tokenizer.swift",
@@ -912,7 +919,8 @@ def mode_bundle(args) -> int:
         c.check(False, "bundled-model tests compile")
         return c.report()
 
-    run = subprocess.run([binary, str(app)], capture_output=True, text=True)
+    installation = repo / "build" / "search-model-validation" / "installed"
+    run = subprocess.run([binary, str(app), str(installation)], capture_output=True, text=True)
     for line in run.stdout.splitlines():
         if "[FAIL]" in line or line.startswith(("checks:", "RESULT")) or "cos(" in line:
             print(f"    | {line}")

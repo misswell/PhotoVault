@@ -997,49 +997,58 @@ PyTorch; use it to rank candidates, then confirm the winner with
 
 Never "fix" a parity failure by adjusting search weights (spec §7).
 
-## Shipping the model (D5)
+## Optional model download (1.1.5)
 
-The W8 build is **364 MB** (89 MB vision + 270 MB text + 5 MB tokenizer); FP16 is
-715 MB. Both are reproducible from `requirements-lock.txt` plus
-`convert_siglip2.py`, so they are **not in git** -- `PhotoVault/Models/` is
-ignored and populated by a script.
+Shipping builds do not bundle the SigLIP2 weights or tokenizer. A clean clone
+builds the complete app without `PhotoVault/Models/`. Settings and smart search
+share one explicit download action; neither app launch nor entering search
+initiates a download. Normal photo workflows remain available without models.
 
-    python tools/models/install_models.py            # copies W8 into PhotoVault/Models
-    python tools/models/install_models.py --check     # report only
-    python tools/models/register_search_sources.py    # registers it as a resource
+The validated W8 artifact set totals 381,597,326 bytes. Each mlpackage member,
+tokenizer and model manifest is an immutable GitHub Release asset. The generated
+`SearchModelCatalog.swift` pins the release URL, relative path, size and SHA-256
+of every file. Changing model bytes requires generating a new catalog and
+publishing assets under a new tag; never replace existing assets or tags.
 
-The consequence is real and stated rather than hidden: **a clean clone cannot
-build a working app until the install step has run once.** The build does not
-fail without it -- no Swift source references these files at compile time -- so
-search simply has no model, and `SearchModelResources` reports exactly which file
-is missing and which command installs it, instead of crashing on a nil URL.
+```sh
+python3 tools/models/install_models.py
+python3 tools/models/package_download.py --tag v1.1.5 --output build/releases/1.1.5/models
+python3 tools/models/register_search_sources.py
+```
 
-Verified: the bundle contains `SigLIP2Vision.mlmodelc` (89 MB),
-`SigLIP2Text.mlmodelc` (270 MB), `tokenizer-v1.bin` and
-`SearchModelManifest.json`; app total **384 MB**. The `.mlmodelc` layout
-(`coremldata.bin` / `model.mil` / `weights`) confirms `coremlc` genuinely
-compiled them rather than the package being copied.
+`install_models.py` stages locally converted models for packaging only.
+`register_search_sources.py` registers Swift sources and deliberately excludes
+model resources even when that local directory exists. Upload the generated
+assets with the signed IPA when publishing the referenced Release.
 
-### The bundled artifacts are tested, not assumed
+On explicit download, `SearchModelDownloader` streams files to a private staging
+folder, checks sizes and SHA-256, compiles both mlpackages using Core ML on the
+device, verifies their embedding dimensions, and publishes the complete folder.
+Cancellation or failure clears staging files. An interrupted process's partial
+folders are reclaimed on the next download attempt. Application Support retains
+compiled models across launches and excludes them from iCloud backups; the
+settings action that clears image caches does not remove these models.
 
-    python verify_siglip2.py bundle      # 16/16 checks
+Validation:
 
-Every other mode here checks the *pipeline*: Python reference, converted
-mlpackage, Swift port. All of them passed while the app still had no model in it,
-because "the mlpackage is correct" and "the app can load what shipped" are
-different claims. This mode loads the `.mlmodelc` files out of the built
-`PhotoVault.app` and runs them.
+```sh
+xcrun swiftc -swift-version 6 -parse-as-library -O \
+  PhotoVault/Search/SearchModelDownload.swift PhotoVault/Search/SearchModelCatalog.swift \
+  tools/models/download_test/main.swift -o build/search-model-download-tests
+build/search-model-download-tests PhotoVault/Models build/search-model-validation
+```
 
-The decisive check:
+The download gate covers pinned file integrity, truncated/corrupt data, unsafe
+paths, cancellation and cleanup, actual Core ML compilation, backup exclusion
+and preserving an existing installation on failure. Use a fresh validation
+directory per run. `bundle_test` now takes both an app path and the resulting
+installed model directory, running the original 16 encoder/tokenizer checks
+against the optional installation. `verify_siglip2.py bundle` expects that
+installation at `build/search-model-validation/installed`.
 
-    cos("CAT", "cat") = 0.8610     (reference 0.8616)
-
-That one number proves the bundled tokenizer and the bundled text tower are the
-**pair** that was validated. A mismatched vocabulary, a case-folding normalizer,
-or a stale model would each move it -- and this tokenizer deliberately does not
-fold case (`CAT` and `cat` are tokens 29492 and 4991). Measured alongside it:
-vision norm 1.0007458 and text norm 0.9997030, confirming the conversion's baked-in
-normalization survived packaging.
+The validated pair reproduces cos("CAT", "cat") ≈ 0.8612 (reference 0.8616).
+Models are compiled and loaded off the UI thread. Download progress is throttled
+to four updates per second; indexing starts only when the user taps its action.
 
 ## Registering the search sources (D4)
 

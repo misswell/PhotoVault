@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""Register PhotoVault/Search sources and PhotoVault/Models resources in the project.
+"""Register PhotoVault/Search sources in the project.
 
-Two groups are handled:
-
-* `PhotoVault/Search/*.swift` and the `.metal` kernel go into the **Sources**
-  phase.
-* `PhotoVault/Models/*` (`SigLIP2Vision.mlpackage`, `SigLIP2Text.mlpackage`,
-  `tokenizer-v1.bin`, `SearchModelManifest.json`) go into the **Resources**
-  phase, where Xcode's `coremlc` compiles each `.mlpackage` into an
-  `.mlmodelc`. That directory is gitignored and produced by
-  `install_models.py`; when it is absent this part is skipped with a note rather
-  than treated as an error, because the Swift code compiles without it.
+Models are optional online downloads. Local PhotoVault/Models artifacts are
+only inputs to package_download.py and must never be added to app resources.
 
 Why this is a script rather than a hand edit
 -------------------------------------------
@@ -84,15 +76,8 @@ def existing_indices(text: str, prefix: str) -> set[int]:
 
 
 def collect_resources() -> list[pathlib.Path]:
-    """Model artifacts to bundle, or an empty list when they are not installed.
-
-    Absence is not an error: the directory is gitignored, so a clean clone has
-    none until `install_models.py` runs. The Swift sources compile either way.
-    """
-    if not RESOURCE_DIR.is_dir():
-        return []
-    return sorted((p for p in RESOURCE_DIR.iterdir() if not p.name.startswith(".")),
-                  key=lambda p: p.name)
+    """Shipping builds never bundle models, even after install_models.py runs."""
+    return []
 
 
 def collect_sources() -> list[pathlib.Path]:
@@ -164,8 +149,7 @@ def main() -> int:
         for path in resources_to_add:
             print(f"  [add ] {path.name}")
     else:
-        print(f"Model resources: none in {RESOURCE_DIR.relative_to(REPO)} "
-              "(run install_models.py to populate)")
+        print("Model resources: excluded (optional online download)")
     for path in unregistered:
         print(f"  [add ] {path.name}")
 

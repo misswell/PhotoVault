@@ -1,13 +1,13 @@
-// Verifies the *bundled* model artifacts, not the conversion output.
+// Verifies the *downloaded* model artifacts, not the conversion output.
 //
 // Everything else in this directory checks the pipeline: Python reference,
 // converted mlpackage, Swift port. Those all passed while the app still had no
 // model in it, because "the mlpackage is correct" and "the app can load what
 // shipped" are different claims. This harness closes that gap by loading the
-// `.mlmodelc` files out of the built PhotoVault.app and running them.
+// `.mlmodelc` files out of the verified optional installation and running them.
 //
 // The decisive check is the last one: `CAT` and `cat` must embed to a cosine of
-// about 0.8616. That single number proves the bundled tokenizer and the bundled
+// about 0.8616. That single number proves the downloaded tokenizer and the downloaded
 // text tower are the *pair* that was validated -- a mismatched vocabulary, a
 // case-folding normalizer, or a stale model would each move it.
 
@@ -21,6 +21,7 @@ setvbuf(stdout, nil, _IONBF, 0)
 var checks = 0
 var failures = 0
 
+@MainActor
 func check(_ condition: Bool, _ label: String, _ detail: @autoclosure () -> String = "") {
     checks += 1
     if condition {
@@ -63,12 +64,18 @@ guard let bundle = Bundle(url: appURL) else {
     exit(1)
 }
 
-let resources = SearchModelResources(bundle: bundle)
+// Shipping app bundles no longer carry weights. Pass the separately verified
+// on-device-style installation directory as the second argument.
+guard CommandLine.arguments.count > 2 else {
+    print("usage: bundle_test <PhotoVault.app> <installed model directory>")
+    exit(2)
+}
+let resources = SearchModelResources(directory: URL(fileURLWithPath: CommandLine.arguments[2]))
 
 // ---------------------------------------------------------------------------
-section("the app bundle contains a usable model")
+section("the optional installation contains a usable model")
 
-check(resources.isInstalled, "every search artifact is present in the bundle")
+check(resources.isInstalled, "every search artifact is present in the optional installation")
 
 do {
     let vision = try resources.visionModelURL()
@@ -95,7 +102,7 @@ do {
 }
 
 // ---------------------------------------------------------------------------
-section("the bundled models load and run")
+section("the downloaded models load and run")
 
 var visionEncoder: SigLIP2VisionEncoder?
 var textEncoder: SigLIP2TextEncoder?
@@ -108,9 +115,9 @@ do {
     tokenizer = try resources.makeTokenizer()
     visionEncoder = try resources.makeVisionEncoder()
     textEncoder = try resources.makeTextEncoder()
-    check(true, "the tokenizer and both encoders load from the bundle")
+    check(true, "the tokenizer and both encoders load from the installation")
 } catch {
-    check(false, "the tokenizer and both encoders load from the bundle", "\(error)")
+    check(false, "the tokenizer and both encoders load from the installation", "\(error)")
 }
 
 do {
@@ -152,7 +159,7 @@ do {
 }
 
 // ---------------------------------------------------------------------------
-section("the bundled pair reproduces the validated behaviour")
+section("the downloaded pair reproduces the validated behaviour")
 
 do {
     if let textEncoder, let tokenizer {
@@ -170,7 +177,7 @@ do {
         let caseSimilarity = cosine(cat, catLower)
         print(String(format: "         cos(CAT, cat) = %.4f (reference 0.8616)", caseSimilarity))
         check(abs(caseSimilarity - 0.8616) < 0.01,
-              "case is still not folded, so the bundled pair is the validated one",
+              "case is still not folded, so the downloaded pair is the validated one",
               String(format: "%.4f", caseSimilarity))
 
         let catRepeat = try textEncoder.embedding(text: "cat", tokenizer: tokenizer)
@@ -199,13 +206,13 @@ do {
         }
     }
 } catch {
-    check(false, "the bundled text tower reproduces the reference", "\(error)")
+    check(false, "the downloaded text tower reproduces the reference", "\(error)")
 }
 
 // ---------------------------------------------------------------------------
 print("\nchecks: \(checks), failures: \(failures)")
 if failures == 0 {
-    print("RESULT: all \(checks) bundled-model checks passed")
+    print("RESULT: all \(checks) downloaded-model checks passed")
     exit(0)
 } else {
     print("RESULT: \(failures) of \(checks) checks FAILED")

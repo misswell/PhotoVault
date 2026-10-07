@@ -1683,6 +1683,11 @@ struct PhotoVaultSettingsView: View {
                     if cacheCleared { Text("图片内存缓存已释放，文件夹缩略图缓存将在后台清理。").font(.caption).foregroundStyle(.secondary) }
                 }
 
+                Section("智能搜索") {
+                    SearchModelDownloadControl()
+                        .padding(.vertical, 4)
+                }
+
                 Section("启动时打开") {
                     Picker("启动页面", selection: $startupDestinationRawValue) {
                         Text("首页")

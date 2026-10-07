@@ -33,6 +33,7 @@ final class SmartSearchModel {
 
     enum Phase: Equatable {
         case idle
+        case modelRequired
         case preparingModel
         /// Searching is possible but the index is still filling.
         case searching
@@ -88,7 +89,12 @@ final class SmartSearchModel {
     /// Idempotent: the screen calls it from `.task`, which re-runs on every
     /// appearance, and reloading a 270 MB text tower each time would be felt.
     func prepare() async {
-        guard phase == .idle else { return }
+        guard !isReady, phase != .preparingModel else { return }
+        guard modelResources.isInstalled else {
+            statusMessage = "模型为可选下载"
+            phase = .modelRequired
+            return
+        }
         phase = .preparingModel
 
         // Everything below the model load is cheap enough to do inline, but the
@@ -148,7 +154,7 @@ final class SmartSearchModel {
     /// considers pending, and nothing is pending until PhotoKit's assets have
     /// been written down.
     func startIndexing() {
-        guard indexTask == nil, let store else { return }
+        guard isReady, indexTask == nil, let store else { return }
         indexTask = Task { [weak self] in
             guard let self else { return }
             do {
@@ -206,7 +212,6 @@ final class SmartSearchModel {
             return
         }
         guard let engine else {
-            phase = .preparingModel
             return
         }
 

@@ -8,12 +8,9 @@ FP16 build is 715 MB. Both are fully reproducible from
 `tools/models/requirements-lock.txt` plus `convert_siglip2.py`, so
 `PhotoVault/Models/` is ignored and populated by this script.
 
-The consequence is real and worth stating: **a clean clone cannot build a working
-app until this has been run once.** That is the deliberate trade -- a repository
-that stays small and reviewable, at the cost of one reproducible step. The build
-does not fail without it (no Swift source references these files at compile
-time); search simply has no model to load, and `SearchModelResources` reports
-that clearly rather than crashing.
+This directory is only a local staging source for `package_download.py`.
+Shipping app builds exclude all model files. Users download them optionally
+from settings or smart search; a clean clone builds without this step.
 
     python tools/models/install_models.py              # install W8 (the default)
     python tools/models/install_models.py --precision fp16
@@ -157,7 +154,7 @@ def main() -> int:
 
     print(f"\ninstalled into {DESTINATION.relative_to(REPO)}")
     print("next:")
-    print("  python tools/models/register_search_sources.py   # register as resources")
+    print("  python tools/models/package_download.py --tag <new-release-tag> --output build/model-assets")
     return 0
 
 

@@ -4,16 +4,18 @@ PhotoVault's AI photo search runs entirely on device: no photo, embedding, OCR
 result or query ever leaves the device. This file records the third-party
 components involved and their licenses.
 
-Verified against the shipped artifacts on 2026-09-13.
+Verified against the model artifacts on 2026-09-13. Since 1.1.5 these
+artifacts are optional online downloads from GitHub Releases; app bundles
+contain no model weights or tokenizer.
 
-## Redistributed inside the app bundle
+## Redistributed as an optional model download
 
 ### SigLIP2 — `google/siglip2-base-patch16-256`
 
 - **License:** Apache License 2.0 (read from the upstream model card:
   `license: apache-2.0`)
 - **Upstream:** <https://huggingface.co/google/siglip2-base-patch16-256>
-- **Shipped as:** `SigLIP2Vision.mlpackage`, `SigLIP2Text.mlpackage`,
+- **Downloaded as:** `SigLIP2Vision.mlpackage`, `SigLIP2Text.mlpackage`,
   `tokenizer-v1.bin`
 - **Modifications made by this project.** The weights are used as published; no
   training, fine-tuning or distillation was performed. The following changes were

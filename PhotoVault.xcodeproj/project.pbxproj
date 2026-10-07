@@ -54,10 +54,6 @@
 		A10000000000000000000056 /* SmartSearchModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000056 /* SmartSearchModel.swift */; };
 		A10000000000000000000057 /* SmartSearchScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000057 /* SmartSearchScreen.swift */; };
 		A10000000000000000000058 /* AISearchSelfCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000058 /* AISearchSelfCheck.swift */; };
-		A10000000000000000000059 /* SearchModelManifest.json in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000059 /* SearchModelManifest.json */; };
-		A10000000000000000000060 /* SigLIP2Text.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000060 /* SigLIP2Text.mlpackage */; };
-		A10000000000000000000061 /* SigLIP2Vision.mlpackage in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000061 /* SigLIP2Vision.mlpackage */; };
-		A10000000000000000000062 /* tokenizer-v1.bin in Resources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000062 /* tokenizer-v1.bin */; };
 		A10000000000000000000080 /* PhotoWorkspaceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000080 /* PhotoWorkspaceStore.swift */; };
 		A10000000000000000000081 /* PhotoEditEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000081 /* PhotoEditEngine.swift */; };
 		A10000000000000000000082 /* PhotoEditorScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000082 /* PhotoEditorScreen.swift */; };
@@ -71,6 +67,9 @@
 		A20000000000000000000004 /* ReferenceWorkflowUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* ReferenceWorkflowUITests.swift */; };
 		A10000000000000000000090 /* LongScreenshotEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000090 /* LongScreenshotEngine.swift */; };
 		A10000000000000000000091 /* LongScreenshotScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000091 /* LongScreenshotScreen.swift */; };
+		A10000000000000000000059 /* SearchModelCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000064 /* SearchModelCatalog.swift */; };
+		A10000000000000000000060 /* SearchModelDownload.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000070 /* SearchModelDownload.swift */; };
+		A10000000000000000000061 /* SearchModelDownloadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10000000000000000000071 /* SearchModelDownloadView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -151,6 +150,9 @@
 		B20000000000000000000004 /* ReferenceWorkflowUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReferenceWorkflowUITests.swift; sourceTree = "<group>"; };
 		B10000000000000000000090 /* LongScreenshotEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LongScreenshotEngine.swift; sourceTree = "<group>"; };
 		B10000000000000000000091 /* LongScreenshotScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LongScreenshotScreen.swift; sourceTree = "<group>"; };
+		B10000000000000000000064 /* SearchModelCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchModelCatalog.swift; sourceTree = "<group>"; };
+		B10000000000000000000070 /* SearchModelDownload.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchModelDownload.swift; sourceTree = "<group>"; };
+		B10000000000000000000071 /* SearchModelDownloadView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchModelDownloadView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -259,6 +261,9 @@
 				B10000000000000000000055 /* SigLIP2VisionEncoder.swift */,
 				B10000000000000000000056 /* SmartSearchModel.swift */,
 				B10000000000000000000057 /* SmartSearchScreen.swift */,
+				B10000000000000000000064 /* SearchModelCatalog.swift */,
+				B10000000000000000000070 /* SearchModelDownload.swift */,
+				B10000000000000000000071 /* SearchModelDownloadView.swift */,
 			);
 			path = Search;
 			sourceTree = "<group>";
@@ -364,10 +369,6 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A10000000000000000000059 /* SearchModelManifest.json in Resources */,
-				A10000000000000000000060 /* SigLIP2Text.mlpackage in Resources */,
-				A10000000000000000000061 /* SigLIP2Vision.mlpackage in Resources */,
-				A10000000000000000000062 /* tokenizer-v1.bin in Resources */,
 				A10000000000000000000013 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -379,6 +380,9 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10000000000000000000059 /* SearchModelCatalog.swift in Sources */,
+				A10000000000000000000060 /* SearchModelDownload.swift in Sources */,
+				A10000000000000000000061 /* SearchModelDownloadView.swift in Sources */,
 				A10000000000000000000040 /* AIPhotoSearchStore.swift in Sources */,
 				A10000000000000000000041 /* EmbeddingSimilarity.metal in Sources */,
 				A10000000000000000000042 /* EmbeddingStoreFile.swift in Sources */,
@@ -513,7 +517,7 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconLight AppIconDark";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				DEVELOPMENT_TEAM = U8U443D7ZL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoVault/Info.plist;
@@ -536,7 +540,7 @@
 				ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconLight AppIconDark";
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				DEVELOPMENT_TEAM = U8U443D7ZL;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = PhotoVault/Info.plist;
