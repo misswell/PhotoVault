@@ -1430,7 +1430,10 @@ struct PhotoViewerView: View {
             Spacer()
             Menu {
                 if let currentAsset {
-                    Button(store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站", systemImage: "trash") {
+                    Button(
+                        store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站",
+                        systemImage: store.isInRecycleBin(currentAsset) ? "arrow.uturn.backward" : "tray.and.arrow.down"
+                    ) {
                         if store.isInRecycleBin(currentAsset) { store.removeFromRecycleBin(currentAsset) }
                         else { store.addToRecycleBin(currentAsset) }
                     }
@@ -3292,7 +3295,10 @@ struct IndexedPhotoViewerView: View {
             Spacer()
             Menu {
                 if let currentAsset {
-                    Button(store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站", systemImage: "trash") {
+                    Button(
+                        store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站",
+                        systemImage: store.isInRecycleBin(currentAsset) ? "arrow.uturn.backward" : "tray.and.arrow.down"
+                    ) {
                         if store.isInRecycleBin(currentAsset) { store.removeFromRecycleBin(currentAsset) }
                         else { store.addToRecycleBin(currentAsset) }
                     }

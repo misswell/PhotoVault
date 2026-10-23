@@ -91,6 +91,16 @@ struct ContentView: View {
                     .map(PhotoSection.album) ?? .home
             )
         }
+
+#if DEBUG
+        // Device verification hook: Smart Search has no persisted startup
+        // destination, and launching straight into it is the only way to
+        // confirm from `devicectl` that opening the screen starts indexing.
+        if ProcessInfo.processInfo.arguments.contains("--pv-open-smart-search") {
+            _selectedRootTab = State(initialValue: .library)
+            _selection = State(initialValue: .smartSearch)
+        }
+#endif
     }
 
     private enum FolderListItem: Identifiable {

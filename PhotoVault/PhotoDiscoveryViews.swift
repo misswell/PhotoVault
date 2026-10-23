@@ -221,24 +221,67 @@ struct WorkspaceAlbumBrowser: View {
         if scope == "历史" || scope == "星标" { return filtered }
         return filtered.sorted { ascending ? $0.title.localizedStandardCompare($1.title) == .orderedAscending : $0.title.localizedStandardCompare($1.title) == .orderedDescending }
     }
+
+    private var scopeTitle: String {
+        switch scope {
+        case "星标": return "星标相册"
+        case "历史": return "相册浏览历史"
+        case "共享": return "共享相册"
+        default: return "全部相册"
+        }
+    }
+
+    /// 星标/历史/共享 为空时不能只留一片空白：每种范围都要说明怎么产生内容。
+    private var emptyState: (title: String, symbol: String, detail: String)? {
+        if !query.isEmpty {
+            guard albums.isEmpty else { return nil }
+            return ("没有找到相册", "magnifyingglass", "请尝试搜索其他相册名称。")
+        }
+        guard albums.isEmpty else { return nil }
+        switch scope {
+        case "星标":
+            return ("还没有星标相册", "star", "长按相册或在相册选择器里点星标，把常用相册放到这里。")
+        case "历史":
+            return ("还没有浏览记录", "clock", "打开过的相册会出现在这里。")
+        case "共享":
+            return ("没有共享相册", "person.2", "与他人共享的相册会出现在这里。")
+        default:
+            // 侧栏有文件夹时列表本身不为空，不需要再盖一层空状态。
+            guard store.albumFolders.isEmpty else { return nil }
+            return ("还没有相册", "rectangle.stack", "在系统照片 App 中创建相册后会显示在这里。")
+        }
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
                     Picker("相册范围", selection: $scope) { ForEach(["全部", "星标", "历史", "共享"], id: \.self) { Text($0).tag($0) } }.pickerStyle(.segmented)
                     if scope == "全部" && query.isEmpty {
-                        ForEach(store.albumFolders) { folder in WorkspaceFolderBrowserRow(folder: folder, store: store, tiles: tiles) }
+                        ForEach(store.albumFolders) { folder in WorkspaceFolderBrowserRow(folder: folder, store: store, tiles: tiles, ascending: ascending) }
                     }
                     WorkspaceAlbumRows(albums: albums, store: store, tiles: tiles)
+                    if let emptyState {
+                        ContentUnavailableView(
+                            emptyState.title,
+                            systemImage: emptyState.symbol,
+                            description: Text(emptyState.detail)
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 240)
+                    }
                 }.padding()
             }
-            .navigationTitle(scope == "历史" ? "相册浏览历史" : "全部相册")
+            .navigationTitle(scopeTitle)
             .searchable(text: $query, prompt: "搜索相册")
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button("创建", systemImage: "plus") { create = true }
                     Button(tiles ? "列表" : "平铺", systemImage: tiles ? "list.bullet" : "square.grid.2x2") { tiles.toggle() }
-                    Button("排序", systemImage: "arrow.up.arrow.down") { ascending.toggle() }
+                    if scope == "全部" || scope == "共享" {
+                        // 星标/历史按固定顺序展示，排序按钮在这些范围里没有作用。
+                        Button(ascending ? "当前升序排列" : "当前降序排列", systemImage: ascending ? "arrow.up" : "arrow.down") { ascending.toggle() }
+                            .accessibilityHint("点按切换排序方向")
+                    }
                 }
             }
         }
@@ -255,15 +298,25 @@ private struct WorkspaceFolderBrowserRow: View {
     let folder: PhotoAlbumFolder
     @ObservedObject var store: PhotoLibraryStore
     let tiles: Bool
+    let ascending: Bool
     @State private var expanded = false
+
+    private var sortedAlbums: [PhotoAlbum] {
+        folder.albums.sorted {
+            ascending
+                ? $0.title.localizedStandardCompare($1.title) == .orderedAscending
+                : $0.title.localizedStandardCompare($1.title) == .orderedDescending
+        }
+    }
+
     var body: some View {
         VStack(spacing: 12) {
             Button { expanded.toggle() } label: {
                 HStack(spacing: 10) { Image(systemName: expanded ? "chevron.down" : "chevron.right"); Image(systemName: "folder").frame(width: 28, height: 28); Text(folder.title); Spacer(); Text("\(folder.albumCount)").foregroundStyle(.secondary) }.frame(minHeight: 44).foregroundStyle(.primary)
             }
             if expanded {
-                ForEach(folder.subfolders) { child in WorkspaceFolderBrowserRow(folder: child, store: store, tiles: tiles) }
-                WorkspaceAlbumRows(albums: folder.albums, store: store, tiles: tiles)
+                ForEach(folder.subfolders) { child in WorkspaceFolderBrowserRow(folder: child, store: store, tiles: tiles, ascending: ascending) }
+                WorkspaceAlbumRows(albums: sortedAlbums, store: store, tiles: tiles)
             }
         }
     }
@@ -302,6 +355,7 @@ private struct WorkspaceAlbumRows: View {
                 }.frame(minHeight: 44).foregroundStyle(.primary)
             }
         }
+        .buttonStyle(.plain)
         .contextMenu { Button(store.quickAlbumIDs.contains(album.id) ? "取消星标" : "设为快速收藏") { store.toggleQuickAlbum(album.id) } }
     }
 }
