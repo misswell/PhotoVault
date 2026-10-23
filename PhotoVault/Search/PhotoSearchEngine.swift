@@ -159,6 +159,15 @@ final class PhotoSearchEngine: Sendable {
     private let gazetteer: OfflineGazetteer
     private let analyzer: QueryAnalyzer
     private let configuration: PhotoSearchConfiguration
+    /// Reopens the matrix for a query while indexing is running.
+    ///
+    /// `EmbeddingMatrixReader` snapshots the header at open, and the indexer
+    /// appends rows behind it. Without a reopen, candidate ids that SQLite
+    /// already reports would point past the snapshot and every search during an
+    /// index pass would fail with `slotOutOfRange`. A closure rather than a
+    /// mutable reader keeps the engine `Sendable`; the mapping itself is cheap
+    /// and lazy.
+    private let reopenEmbeddings: (@Sendable () throws -> EmbeddingMatrixReader)?
 
     init(
         store: AIPhotoSearchStore,
@@ -166,7 +175,8 @@ final class PhotoSearchEngine: Sendable {
         encoder: QueryTextEncoding,
         gazetteer: OfflineGazetteer = OfflineGazetteer(),
         analyzer: QueryAnalyzer = QueryAnalyzer(),
-        configuration: PhotoSearchConfiguration = .default
+        configuration: PhotoSearchConfiguration = .default,
+        reopenEmbeddings: (@Sendable () throws -> EmbeddingMatrixReader)? = nil
     ) {
         self.store = store
         self.embeddings = embeddings
@@ -174,6 +184,14 @@ final class PhotoSearchEngine: Sendable {
         self.gazetteer = gazetteer
         self.analyzer = analyzer
         self.configuration = configuration
+        self.reopenEmbeddings = reopenEmbeddings
+    }
+
+    /// The reader a query should score against: the newest matrix when the
+    /// caller can provide one, otherwise the snapshot supplied at init.
+    private func currentEmbeddings() throws -> EmbeddingMatrixReader {
+        guard let reopenEmbeddings else { return embeddings }
+        return try reopenEmbeddings()
     }
 
     func search(_ query: String, limit: Int = 60) throws -> PhotoSearchResponse {
@@ -262,16 +280,20 @@ final class PhotoSearchEngine: Sendable {
         }
 
         // -- 5. Score each clause over the candidate set only ------------------
+        // Opened after the candidate slots are known: during an index pass this
+        // mapping is newer than the one captured when the screen loaded, so the
+        // rows indexing has just committed are searchable immediately.
+        let matrix = try currentEmbeddings()
         var positiveScores: [[Float]] = []
         for clause in positiveClauses {
             let vector = try encoder.encodeQuery(clause)
-            positiveScores.append(try embeddings.scores(query: vector, slots: orderedSlots))
+            positiveScores.append(try matrix.scores(query: vector, slots: orderedSlots))
             diagnostics.encodedClauses.append(clause)
         }
         var negativeScores: [[Float]] = []
         for clause in searchPlan.negativeVisualClauses {
             let vector = try encoder.encodeQuery(clause)
-            negativeScores.append(try embeddings.scores(query: vector, slots: orderedSlots))
+            negativeScores.append(try matrix.scores(query: vector, slots: orderedSlots))
             diagnostics.encodedClauses.append("NOT \(clause)")
         }
         diagnostics.usedVectorSearch = true
@@ -389,8 +411,11 @@ final class PhotoSearchEngine: Sendable {
             return PhotoSearchResponse(hits: [], plan: QueryPlan(), diagnostics: diagnostics)
         }
 
-        let query = try embeddings.row(at: referenceSlot)
-        let scores = try embeddings.scores(query: query, slots: orderedSlots)
+        // The reference row and every candidate must come from the same
+        // snapshot, so one reader serves the whole query.
+        let matrix = try currentEmbeddings()
+        let query = try matrix.row(at: referenceSlot)
+        let scores = try matrix.scores(query: query, slots: orderedSlots)
         diagnostics.usedVectorSearch = true
         diagnostics.scoredCount = orderedSlots.count
         diagnostics.encodedClauses = []

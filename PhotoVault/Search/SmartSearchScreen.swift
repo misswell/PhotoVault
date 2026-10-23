@@ -18,7 +18,7 @@ import Photos
 import SwiftUI
 
 struct SmartSearchScreen: View {
-    @State private var model = SmartSearchModel()
+    @State private var model = SmartSearchModel.shared
     @State private var downloads = SearchModelDownloadStore.shared
     @State private var draft = ""
     @FocusState private var isFieldFocused: Bool
@@ -57,6 +57,10 @@ struct SmartSearchScreen: View {
             prompt: "描述你想找的照片"
         )
         .onSubmit(of: .search) { model.search(draft) }
+        // The model is shared across visits so indexing survives leaving the
+        // screen; restore the last submitted query so the field and the
+        // results on screen agree.
+        .onAppear { draft = model.query }
         .task(id: downloads.isInstalled) { await model.prepare() }
         .background(
             PhotoViewerNavigationAnchor(navigator: viewerNavigator)
@@ -82,12 +86,18 @@ struct SmartSearchScreen: View {
                 Text(verbatim: "\(Int(progress.fraction * 100))%")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+            } else if model.isIndexing {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("正在准备索引")
             } else {
                 Image(systemName: "sparkle.magnifyingglass")
                     .foregroundStyle(.secondary)
             }
 
-            Text(model.statusMessage ?? "准备中…")
+            // The sync that precedes the first batch has no batch progress, so
+            // it says what it is doing rather than showing a stale count.
+            Text(model.isStartingIndex ? "正在同步照片库…" : (model.statusMessage ?? "准备中…"))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -98,10 +108,12 @@ struct SmartSearchScreen: View {
                 Button("暂停") { model.cancelIndexing() }
                     .font(.caption)
                     .buttonStyle(.borderless)
-            } else if model.isReady, model.indexProgress?.isComplete != true {
-                Button(model.indexProgress == nil ? "建立索引" : "继续建立索引") { model.startIndexing() }
-                    .font(.caption)
-                    .buttonStyle(.borderless)
+            } else if model.needsIndexing {
+                Button((model.indexStats?.embeddedAssets ?? 0) > 0 ? "继续建立索引" : "建立索引") {
+                    model.startIndexing()
+                }
+                .font(.caption)
+                .buttonStyle(.borderless)
             }
         }
         .padding(.horizontal, 16)
@@ -138,7 +150,7 @@ struct SmartSearchScreen: View {
             if model.query.isEmpty {
                 emptyState
             } else if model.assets.isEmpty, case .results = model.phase {
-                ContentUnavailableView.search(text: model.query)
+                noResultsState
             } else {
                 resultsGrid
             }
@@ -146,14 +158,62 @@ struct SmartSearchScreen: View {
     }
 
     private var emptyState: some View {
-        ContentUnavailableView(
-            "搜索照片内容",
-            systemImage: "sparkle.magnifyingglass",
-            description: Text(
+        ContentUnavailableView {
+            Label("搜索照片内容", systemImage: "sparkle.magnifyingglass")
+        } description: {
+            Text(
                 "描述照片里有什么，例如「海边的猫」「2023 年拍的发票」「北京的夜景」。\n"
-                + "全部在本机完成，照片不会离开设备。"
+                + "全部在本机完成，不会上传照片，也不会为了建索引下载 iCloud 原图。"
             )
-        )
+        } actions: {
+            if model.needsIndexing, !model.isIndexing {
+                Button {
+                    model.startIndexing()
+                } label: {
+                    Label(
+                        (model.indexStats?.embeddedAssets ?? 0) > 0 ? "继续建立索引" : "建立索引",
+                        systemImage: "sparkles"
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+    }
+
+    /// An empty result is ambiguous: the query may not match, or the photo may
+    /// simply not be indexed yet. Saying which one it is, with the actual
+    /// counts, is the difference between a limitation the user can act on and
+    /// a feature that appears broken. Before this existed the screen said only
+    /// "No Results", while 98% of a real library was still pending.
+    private var noResultsState: some View {
+        ContentUnavailableView {
+            Label("没有找到「\(model.query)」", systemImage: "sparkle.magnifyingglass")
+        } description: {
+            if model.isIndexing {
+                Text(
+                    "索引正在建立，当前只搜索了已建立索引的照片。"
+                    + "建好后再搜一次就能覆盖全部照片。"
+                )
+            } else if let coverage = model.coverageNote {
+                Text(
+                    coverage
+                    + (model.needsIndexing
+                        ? "\n继续建立索引后再试，或换一个更常见的说法。"
+                        : "\n换一个更常见的说法试试。")
+                )
+            } else {
+                Text("换个更常见的说法试试，例如只描述主体或场景。")
+            }
+        } actions: {
+            if model.needsIndexing, !model.isIndexing {
+                Button {
+                    model.startIndexing()
+                } label: {
+                    Label("继续建立索引", systemImage: "sparkles")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
     }
 
     private var resultsGrid: some View {
@@ -194,9 +254,10 @@ struct SmartSearchScreen: View {
                 diagnosticsFooter(diagnostics)
             }
         }
-        // Cancelling the in-flight query when the screen goes away keeps a slow
-        // scan from publishing into a view that no longer exists.
-        .onDisappear { model.clear() }
+        // No `onDisappear { model.clear() }`: pushing the photo viewer also
+        // disappears this view, and clearing there would throw away the results
+        // the user is about to come back to. A stale search task is already
+        // rejected by the query-generation check in `SmartSearchModel`.
     }
 
     /// Opens the shared viewer at the tapped result, paging in **relevance order**.
@@ -272,6 +333,11 @@ struct SmartSearchScreen: View {
                     diagnostics.elapsedSeconds * 1000
                 )
             )
+            if model.isIndexing {
+                Label("索引建立中，结果会随着覆盖范围扩大而变多。", systemImage: "circle.lefthalf.filled")
+            } else if let coverage = model.coverageNote {
+                Label(coverage, systemImage: "circle.lefthalf.filled")
+            }
             ForEach(diagnostics.warnings, id: \.self) { warning in
                 Label(warning, systemImage: "info.circle")
                     .foregroundStyle(.secondary)

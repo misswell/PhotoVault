@@ -61,13 +61,28 @@ protocol PendingAssetProviding: Sendable {
     func totalAssetCount() throws -> Int
 }
 
+/// A decoded image, plus what PhotoKit was able to supply.
+struct IndexImage: Sendable {
+    let image: CGImage
+    /// `true` when PhotoKit substituted a lower-quality local version --
+    /// typically a cached thumbnail for an iCloud-only original. Good enough
+    /// for the 256px vision model, too small to trust for text recognition.
+    let isLocalPreview: Bool
+
+    init(image: CGImage, isLocalPreview: Bool = false) {
+        self.image = image
+        self.isLocalPreview = isLocalPreview
+    }
+}
+
 protocol AssetImageLoading: Sendable {
-    /// A decodable image, or `nil` when the asset is temporarily unavailable.
+    /// A locally available image, or `nil` when the asset has no local copy.
     ///
-    /// `nil` is not an error. An iCloud original that has not been downloaded is
-    /// the normal case on a fresh device, and treating it as a failure would
+    /// Implementations must not download iCloud originals. `nil` is not an
+    /// error: a photo that is only in iCloud is the normal case on a device
+    /// using "Optimize iPhone Storage", and treating it as a failure would
     /// count a healthy photo towards a failure budget and eventually park it.
-    func image(for asset: IndexableAsset) throws -> CGImage?
+    func image(for asset: IndexableAsset) throws -> IndexImage?
 }
 
 protocol AssetEmbedding: Sendable {
@@ -417,16 +432,16 @@ final class PhotoSearchIndexCoordinator: @unchecked Sendable {
         touchedText: inout Bool,
         progress: inout PhotoSearchIndexProgress
     ) throws {
-        let image: CGImage?
+        let loaded: IndexImage?
         do {
-            image = try imageLoader.image(for: asset)
+            loaded = try imageLoader.image(for: asset)
         } catch {
             try store.markFailed(assetID: asset.assetID, error: String(describing: error))
             progress.failed += 1
             return
         }
 
-        guard let image else {
+        guard let loaded else {
             // Not on this device. Deferred, not failed -- see `deferAsset`.
             try store.deferAsset(assetID: asset.assetID, until: now().addingTimeInterval(6 * 3600))
             progress.unavailable += 1
@@ -434,7 +449,7 @@ final class PhotoSearchIndexCoordinator: @unchecked Sendable {
         }
 
         do {
-            let vector = try embedder.embedding(cgImage: image)
+            let vector = try embedder.embedding(cgImage: loaded.image)
             try store.storeEmbedding(assetID: asset.assetID, vector: vector)
         } catch {
             try store.markFailed(assetID: asset.assetID, error: String(describing: error))
@@ -445,9 +460,13 @@ final class PhotoSearchIndexCoordinator: @unchecked Sendable {
         // Metadata is attached to the same row the embedding just landed in.
         try store.upsertMetadata([asset.metadata])
 
-        if asset.wantsTextRecognition, policy.recognizesText, let recognizer {
+        // A local preview is enough for the vision model, but OCR on a cached
+        // thumbnail would produce noise and mark the text as attempted, so it
+        // is skipped: the asset keeps its embedding and no text.
+        if asset.wantsTextRecognition, policy.recognizesText, !loaded.isLocalPreview,
+           let recognizer {
             do {
-                let recognition = try recognizer.recognize(cgImage: image)
+                let recognition = try recognizer.recognize(cgImage: loaded.image)
                 try store.storeText(assetID: asset.assetID, text: recognition.text)
                 touchedText = true
             } catch {

@@ -243,7 +243,12 @@ struct PhotoKitPendingSource: PendingAssetProviding {
         let byID = Dictionary(uniqueKeysWithValues: records.map { ($0.assetID, $0) })
         return identifiers.compactMap { identifier in
             guard let metadata = byID[identifier] else { return nil }
-            return IndexableAsset(metadata: metadata)
+            // A video is embedded from its poster frame, which is not where
+            // text lives; running OCR on it would only mark it attempted.
+            return IndexableAsset(
+                metadata: metadata,
+                wantsTextRecognition: metadata.mediaType != 2
+            )
         }
     }
 
@@ -256,12 +261,18 @@ struct PhotoKitPendingSource: PendingAssetProviding {
 // MARK: - Image loading
 
 /// Decodes an asset for embedding.
+///
+/// Never downloads an iCloud original. A 256px target does not make the request
+/// cheap on an optimized library: PhotoKit satisfies a network-allowed request
+/// by downloading the whole asset first and then downsampling it. For 100k
+/// photos that is hundreds of gigabytes and days of transfer to produce an
+/// image the model reduces to 256px anyway. With network access off, PhotoKit
+/// returns the locally cached thumbnail or the optimized local copy, and `nil`
+/// for assets with no local representation -- those are deferred, not failed.
 final class PhotoKitImageLoader: AssetImageLoading, @unchecked Sendable {
 
     private let manager: PHImageManager
-    /// The model consumes 256x256, so there is no reason to materialise a 12 MP
-    /// original: PhotoKit can deliver a correctly sized image far more cheaply,
-    /// and on an iCloud library it avoids downloading the full asset.
+    /// The model consumes 256x256, so this is the only size worth asking for.
     let targetSize: CGSize
 
     init(manager: PHImageManager = .default(), targetSize: CGSize = CGSize(width: 256, height: 256)) {
@@ -269,13 +280,13 @@ final class PhotoKitImageLoader: AssetImageLoading, @unchecked Sendable {
         self.targetSize = targetSize
     }
 
-    func image(for asset: IndexableAsset) throws -> CGImage? {
+    func image(for asset: IndexableAsset) throws -> IndexImage? {
         let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [asset.assetID], options: nil)
         guard let photo = fetch.firstObject else { return nil }
 
         let options = PHImageRequestOptions()
         options.isSynchronous = true
-        options.isNetworkAccessAllowed = true
+        options.isNetworkAccessAllowed = false
         // The model must see the unmodified photo. PhotoKit's automatic
         // adjustment would embed an edited image that does not match what the
         // user sees, and would differ between devices.
@@ -283,21 +294,27 @@ final class PhotoKitImageLoader: AssetImageLoading, @unchecked Sendable {
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .exact
 
-        var result: CGImage?
-        var isUnavailable = false
+        var best: CGImage?
+        var bestIsPreview = false
         manager.requestImage(
             for: photo, targetSize: targetSize, contentMode: .aspectFit, options: options
         ) { image, info in
+            guard let cgImage = image?.cgImage else { return }
             let details: [AnyHashable: Any] = info ?? [:]
-            if details[PHImageResultIsDegradedKey] as? Bool == true { return }
-            if details[PHImageResultIsInCloudKey] as? Bool == true, image == nil {
-                isUnavailable = true
-                return
+            // A cached thumbnail is a legitimate indexing input; an iCloud
+            // asset with nothing cached locally is handled by the caller.
+            // `IsInCloud` only says the original lives in iCloud -- the local
+            // optimized copy is still full quality -- so degrade OCR only for
+            // a result PhotoKit itself marks as degraded.
+            let isPreview = details[PHImageResultIsDegradedKey] as? Bool == true
+            // Prefer the final frame if PhotoKit delivers a preview first.
+            if best == nil || (bestIsPreview && !isPreview) {
+                best = cgImage
+                bestIsPreview = isPreview
             }
-            result = image?.cgImage
         }
-        if result == nil && isUnavailable { return nil }
-        return result
+        guard let best else { return nil }
+        return IndexImage(image: best, isLocalPreview: bestIsPreview)
     }
 }
 

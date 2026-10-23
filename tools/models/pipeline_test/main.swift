@@ -117,14 +117,16 @@ struct StubImageLoader: AssetImageLoading, @unchecked Sendable {
     var unavailableIDs: Set<String> = []
     /// Asset IDs whose load throws.
     var throwingIDs: Set<String> = []
+    /// Asset IDs for which PhotoKit could only supply a locally cached preview.
+    var previewIDs: Set<String> = []
     let image: CGImage
 
-    func image(for asset: IndexableAsset) throws -> CGImage? {
+    func image(for asset: IndexableAsset) throws -> IndexImage? {
         if throwingIDs.contains(asset.assetID) {
             throw NSError(domain: "test", code: 1, userInfo: [NSLocalizedDescriptionKey: "decode failed"])
         }
         if unavailableIDs.contains(asset.assetID) { return nil }
-        return image
+        return IndexImage(image: image, isLocalPreview: previewIDs.contains(asset.assetID))
     }
 }
 
@@ -395,8 +397,45 @@ do {
     // counting it as a failure would park it permanently after a few attempts.
     check(stats.failedAssets == 0, "an undownloaded asset is not a failure", "failed \(stats.failedAssets)")
     check(stats.pendingAssets == 1, "it stays pending for a later attempt", "pending \(stats.pendingAssets)")
+    check(stats.waitingForLocalPreview == 1,
+          "and counts as waiting for a local preview rather than actionable work",
+          "waiting \(stats.waitingForLocalPreview)")
     check(coordinator.progress.unavailable == 1, "and is reported as unavailable",
           "unavailable=\(coordinator.progress.unavailable), completed=\(coordinator.progress.completed), total=\(coordinator.progress.total)")
+}
+
+// ---------------------------------------------------------------------------
+section("a locally cached iCloud preview is indexed, but its text is not")
+
+do {
+    let store = try makeStore()
+    let source = StoreBackedSource(store: store, metadataByID: metadataByID)
+    let previewOnly = "asset-011"
+    let coordinator = PhotoSearchIndexCoordinator(
+        store: store, source: source,
+        imageLoader: StubImageLoader(previewIDs: [previewOnly], image: image),
+        embedder: DeterministicEmbedder(),
+        recognizer: StubRecognizer(),
+        baseBatchSize: testBatchSize
+    )
+    let run = coordinator.beginRun()
+    var guardCount = 0
+    while true {
+        let result = try coordinator.step(generation: run, conditions: PhotoSearchIndexConditions())
+        if case .finished = result { break }
+        if case .processed = result {} else { break }
+        guardCount += 1
+        guard guardCount < 100 else { break }
+    }
+    let stats = try store.stats()
+    check(stats.embeddedAssets == assetCount,
+          "the preview is good enough for the vision model", "ready \(stats.embeddedAssets)")
+    let text = try store.assetIDsMatchingText(terms: ["发票"], limit: 50)
+    check(!text.contains(previewOnly),
+          "OCR is skipped on a cached thumbnail instead of recording noise", "\(text.count) with text")
+    check(coordinator.progress.deferredText >= 1,
+          "and the missed text is counted as deferred",
+          "deferredText=\(coordinator.progress.deferredText)")
 }
 
 // ---------------------------------------------------------------------------

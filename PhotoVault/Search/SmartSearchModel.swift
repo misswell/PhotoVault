@@ -14,7 +14,9 @@
 //  * The index is filled from here rather than from app launch. Indexing 100k
 //    photos is hours of work, and starting it automatically on first launch
 //    would mean a user who never opens search pays for it. Opening the screen is
-//    the signal that the feature is wanted.
+//    the signal that the feature is wanted -- so `prepare()` starts (or
+//    resumes) indexing by itself. An explicit pause is remembered across
+//    launches; otherwise reopening the screen would undo the user's choice.
 //
 //  * Results are `[PHAsset]`, not a `PHFetchResult`. PhotoKit returns assets
 //    from an identifier fetch in an arbitrary order, and the whole point of
@@ -30,6 +32,15 @@ import SwiftUI
 @MainActor
 @Observable
 final class SmartSearchModel {
+
+    /// One model for the whole process.
+    ///
+    /// Indexing deliberately outlives the screen: leaving search and coming
+    /// back used to build a second `SmartSearchModel`, and the old task kept
+    /// running (it retains its model) -- two indexers appending to the same
+    /// embedding matrix. Sharing the instance also means a run started here is
+    /// still visible, with its progress, the next time the screen opens.
+    static let shared = SmartSearchModel()
 
     enum Phase: Equatable {
         case idle
@@ -53,7 +64,16 @@ final class SmartSearchModel {
     private(set) var diagnostics: PhotoSearchDiagnostics?
     private(set) var indexProgress: PhotoSearchIndexProgress?
     private(set) var indexState: PhotoSearchIndexState = .idle
+    private(set) var indexStats: AISearchIndexStats?
     private(set) var statusMessage: String?
+
+    /// The metadata sync and vision-model load happen before the coordinator's
+    /// first batch. Reporting that window as "indexing" is what keeps the
+    /// progress UI honest while a 100k-photo library is being brought up to
+    /// date -- without it the screen looks idle for minutes.
+    private(set) var isStartingIndex = false
+
+    private static let indexingPausedKey = "PhotoVault.smartSearch.indexingPaused"
 
     /// `true` once the model is loaded and the index is usable, so the UI can
     /// distinguish "still preparing" from "no results".
@@ -63,8 +83,37 @@ final class SmartSearchModel {
     }
 
     var isIndexing: Bool {
+        if isStartingIndex { return true }
         if case .running = indexState { return true }
         return false
+    }
+
+    /// Work the indexer can still do. Driven by stored statistics rather than
+    /// the coordinator's in-memory progress, which is nil until a run starts --
+    /// a screen opened after a relaunch must still offer "继续建立索引".
+    var needsIndexing: Bool {
+        guard isReady else { return false }
+        guard let stats = indexStats else { return true }
+        guard stats.totalAssets > 0 else { return true }
+        // Assets waiting on a local preview cannot be indexed right now, so
+        // offering "continue" for them would start a run that does nothing.
+        return stats.pendingAssets > stats.waitingForLocalPreview
+    }
+
+    /// What the results do *not* cover, phrased for the empty state.
+    ///
+    /// A search that looks at 1,782 of 104,462 photos and finds nothing has not
+    /// disproved the query; without saying so the feature looks broken.
+    var coverageNote: String? {
+        guard let stats = indexStats, stats.totalAssets > 0,
+              stats.pendingAssets > 0 else { return nil }
+        var note = "目前只为 \(stats.embeddedAssets)/\(stats.totalAssets) 张照片建立了索引，"
+            + "搜索只能在已索引的照片里查找。"
+        if stats.waitingForLocalPreview > 0 {
+            note += "\n其中 \(stats.waitingForLocalPreview) 张在本机还没有可用的预览。"
+                + "索引不会下载 iCloud 原图，系统缓存出预览后会自动补上。"
+        }
+        return note
     }
 
     // MARK: - Owned machinery
@@ -89,7 +138,17 @@ final class SmartSearchModel {
     /// Idempotent: the screen calls it from `.task`, which re-runs on every
     /// appearance, and reloading a 270 MB text tower each time would be felt.
     func prepare() async {
-        guard !isReady, phase != .preparingModel else { return }
+        if isReady {
+            // Already loaded from an earlier visit. Refresh the counts so the
+            // coverage line is current, then pick the index back up if a
+            // previous run stopped and the user did not pause it.
+            await refreshIndexStatus()
+            if needsIndexing, !Self.indexingIsPaused, indexTask == nil {
+                startIndexing()
+            }
+            return
+        }
+        guard phase != .preparingModel else { return }
         guard modelResources.isInstalled else {
             statusMessage = "模型为可选下载"
             phase = .modelRequired
@@ -121,10 +180,14 @@ final class SmartSearchModel {
             textEncoder = loaded.text
 
             let reader = try EmbeddingMatrixReader(url: paths.embeddings)
+            let matrixURL = paths.embeddings
             engine = PhotoSearchEngine(
                 store: store,
                 embeddings: reader,
-                encoder: SigLIP2QueryEncoder(encoder: loaded.text, tokenizer: loaded.tokenizer)
+                encoder: SigLIP2QueryEncoder(encoder: loaded.text, tokenizer: loaded.tokenizer),
+                // Auto-indexing can commit thousands of rows while this screen
+                // is open; a query must see them without rebuilding the engine.
+                reopenEmbeddings: { try EmbeddingMatrixReader(url: matrixURL) }
             )
 
             if let manifest = try? modelResources.manifest() {
@@ -132,6 +195,18 @@ final class SmartSearchModel {
             }
             phase = .idle
             await refreshIndexStatus()
+
+            // A query submitted while the model was loading was accepted into
+            // `query` but could not run (no engine yet). Run it now instead of
+            // leaving an empty grid with no explanation.
+            if !query.isEmpty { search(query) }
+
+            // Opening search is the signal that indexing is wanted. A previous
+            // explicit pause is respected across launches; the button in the
+            // status bar is how it is lifted.
+            if needsIndexing, !Self.indexingIsPaused {
+                startIndexing()
+            }
         } catch {
             phase = .failed(Self.describe(error))
         }
@@ -141,25 +216,52 @@ final class SmartSearchModel {
         guard let store else { return }
         do {
             let stats = try store.stats()
+            indexStats = stats
             statusMessage = Self.summary(stats: stats)
         } catch {
             statusMessage = Self.describe(error)
         }
     }
 
-    /// Fills the index, one batch at a time, until it is complete or the screen
-    /// goes away.
+    private static var indexingIsPaused: Bool {
+        UserDefaults.standard.bool(forKey: indexingPausedKey)
+    }
+
+    private static func setIndexingPaused(_ paused: Bool) {
+        UserDefaults.standard.set(paused, forKey: indexingPausedKey)
+    }
+
+    /// Fills the index, one batch at a time, until it is complete or paused.
+    ///
+    /// The model is shared, so leaving the screen does not stop a run; this is
+    /// what lets a 100k-photo index make progress while the user is elsewhere in
+    /// the app. The task ends when the app is suspended or killed, and the next
+    /// visit resumes from the rows already committed.
     ///
     /// The metadata sync comes first: the pipeline embeds whatever the store
     /// considers pending, and nothing is pending until PhotoKit's assets have
     /// been written down.
     func startIndexing() {
         guard isReady, indexTask == nil, let store else { return }
-        indexTask = Task { [weak self] in
+        Self.setIndexingPaused(false)
+        isStartingIndex = true
+        indexTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer {
+                self.isStartingIndex = false
+                self.indexTask = nil
+                // The coordinator owns the vision tower. Keeping it after the
+                // run would pin ~90 MB for a model nothing is using.
+                self.coordinator = nil
+            }
             do {
-                var sync = PhotoKitMetadataSync(store: store)
-                var result = try sync.sync()
+                // The sync walks the library and writes metadata; the model
+                // load reads ~90 MB. Neither belongs on the main actor, and the
+                // task inherits it unless explicitly detached.
+                let result = try await Task.detached(priority: .utility) {
+                    try PhotoKitMetadataSync(store: store).sync()
+                }.value
+                guard !Task.isCancelled else { return }
                 // A limited library is a first-class state, not a failure: the
                 // index covers the selection the user granted.
                 if result.isLimited {
@@ -167,11 +269,16 @@ final class SmartSearchModel {
                 }
                 await self.refreshIndexStatus()
 
+                let embedder = try await Task.detached(priority: .userInitiated) { [modelResources] in
+                    try modelResources.makeVisionEncoder()
+                }.value
+                guard !Task.isCancelled else { return }
+
                 let coordinator = PhotoSearchIndexCoordinator(
                     store: store,
                     source: PhotoKitPendingSource(store: store),
                     imageLoader: PhotoKitImageLoader(),
-                    embedder: try self.modelResources.makeVisionEncoder(),
+                    embedder: embedder,
                     recognizer: PhotoTextRecognizer()
                 )
                 self.coordinator = coordinator
@@ -182,20 +289,29 @@ final class SmartSearchModel {
                 if result.didFullScan {
                     self.statusMessage = "已重新扫描照片库"
                 }
+                // The sync phase is over; from here the coordinator's progress
+                // is what the status bar should describe.
+                self.isStartingIndex = false
                 await coordinator.run()
             } catch {
                 self.statusMessage = Self.describe(error)
             }
             await self.refreshIndexStatus()
-            self.indexTask = nil
         }
     }
 
+    /// Stops at the next pause boundary and remembers the choice.
+    ///
+    /// `indexTask` is deliberately not cleared here: the task's own cleanup
+    /// clears it once the current batch (or the metadata sync) has actually
+    /// stopped. Clearing it now would let a second run start while the first
+    /// one is still winding down.
     func cancelIndexing() {
+        Self.setIndexingPaused(true)
         indexTask?.cancel()
-        indexTask = nil
         coordinator?.pause()
         indexState = .paused(coordinator?.progress ?? PhotoSearchIndexProgress())
+        isStartingIndex = false
     }
 
     // MARK: - Searching
@@ -228,6 +344,9 @@ final class SmartSearchModel {
                 // A newer query may have started while this one ran; the older
                 // answer must not overwrite the newer one.
                 guard !Task.isCancelled, self.query == trimmed else { return }
+                // The empty state names how much of the library was searched,
+                // and indexing may have advanced since the screen opened.
+                await self.refreshIndexStatus()
                 self.apply(response: response)
             } catch {
                 guard !Task.isCancelled else { return }
@@ -250,6 +369,7 @@ final class SmartSearchModel {
                     try engine.search(similarTo: identifier)
                 }.value
                 guard !Task.isCancelled else { return }
+                await self.refreshIndexStatus()
                 self.apply(response: response)
             } catch {
                 guard !Task.isCancelled else { return }
@@ -338,8 +458,12 @@ final class SmartSearchModel {
             return "已索引 \(stats.embeddedAssets) 张"
         }
         var parts = ["已索引 \(stats.embeddedAssets)/\(stats.totalAssets)"]
-        if stats.pendingAssets > 0 { parts.append("待处理 \(stats.pendingAssets)") }
+        let actionable = stats.pendingAssets - stats.waitingForLocalPreview
+        if actionable > 0 { parts.append("待处理 \(actionable)") }
         if stats.failedAssets > 0 { parts.append("失败 \(stats.failedAssets)") }
+        if stats.waitingForLocalPreview > 0 {
+            parts.append("等待本机预览 \(stats.waitingForLocalPreview)")
+        }
         return parts.joined(separator: " · ")
     }
 

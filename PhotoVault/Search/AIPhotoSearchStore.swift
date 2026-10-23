@@ -52,6 +52,10 @@ struct AISearchIndexStats: Equatable, Sendable {
     var failedAssets = 0
     var assetsWithLocation = 0
     var assetsWithText = 0
+    /// Pending assets whose next attempt is scheduled in the future. In practice
+    /// these are iCloud originals with no local image: the indexer will not
+    /// download them, so they wait until the system caches a preview.
+    var waitingForLocalPreview = 0
 }
 
 /// Which assets a query is allowed to consider, before vector ranking.
@@ -1116,6 +1120,12 @@ final class AIPhotoSearchStore: @unchecked Sendable {
                 stats.failedAssets = try scalarInt(
                     "SELECT COUNT(*) FROM ai_asset WHERE status = \(Status.failed.rawValue)"
                 )
+                stats.waitingForLocalPreview = try scalarInt("""
+                    SELECT COUNT(*) FROM ai_asset
+                    WHERE status = \(Status.pending.rawValue)
+                      AND next_retry_at IS NOT NULL
+                      AND next_retry_at > \(Int(Date().timeIntervalSince1970))
+                """)
                 stats.assetsWithLocation = try scalarInt(
                     "SELECT COUNT(*) FROM ai_asset WHERE latitude IS NOT NULL"
                 )
