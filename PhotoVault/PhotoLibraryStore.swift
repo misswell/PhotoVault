@@ -205,6 +205,10 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     /// A full-library fetch is already running; further change notifications
     /// only mark it dirty instead of cancelling and restarting it.
     private var isFullRefreshInFlight = false
+    /// Generation that owns `isFullRefreshInFlight` / `pendingRefreshAfterFetch`.
+    /// A superseded refresh must not clear or consume the state of the one that
+    /// replaced it.
+    private var refreshGenerationInFlight: Int?
     private var pendingRefreshAfterFetch = false
     /// Burst-coalescing for library change notifications.
     private var pendingChanges: [PHChange] = []
@@ -364,6 +368,8 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
         isLoadingAlbums = true
         isFullRefreshInFlight = true
+        refreshGenerationInFlight = generation
+        pendingRefreshAfterFetch = false
 
         // Time-to-first-pixels is the bounded launch window and nothing else.
         // Nothing else may touch PhotoKit until it resolves: on a cold
@@ -382,7 +388,10 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     /// sorted library fetch, album metadata, and the change observer. Starts
     /// only once the launch window has been resolved or skipped.
     private func beginBulkRefresh(generation: Int) {
-        guard indexGeneration == generation else { return }
+        guard indexGeneration == generation else {
+            finishRefreshIfOwned(generation: generation)
+            return
+        }
         loadCachedAlbumsIfNeeded()
         if !hasRegisteredChangeObserver {
             hasRegisteredChangeObserver = true
@@ -390,6 +399,7 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
             photoVaultTraceLaunch("store change observer registered")
         }
 
+        let indexStore = self.indexStore
         photoVaultTraceLaunch("store bulk refresh begin generation=\(generation)")
         DispatchQueue.global(qos: .userInitiated).async {
             photoVaultTraceLaunch("store full fetch begin")
@@ -412,30 +422,47 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 )
             }
 
-            // Encoding the snapshot is proportional to the album/folder count;
-            // do it here rather than on the main actor.
-            let fetchedAlbums = Self.fetchAlbums()
-            photoVaultTraceLaunch(
-                "store albums fetched albums=\(fetchedAlbums.albums.count) "
-                    + "folders=\(fetchedAlbums.folders.count)"
-            )
-            let snapshotData = Self.encodeAlbumCache(
-                albums: fetchedAlbums.albums,
-                folders: fetchedAlbums.folders
-            )
+            // A newer refresh or a live library change superseded this pass
+            // while the asset fetch was running. Do not pay for the album
+            // metadata scan; the owner of the current generation will.
+            var fetchedAlbums: PhotoAlbumFetchResult?
+            var snapshotData: Data?
+            if indexStore.isActiveGeneration(generation) {
+                // Encoding the snapshot is proportional to the album/folder
+                // count; do it here rather than on the main actor.
+                let albums = Self.fetchAlbums()
+                fetchedAlbums = albums
+                snapshotData = Self.encodeAlbumCache(
+                    albums: albums.albums,
+                    folders: albums.folders
+                )
+                photoVaultTraceLaunch(
+                    "store albums fetched albums=\(albums.albums.count) "
+                        + "folders=\(albums.folders.count)"
+                )
+            } else {
+                photoVaultTraceLaunch(
+                    "store albums skipped stale generation=\(generation)"
+                )
+            }
 
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
+                // A superseded pass owns none of this shared state: its
+                // pending flag belongs to the pass that replaced it.
+                guard self.refreshGenerationInFlight == generation else { return }
+                self.refreshGenerationInFlight = nil
                 self.isFullRefreshInFlight = false
                 // A change arrived while this fetch was running. Run one more
                 // pass instead of having cancelled this one.
                 let shouldRefreshAgain = self.pendingRefreshAfterFetch
                 self.pendingRefreshAfterFetch = false
+                self.isLoadingAlbums = false
 
-                guard self.indexGeneration == generation else {
-                    if shouldRefreshAgain, !self.isFullRefreshInFlight {
-                        self.refresh()
-                    }
+                guard self.indexGeneration == generation,
+                      let fetchedAlbums
+                else {
+                    if shouldRefreshAgain { self.refresh() }
                     return
                 }
                 photoVaultTrace(
@@ -451,7 +478,6 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 self.albums = fetchedAlbums.albums
                 self.albumFolders = fetchedAlbums.folders
                 self.allPhotos = fetchedPhotos
-                self.isLoadingAlbums = false
                 self.synchronizeIndex(
                     allPhotos: fetchedPhotos,
                     userAlbums: fetchedAlbums.albums
@@ -464,6 +490,19 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 }
             }
         }
+    }
+
+    /// Releases the in-flight bookkeeping of a refresh that was superseded
+    /// before its background work started. Only the generation that owns the
+    /// flag may clear it.
+    private func finishRefreshIfOwned(generation: Int) {
+        guard refreshGenerationInFlight == generation else { return }
+        refreshGenerationInFlight = nil
+        isFullRefreshInFlight = false
+        isLoadingAlbums = false
+        let shouldRefreshAgain = pendingRefreshAfterFetch
+        pendingRefreshAfterFetch = false
+        if shouldRefreshAgain { refresh() }
     }
 
     func ensureUnsortedIndex() {
@@ -1140,6 +1179,9 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
         // A nil detail means the change only affected collections (for
         // example, adding an asset to an album), so the existing asset fetch
         // result is still valid and can be reused without a full asset fetch.
+        if let details {
+            invalidateEditedAssetCaches(change: change, assets: details.changedObjects)
+        }
         let updatedPhotos = details?.fetchResultAfterChanges ?? currentPhotos
         allPhotos = updatedPhotos
         needsUnsortedIndex = true
@@ -1148,6 +1190,19 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
         isLoadingAlbums = true
         scheduleAlbumRescan()
+    }
+
+    /// An in-place edit keeps the library count and every identifier, so the
+    /// grid sees no data-source change and cached thumbnails would keep
+    /// showing the old render. Bounded because a large delta is a bulk
+    /// import/deletion, not an edit, and inspecting each object is wasteful.
+    private func invalidateEditedAssetCaches(change: PHChange, assets: [PHAsset]) {
+        guard !assets.isEmpty, assets.count <= 64 else { return }
+        let edited = assets.filter {
+            change.changeDetails(for: $0)?.assetContentChanged == true
+        }
+        guard !edited.isEmpty else { return }
+        PhotoImageManager.shared.invalidate(assetIdentifiers: edited.map(\.localIdentifier))
     }
 
     /// A full library fetch is already running. Restarting it on every
@@ -1179,7 +1234,9 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
     private func performAlbumRescan() {
         guard let photos = allPhotos else { return }
         let generation = indexGeneration
+        let indexStore = self.indexStore
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard indexStore.isActiveGeneration(generation) else { return }
             let fetchedAlbums = Self.fetchAlbums()
             // Encoding the snapshot is proportional to the album/folder count
             // and used to run on the main actor on this hot path. It is pure
@@ -1191,13 +1248,13 @@ final class PhotoLibraryStore: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
             DispatchQueue.main.async {
                 guard let self else { return }
+                guard self.indexGeneration == generation else { return }
                 if let snapshotData {
                     UserDefaults.standard.set(
                         snapshotData,
                         forKey: self.albumCacheDefaultsKey
                     )
                 }
-                guard self.indexGeneration == generation else { return }
                 self.hasPublishedFreshAlbums = true
                 self.albumFetchResults.removeAll(keepingCapacity: true)
                 self.albums = fetchedAlbums.albums

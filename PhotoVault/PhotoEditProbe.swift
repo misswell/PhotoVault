@@ -109,6 +109,16 @@ final class PhotoEditProbe: ObservableObject {
             similarity.add(id: "wrong-ratio", hash: firstHash, ratio: 0.5)
             check(similarity.groups.contains { $0.contains("first") && $0.contains("far") }, "similar images beyond 100 item window")
             check(!similarity.groups.contains { $0.contains("wrong-ratio") && $0.contains("first") }, "similarity respects aspect ratio")
+            // Two groups that a later candidate bridges must collapse into one.
+            var merge = CleanupSimilarityIndex()
+            merge.add(id: "g1-a", hash: 0x1F0_0000, ratio: 1)
+            merge.add(id: "g1-b", hash: 0x3FF0_0000, ratio: 1)
+            merge.add(id: "g2-a", hash: 0x1F, ratio: 1)
+            merge.add(id: "g2-b", hash: 0x3FF, ratio: 1)
+            let beforeBridge = merge.groups.map { Set($0) }
+            check(beforeBridge == [Set(["g1-a", "g1-b"]), Set(["g2-a", "g2-b"])], "similarity keeps distinct groups")
+            merge.add(id: "bridge", hash: 0x1F0_001F, ratio: 1)
+            check(merge.groups.count == 1 && Set(merge.groups[0]) == ["g1-a", "g1-b", "g2-a", "g2-b", "bridge"], "similarity merges groups bridged by a new candidate")
             func media(_ id: String, bytes: Int64?, digest: String? = nil) -> ScannedMedia {
                 ScannedMedia(id: id, date: diaryDate, modified: nil, bytes: bytes, kind: PHAssetMediaType.video.rawValue, live: false, screenshot: false, width: 640, height: 480, hash: nil, digest: digest)
             }

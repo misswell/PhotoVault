@@ -34,24 +34,36 @@ final class SearchModelDownloadStore {
     }
 
     func download() {
-        guard task == nil, !isInstalled else { return }
+        guard !isInstalled else {
+            state = .installed
+            return
+        }
+        // A cancelled task is allowed to be replaced, but only after it has
+        // actually exited: the new attempt sweeps `.download-*` staging
+        // folders that the old one may still be writing into.
+        if let task, !task.isCancelled { return }
+        let previous = task
         let id = UUID()
         downloadID = id
         state = .downloading(received: 0, total: SearchModelCatalog.production.totalBytes)
         task = Task.detached(priority: .utility) { [self] in
+            await previous?.value
             do {
-                try await SearchModelDownloader.install(
-                    catalog: .production, destination: SearchModelInstallation.directory
-                ) { [self] progress in
-                    Task { @MainActor [self] in
-                        guard self.downloadID == id else { return }
-                        switch progress {
-                        case .downloading(let received, let total):
-                            if self.state == .installing { return }
-                            if case .downloading(let previous, _) = self.state, received < previous { return }
-                            self.state = .downloading(received: received, total: total)
-                        case .installing:
-                            self.state = .installing
+                try Task.checkCancellation()
+                if !SearchModelResources().isInstalled {
+                    try await SearchModelDownloader.install(
+                        catalog: .production, destination: SearchModelInstallation.directory
+                    ) { [self] progress in
+                        Task { @MainActor [self] in
+                            guard self.downloadID == id else { return }
+                            switch progress {
+                            case .downloading(let received, let total):
+                                if self.state == .installing { return }
+                                if case .downloading(let previous, _) = self.state, received < previous { return }
+                                self.state = .downloading(received: received, total: total)
+                            case .installing:
+                                self.state = .installing
+                            }
                         }
                     }
                 }
@@ -63,8 +75,11 @@ final class SearchModelDownloadStore {
     }
 
     func cancel() {
+        // Keep the task reference: a retry must wait for this cancelled work
+        // to leave the staging directory before sweeping it. Clearing the
+        // download id makes its eventual `finish` a no-op, so a user-requested
+        // cancel never surfaces as a failure.
         task?.cancel()
-        task = nil
         downloadID = nil
         state = SearchModelResources().isInstalled ? .installed : .notDownloaded
     }

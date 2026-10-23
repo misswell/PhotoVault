@@ -218,6 +218,7 @@ struct CompressionHistoryScreen: View {
             defer { deleting = false }
             do {
                 try await PHPhotoLibrary.shared().performChanges { @Sendable in PHAssetChangeRequest(for: asset).revertAssetContentToOriginal() }
+                PhotoImageManager.shared.invalidate(assetIdentifiers: [asset.localIdentifier])
                 workspace.removeReplacedCompression(for: record.resultID)
                 selected = nil
             }

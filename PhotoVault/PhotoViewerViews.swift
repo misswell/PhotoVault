@@ -1433,13 +1433,7 @@ struct PhotoViewerView: View {
             Spacer(minLength: 0)
             viewerBarAction {
                 if let currentAsset {
-                    Button(
-                        store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站",
-                        systemImage: store.isInRecycleBin(currentAsset) ? "arrow.uturn.backward" : "tray.and.arrow.down"
-                    ) {
-                        if store.isInRecycleBin(currentAsset) { store.removeFromRecycleBin(currentAsset) }
-                        else { store.addToRecycleBin(currentAsset) }
-                    }
+                    store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
                 }
             } label: { Image(systemName: "trash") }
             .disabled(currentAsset == nil)
@@ -3271,13 +3265,7 @@ struct IndexedPhotoViewerView: View {
             Spacer(minLength: 0)
             viewerBarAction {
                 if let currentAsset {
-                    Button(
-                        store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站",
-                        systemImage: store.isInRecycleBin(currentAsset) ? "arrow.uturn.backward" : "tray.and.arrow.down"
-                    ) {
-                        if store.isInRecycleBin(currentAsset) { store.removeFromRecycleBin(currentAsset) }
-                        else { store.addToRecycleBin(currentAsset) }
-                    }
+                    store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
                 }
             } label: { Image(systemName: "trash") }
             .disabled(currentAsset == nil)

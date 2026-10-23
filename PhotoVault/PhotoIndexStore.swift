@@ -107,6 +107,12 @@ final class PhotoIndexStore: @unchecked Sendable {
         generationLock.unlock()
     }
 
+    /// Thread-safe check for background work that is about to start an
+    /// expensive pass on behalf of a generation.
+    func isActiveGeneration(_ generation: Int) -> Bool {
+        isGenerationCurrent(generation)
+    }
+
     private func isGenerationCurrent(_ generation: Int) -> Bool {
         generationLock.lock()
         defer { generationLock.unlock() }

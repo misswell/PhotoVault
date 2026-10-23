@@ -483,6 +483,11 @@ private final class PhotoCachedFrame: @unchecked Sendable {
 
 final class PhotoImageManager {
     static let cacheInvalidatedNotification = Notification.Name("PhotoVault.photoCacheInvalidated")
+    /// Posted when an asset's rendered pixels changed (edit saved or reverted).
+    /// `userInfo` carries the affected local identifiers under
+    /// `changedAssetIdentifiersKey`; views showing them must re-request.
+    static let assetContentChangedNotification = Notification.Name("PhotoVault.photoAssetContentChanged")
+    static let changedAssetIdentifiersKey = "identifiers"
     // PHCachingImageManager is internally synchronized; all access here is
     // intentionally centralized through this one shared cache owner.
     nonisolated(unsafe) static let shared = PhotoImageManager()
@@ -493,6 +498,11 @@ final class PhotoImageManager {
     private let imageCache = NSCache<NSString, PhotoCachedFrame>()
     private let albumThumbnailCache = NSCache<NSString, PhotoCachedFrame>()
     private let gridThumbnailCache = NSCache<NSString, PhotoCachedFrame>()
+    private let revisionLock = NSLock()
+    /// Bumped per asset whenever its rendered content changes; folded into the
+    /// cache key so an old frame can never be served after an edit. Only
+    /// edited identifiers enter this map, so it stays small.
+    private var assetContentRevisions: [String: UInt32] = [:]
 
     private init() {
         let physicalMemory = ProcessInfo.processInfo.physicalMemory
@@ -866,7 +876,34 @@ final class PhotoImageManager {
         targetSize: CGSize,
         contentMode: PHImageContentMode
     ) -> NSString {
-        "\(asset.localIdentifier)|\(Int(targetSize.width.rounded()))x\(Int(targetSize.height.rounded()))|\(contentMode.rawValue)" as NSString
+        let revision = contentRevision(for: asset.localIdentifier)
+        return "\(asset.localIdentifier)|r\(revision)|\(Int(targetSize.width.rounded()))x\(Int(targetSize.height.rounded()))|\(contentMode.rawValue)" as NSString
+    }
+
+    /// The current content revision of an asset. Cells keep the value they
+    /// rendered so a re-configure can tell a stale frame from a reusable one.
+    func contentRevision(for identifier: String) -> UInt32 {
+        revisionLock.lock()
+        defer { revisionLock.unlock() }
+        return assetContentRevisions[identifier] ?? 0
+    }
+
+    /// Drops every cached size/scope for these assets by rotating their cache
+    /// key. Old entries become unreachable and age out under the existing cost
+    /// and count limits; nothing else in the cache has to be thrown away.
+    func invalidate(assetIdentifiers: [String]) {
+        let identifiers = Set(assetIdentifiers)
+        guard !identifiers.isEmpty else { return }
+        revisionLock.lock()
+        for identifier in identifiers {
+            assetContentRevisions[identifier, default: 0] &+= 1
+        }
+        revisionLock.unlock()
+        NotificationCenter.default.post(
+            name: Self.assetContentChangedNotification,
+            object: nil,
+            userInfo: [Self.changedAssetIdentifiersKey: identifiers]
+        )
     }
 
     private func imageCacheCost(_ image: UIImage) -> Int {

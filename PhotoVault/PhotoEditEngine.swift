@@ -316,6 +316,7 @@ enum PhotoEditSaver {
             try await PHPhotoLibrary.shared().performChanges { @Sendable in
                 PHAssetChangeRequest(for: asset).contentEditingOutput = prepared.value
             }
+            PhotoImageManager.shared.invalidate(assetIdentifiers: [asset.localIdentifier])
             resultID = asset.localIdentifier
         } else {
             // A Live Photo is saved through PHLivePhotoEditingContext so its
@@ -338,6 +339,7 @@ enum PhotoEditSaver {
                 try await PHPhotoLibrary.shared().performChanges { @Sendable in
                     PHAssetChangeRequest(for: asset).contentEditingOutput = prepared.value
                 }
+                PhotoImageManager.shared.invalidate(assetIdentifiers: [asset.localIdentifier])
                 resultID = asset.localIdentifier
             } else {
                 let box = CreatedAssetID()

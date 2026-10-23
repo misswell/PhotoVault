@@ -725,6 +725,7 @@ struct LANFolderViewerScreen: View {
     /// the close button routes through it like every other exit.
     let transitionState: PhotoViewerTransitionState
     let onClose: () -> Void
+    @State private var prefetchTasks: [Task<Void, Never>] = []
 
     /// The viewer is hosted outside the grid's SwiftUI tree, so the displayed
     /// page must be owned here — a binding back to the grid updates the pager
@@ -851,24 +852,36 @@ struct LANFolderViewerScreen: View {
         } message: {
             Text("无法从 SMB 服务器读取这张照片，请检查共享连接后重试。")
         }
+        .onDisappear {
+            cancelPrefetch()
+        }
     }
 
     /// Warm the disk/memory cache for the neighbors so the next page shows
     /// instantly — the same "prefetch before switching" rule as the album
-    /// viewer, routed through the shared coalescing loader queue.
+    /// viewer, routed through the shared coalescing loader queue. A swipe
+    /// replaces the window, so the previous pair is cancelled rather than
+    /// left holding decode-gate slots for photos the user already passed.
     private func prefetchNeighbors(around index: Int) {
+        cancelPrefetch()
         for offset in [-1, 1] {
             let candidate = index + offset
             guard files.indices.contains(candidate) else { continue }
-            Task.detached(priority: .utility) { [files, folderID, rootURL] in
+            prefetchTasks.append(Task.detached(priority: .utility) { [files, folderID, rootURL] in
+                guard !Task.isCancelled else { return }
                 _ = await LANFolderImageLoaderQueue.load(
                     at: files[candidate],
                     folderID: folderID,
                     rootURL: rootURL,
                     maxPixelSize: 2048
                 )
-            }
+            })
         }
+    }
+
+    private func cancelPrefetch() {
+        for task in prefetchTasks { task.cancel() }
+        prefetchTasks.removeAll()
     }
 }
 
@@ -986,6 +999,7 @@ struct LANFolderSlideshowScreen: View {
     private var interval: TimeInterval = SlideshowSettings.defaultInterval
     @State private var stoppedAtEnd = false
     @State private var previousIdleTimerDisabled = false
+    @State private var prefetchTasks: [Task<Void, Never>] = []
     @AppStorage(SlideshowTransitionStyle.storageKey)
     private var transitionStyleRawValue = SlideshowTransitionStyle.fade.rawValue
 
@@ -1118,6 +1132,7 @@ struct LANFolderSlideshowScreen: View {
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = previousIdleTimerDisabled
+            cancelPrefetch()
         }
         .onChange(of: scenePhase) { _, phase in
             UIApplication.shared.isIdleTimerDisabled = phase == .active
@@ -1185,18 +1200,25 @@ struct LANFolderSlideshowScreen: View {
     }
 
     private func prefetchNeighbors(around index: Int) {
+        cancelPrefetch()
         for offset in [-1, 1] {
             let candidate = index + offset
             guard files.indices.contains(candidate) else { continue }
-            Task.detached(priority: .utility) { [files, folderID, rootURL] in
+            prefetchTasks.append(Task.detached(priority: .utility) { [files, folderID, rootURL] in
+                guard !Task.isCancelled else { return }
                 _ = await LANFolderImageLoaderQueue.load(
                     at: files[candidate],
                     folderID: folderID,
                     rootURL: rootURL,
                     maxPixelSize: 2048
                 )
-            }
+            })
         }
+    }
+
+    private func cancelPrefetch() {
+        for task in prefetchTasks { task.cancel() }
+        prefetchTasks.removeAll()
     }
 }
 

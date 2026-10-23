@@ -406,25 +406,53 @@ final class LANFolderScopeManager: @unchecked Sendable {
         let started = url.startAccessingSecurityScopedResource()
 
         lock.lock()
-        if let existing = active[id],
-           existing.started,
-           existing.url != url {
+        // Another caller may have won the race while this start was in
+        // flight. Two successful grants for the same folder are two
+        // independent references: release ours instead of overwriting the
+        // recorded one, or that reference leaks for the life of the process.
+        if let existing = active[id], existing.url == url, existing.started {
+            lock.unlock()
+            if started { url.stopAccessingSecurityScopedResource() }
+            return true
+        }
+        let previousToRelease: URL? = {
+            guard let existing = active[id],
+                  existing.started,
+                  existing.url != url
+            else { return nil }
             // A different URL replaced this entry while we were starting;
             // release the previous grant (it belongs to the same folder).
-            existing.url.stopAccessingSecurityScopedResource()
-        }
+            return existing.url
+        }()
         active[id] = ActiveScope(url: url, started: started)
         lock.unlock()
+        previousToRelease?.stopAccessingSecurityScopedResource()
         return started
     }
 
     /// Records a scope that was started through another path (e.g. inside an
     /// NSFileCoordinator accessor) so the session-held bookkeeping stays
-    /// accurate without a second startAccessing call.
+    /// accurate without a second startAccessing call. The caller already
+    /// owns a successful grant when it calls this.
     func noteScopeHeld(id: UUID, url: URL) {
+        var releaseAfterUnlock: URL?
         lock.lock()
-        defer { lock.unlock() }
+        if let existing = active[id] {
+            if existing.url == url {
+                if existing.started {
+                    // A grant is already held for this URL. The caller's
+                    // start is redundant; release it after unlocking.
+                    lock.unlock()
+                    url.stopAccessingSecurityScopedResource()
+                    return
+                }
+            } else if existing.started {
+                releaseAfterUnlock = existing.url
+            }
+        }
         active[id] = ActiveScope(url: url, started: true)
+        lock.unlock()
+        releaseAfterUnlock?.stopAccessingSecurityScopedResource()
     }
 }
 
@@ -459,6 +487,13 @@ enum LANFolderImageLoader {
     /// treated as a wedged provider. Waiting forever used to burn one of the
     /// three decode slots for the lifetime of the process.
     static let coordinatedReadTimeout: TimeInterval = 20
+
+    /// The timeout above stops the caller from waiting; it does not stop
+    /// NSFileCoordinator. A slot is held until the accessor block actually
+    /// runs, so a wedged provider cannot accumulate unlimited background
+    /// reads. Once all slots are held, new reads fail fast instead of piling
+    /// up more provider work (the grid shows its placeholder and can retry).
+    private static let coordinatedReadGate = DispatchSemaphore(value: 4)
 
     /// Lists image files under the folder recursively, newest modification
     /// first. Runs off the main thread at the call site; the caller must
@@ -547,6 +582,10 @@ enum LANFolderImageLoader {
     /// the process, which used to starve every later image load.
     static func image(at url: URL, maxPixelSize: CGFloat) -> UIImage? {
         startDownloadIfNeeded(url)
+        guard coordinatedReadGate.wait(timeout: .now() + 2) == .success else {
+            LANFolderDiagnostics.log("image coordinated read skipped: all slots held")
+            return nil
+        }
         let coordinator = NSFileCoordinator(filePresenter: nil)
         let intent = NSFileAccessIntent.readingIntent(with: url, options: [])
         let decoded = CoordinatedResult<UIImage>()
@@ -554,7 +593,10 @@ enum LANFolderImageLoader {
         let queue = OperationQueue()
 
         coordinator.coordinate(with: [intent], queue: queue) { error in
-            defer { done.signal() }
+            defer {
+                done.signal()
+                coordinatedReadGate.signal()
+            }
             if let error {
                 LANFolderDiagnostics.log("image coordinated read denied: \(error.localizedDescription)")
                 return
@@ -651,6 +693,19 @@ enum LANFolderThumbnailDiskCache {
     nonisolated(unsafe) private static var knownModificationDates: [String: Date] = [:]
     private static let knownModificationDateLimit = 32_768
 
+    /// Disk thumbnails are a cache, so they need a ceiling: deleting a folder
+    /// is no longer the only way files can disappear. Writes are counted per
+    /// folder and a background pass evicts the oldest files once the folder
+    /// budget is exceeded.
+    private static let pruneLock = NSLock()
+    nonisolated(unsafe) private static var writesSincePrune: [UUID: Int] = [:]
+    private static let pruneInterval = 128
+    private static let maximumFolderBytes: Int64 = 256 * 1024 * 1024
+    private static let pruneQueue = DispatchQueue(
+        label: "com.misswell.PhotoVault.lan-thumbnail-prune",
+        qos: .utility
+    )
+
     static func recordModificationDate(_ date: Date?, for source: URL) {
         guard let date else { return }
         mtimeLock.lock()
@@ -667,12 +722,18 @@ enum LANFolderThumbnailDiskCache {
         return knownModificationDates[source.path]
     }
 
-    private static func directory(for folderID: UUID) -> URL {
-        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let directory = caches
+    /// Pure path computation. Cache lookups run per visible thumbnail, so
+    /// creating the directory on every call was a pointless syscall on the
+    /// load path.
+    private static func directoryURL(for folderID: UUID) -> URL {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("PhotoVault", isDirectory: true)
             .appendingPathComponent("lan-thumbnails", isDirectory: true)
             .appendingPathComponent(folderID.uuidString, isDirectory: true)
+    }
+
+    private static func ensureDirectory(for folderID: UUID) -> URL {
+        let directory = directoryURL(for: folderID)
         try? FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true
@@ -699,7 +760,7 @@ enum LANFolderThumbnailDiskCache {
             .map { String(format: "%02x", $0) }
             .joined()
         let mtime = Int(modificationDate?.timeIntervalSince1970 ?? 0)
-        return directory(for: folderID)
+        return directoryURL(for: folderID)
             .appendingPathComponent("\(digest)-\(mtime)-\(Int(maxPixelSize)).jpg")
     }
 
@@ -732,9 +793,61 @@ enum LANFolderThumbnailDiskCache {
         ) else { return nil }
         let payload = decoded.jpegData(compressionQuality: 0.72)
         if let payload {
+            _ = ensureDirectory(for: folderID)
             try? payload.write(to: diskURL, options: .atomic)
+            noteWrite(folderID: folderID)
         }
         return decoded
+    }
+
+    private static func noteWrite(folderID: UUID) {
+        let shouldPrune = pruneLock.withLock { () -> Bool in
+            let count = (writesSincePrune[folderID] ?? 0) + 1
+            if count >= pruneInterval {
+                writesSincePrune[folderID] = 0
+                return true
+            }
+            writesSincePrune[folderID] = count
+            return false
+        }
+        guard shouldPrune else { return }
+        pruneQueue.async { prune(folderID: folderID) }
+    }
+
+    /// Evicts oldest thumbnails until the folder is back under its byte
+    /// budget. Runs on a utility queue and tolerates files disappearing
+    /// underneath it.
+    private static func prune(folderID: UUID) {
+        let directory = directoryURL(for: folderID)
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey, .fileSizeKey, .contentModificationDateKey,
+        ]
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: Array(keys),
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        var entries: [(url: URL, size: Int64, date: Date)] = []
+        var total: Int64 = 0
+        for file in files {
+            let values = try? file.resourceValues(forKeys: keys)
+            guard values?.isRegularFile != false else { continue }
+            let size = Int64(values?.fileSize ?? 0)
+            total += size
+            entries.append((
+                file,
+                size,
+                values?.contentModificationDate ?? .distantPast
+            ))
+        }
+        guard total > maximumFolderBytes else { return }
+        entries.sort { $0.date < $1.date }
+        for entry in entries {
+            guard total > maximumFolderBytes else { break }
+            if (try? FileManager.default.removeItem(at: entry.url)) != nil {
+                total -= entry.size
+            }
+        }
     }
 
     /// Only derived thumbnails are removed; folder bookmarks and files remain.
@@ -743,15 +856,14 @@ enum LANFolderThumbnailDiskCache {
             .appendingPathComponent("PhotoVault", isDirectory: true)
             .appendingPathComponent("lan-thumbnails", isDirectory: true)
         try? FileManager.default.removeItem(at: root)
+        pruneLock.withLock { writesSincePrune.removeAll() }
     }
 
     /// Drops a removed album's thumbnails from Caches. Deleting thousands of
     /// files can block for a while, so it never runs on the main thread.
     static func purge(folderID: UUID) {
-        let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("PhotoVault", isDirectory: true)
-            .appendingPathComponent("lan-thumbnails", isDirectory: true)
-            .appendingPathComponent(folderID.uuidString, isDirectory: true)
+        let directory = directoryURL(for: folderID)
+        pruneLock.withLock { writesSincePrune[folderID] = 0 }
         Task.detached(priority: .utility) {
             try? FileManager.default.removeItem(at: directory)
         }

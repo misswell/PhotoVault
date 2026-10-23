@@ -585,6 +585,12 @@ struct PhotoGridView: UIViewRepresentable {
                                                    name: UIApplication.didBecomeActiveNotification, object: nil)
             NotificationCenter.default.addObserver(self, selector: #selector(handleEnteredBackground),
                                                    name: UIApplication.didEnterBackgroundNotification, object: nil)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleAssetContentChanged(_:)),
+                name: PhotoImageManager.assetContentChangedNotification,
+                object: nil
+            )
 
             DispatchQueue.main.async { [weak self, weak collectionView] in
                 guard let self, let collectionView else { return }
@@ -860,6 +866,15 @@ struct PhotoGridView: UIViewRepresentable {
             // Clearing them here leaves blank cells until they are recycled.
         }
 
+        @objc private func handleAssetContentChanged(_ notification: Notification) {
+            guard let collectionView,
+                  let identifiers = notification.userInfo?[
+                    PhotoImageManager.changedAssetIdentifiersKey
+                  ] as? Set<String>
+            else { return }
+            PhotoGridCell.refreshVisibleCells(in: collectionView, identifiers: identifiers)
+        }
+
         private func updateVisibleSelection(in collectionView: UICollectionView) {
             for cell in collectionView.visibleCells {
                 guard let photoCell = cell as? PhotoGridCell,
@@ -1056,6 +1071,9 @@ final class PhotoGridCell: UICollectionViewCell {
     private var representedAsset: PHAsset?
     private var representedIdentifier: String?
     private var representedTargetSize = CGSize.zero
+    private var representedContentRevision: UInt32 = 0
+    private var representedSelectionMode = false
+    private var representedIsSelected = false
 
     /// The frame currently painted by this cell, if any. The viewer uses this
     /// to render an instant first frame; it never retains the cell itself.
@@ -1148,7 +1166,12 @@ final class PhotoGridCell: UICollectionViewCell {
         selectionMode: Bool,
         isSelected: Bool
     ) {
-        let previousImage = representedIdentifier == asset.localIdentifier && representedTargetSize == targetSize ? imageView.image : nil
+        let revision = PhotoImageManager.shared.contentRevision(for: asset.localIdentifier)
+        // Reusing the painted frame is only valid while it still depicts the
+        // asset's current content; an edit rotates the revision.
+        let previousImage = representedIdentifier == asset.localIdentifier
+            && representedTargetSize == targetSize
+            && representedContentRevision == revision ? imageView.image : nil
         let previousHadFinalImage = previousImage != nil && hasFinalImage
         cancelRequest()
         let generation = requestGeneration
@@ -1156,6 +1179,9 @@ final class PhotoGridCell: UICollectionViewCell {
         representedAsset = asset
         representedIdentifier = asset.localIdentifier
         representedTargetSize = targetSize
+        representedContentRevision = revision
+        representedSelectionMode = selectionMode
+        representedIsSelected = isSelected
 
         // Serve an already-decoded thumbnail in the same frame. Without this
         // probe every recycle blanked the cell and re-requested a photo that
@@ -1243,6 +1269,34 @@ final class PhotoGridCell: UICollectionViewCell {
         }
     }
 
+    /// Re-renders this cell when an edit replaced the asset's pixels while the
+    /// cell stayed on screen (an in-place edit keeps count and identifiers
+    /// unchanged, so the grid never reloads for it by itself).
+    func refreshIfStale(identifiers: Set<String>) -> Bool {
+        guard let asset = representedAsset,
+              let identifier = representedIdentifier,
+              identifiers.contains(identifier),
+              representedContentRevision
+                != PhotoImageManager.shared.contentRevision(for: identifier)
+        else { return false }
+        configure(
+            asset: asset,
+            targetSize: representedTargetSize,
+            selectionMode: representedSelectionMode,
+            isSelected: representedIsSelected
+        )
+        return true
+    }
+
+    static func refreshVisibleCells(
+        in collectionView: UICollectionView,
+        identifiers: Set<String>
+    ) {
+        for case let cell as PhotoGridCell in collectionView.visibleCells {
+            _ = cell.refreshIfStale(identifiers: identifiers)
+        }
+    }
+
     func resumeLoadingIfNeeded(
         asset: PHAsset,
         targetSize: CGSize,
@@ -1251,8 +1305,10 @@ final class PhotoGridCell: UICollectionViewCell {
     ) {
         let sameAsset = representedIdentifier == asset.localIdentifier
         let sameTargetSize = representedTargetSize == targetSize
+        let sameContent = representedContentRevision
+            == PhotoImageManager.shared.contentRevision(for: asset.localIdentifier)
 
-        if sameAsset, sameTargetSize, imageView.image != nil, hasFinalImage {
+        if sameAsset, sameTargetSize, sameContent, imageView.image != nil, hasFinalImage {
             setSelection(selectionMode: selectionMode, isSelected: isSelected)
             return
         }
@@ -1585,6 +1641,12 @@ struct IndexedPhotoGridView: UIViewRepresentable {
                                                    name: UIApplication.didBecomeActiveNotification, object: nil)
             NotificationCenter.default.addObserver(self, selector: #selector(handleEnteredBackground),
                                                    name: UIApplication.didEnterBackgroundNotification, object: nil)
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleAssetContentChanged(_:)),
+                name: PhotoImageManager.assetContentChangedNotification,
+                object: nil
+            )
 
             DispatchQueue.main.async { [weak self, weak collectionView] in
                 guard let self, let collectionView else { return }
@@ -1935,6 +1997,15 @@ struct IndexedPhotoGridView: UIViewRepresentable {
             resumesAfterBackground = false
             guard isActive, let collectionView else { return }
             resumeVisibleCells(in: collectionView)
+        }
+
+        @objc private func handleAssetContentChanged(_ notification: Notification) {
+            guard let collectionView,
+                  let identifiers = notification.userInfo?[
+                    PhotoImageManager.changedAssetIdentifiersKey
+                  ] as? Set<String>
+            else { return }
+            PhotoGridCell.refreshVisibleCells(in: collectionView, identifiers: identifiers)
         }
 
         @objc private func handleMemoryWarning() {

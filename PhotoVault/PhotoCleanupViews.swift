@@ -22,8 +22,29 @@ struct ScannedMedia: Codable, Identifiable, Sendable {
 struct CleanupSnapshot: Codable, Sendable {
     let date: Date
     let libraryCount: Int
+    /// PhotoKit change token captured when the scan started. It answers "did
+    /// the library change since this report?" without re-enumerating 100k
+    /// assets — a delete plus an insert leaves the count unchanged but still
+    /// advances the token.
+    let changeToken: Data?
     let items: [ScannedMedia]
     let similarGroups: [[String]]
+
+    init(
+        date: Date,
+        libraryCount: Int,
+        changeToken: Data? = nil,
+        items: [ScannedMedia],
+        similarGroups: [[String]]
+    ) {
+        self.date = date
+        self.libraryCount = libraryCount
+        self.changeToken = changeToken
+        self.items = items
+        self.similarGroups = similarGroups
+    }
+
+    var identity: String { "\(date.timeIntervalSince1970)-\(libraryCount)" }
 }
 
 struct CleanupDay: Sendable { let date: Date; let bytes: Int64; let unknownCount: Int }
@@ -67,8 +88,27 @@ struct CleanupSimilarityIndex {
     private struct Band: Hashable { let index: Int; let value: UInt64 }
     private var buckets: [Band: [Candidate]] = [:]
     private var exact: [UInt64: [Candidate]] = [:]
-    private var groupByID: [String: Int] = [:]
-    private(set) var groups: [[String]] = []
+    /// Union-find over asset IDs. A new photo can be within the Hamming
+    /// threshold of candidates from two groups that were previously separate;
+    /// those groups must be merged instead of the photo joining only the first
+    /// candidate found.
+    private var parent: [String: String] = [:]
+    private var componentSize: [String: Int] = [:]
+    private var insertionOrder: [String] = []
+
+    var groups: [[String]] {
+        var byRoot: [String: [String]] = [:]
+        var rootOrder: [String] = []
+        for id in insertionOrder {
+            let root = rootWithoutCompression(id)
+            if byRoot[root] == nil { rootOrder.append(root) }
+            byRoot[root, default: []].append(id)
+        }
+        return rootOrder.compactMap { root in
+            guard let ids = byRoot[root], ids.count > 1 else { return nil }
+            return ids
+        }
+    }
 
     mutating func add(id: String, hash: UInt64, ratio: Double) {
         let candidate = Candidate(id: id, hash: hash, ratio: ratio)
@@ -78,24 +118,55 @@ struct CleanupSimilarityIndex {
             let bits = min(11, 64 - shift)
             return Band(index: index, value: (hash >> shift) & ((1 << bits) - 1))
         }
-        var match = identical
-        if match == nil {
-            for band in bands {
-                if let found = buckets[band]?.last(where: { abs($0.ratio - ratio) < 0.05 && ($0.hash ^ hash).nonzeroBitCount <= 5 }) {
-                    match = found; break
-                }
+
+        parent[id] = id
+        componentSize[id] = 1
+        insertionOrder.append(id)
+
+        var matchedRoots = Set<String>()
+        if let identical { matchedRoots.insert(find(identical.id)) }
+        for band in bands {
+            for found in buckets[band] ?? []
+            where abs(found.ratio - ratio) < 0.05 && (found.hash ^ hash).nonzeroBitCount <= 5 {
+                matchedRoots.insert(find(found.id))
             }
         }
-        if let match {
-            if let group = groupByID[match.id] { groups[group].append(id); groupByID[id] = group }
-            else { groupByID[match.id] = groups.count; groupByID[id] = groups.count; groups.append([match.id, id]) }
-        }
+        for root in matchedRoots { union(id, root) }
+
         // Identical hashes with a matching aspect ratio already have a lookup
         // representative; avoid huge candidate buckets for repeated images.
         if identical == nil {
             exact[hash, default: []].append(candidate)
             for band in bands { buckets[band, default: []].append(candidate) }
         }
+    }
+
+    private mutating func find(_ id: String) -> String {
+        let root = rootWithoutCompression(id)
+        var node = id
+        while let next = parent[node], next != root {
+            parent[node] = root
+            node = next
+        }
+        return root
+    }
+
+    private func rootWithoutCompression(_ id: String) -> String {
+        var current = id
+        while let next = parent[current], next != current { current = next }
+        return current
+    }
+
+    private mutating func union(_ lhs: String, _ rhs: String) {
+        var left = find(lhs)
+        var right = find(rhs)
+        guard left != right else { return }
+        if (componentSize[left] ?? 1) < (componentSize[right] ?? 1) {
+            swap(&left, &right)
+        }
+        parent[right] = left
+        componentSize[left] = (componentSize[left] ?? 1) + (componentSize[right] ?? 1)
+        componentSize.removeValue(forKey: right)
     }
 }
 
@@ -110,7 +181,33 @@ actor PhotoCleanupWorker {
         guard let data = try? Data(contentsOf: cacheURL) else { return nil }
         return try? JSONDecoder().decode(CleanupSnapshot.self, from: data)
     }
+
+    /// Cheap freshness check through PhotoKit's own persistent-change token.
+    /// An expired/unreadable token is treated as stale: showing an old report
+    /// as current is worse than asking for a rescan.
+    func isCurrent(_ snapshot: CleanupSnapshot) -> Bool {
+        guard let data = snapshot.changeToken,
+              let token = try? NSKeyedUnarchiver.unarchivedObject(
+                  ofClass: PHPersistentChangeToken.self,
+                  from: data
+              )
+        else { return false }
+        do {
+            let changes = try PHPhotoLibrary.shared().fetchPersistentChanges(since: token)
+            for _ in changes { return false }
+            return true
+        } catch {
+            return false
+        }
+    }
     func scan(_ assets: PhotoFetchSnapshot, progress: @escaping @Sendable (Int, Int) async -> Void) async throws -> CleanupSnapshot {
+        // Capture before reading: anything edited while this scan runs makes
+        // the report stale rather than silently mixing two library versions.
+        let startToken = PHPhotoLibrary.shared().currentChangeToken
+        let tokenData = try? NSKeyedArchiver.archivedData(
+            withRootObject: startToken,
+            requiringSecureCoding: true
+        )
         let old = load()
         let cached = Dictionary((old?.items ?? []).map { ($0.id, $0) }, uniquingKeysWith: { _, last in last })
         var items: [ScannedMedia] = []
@@ -144,7 +241,13 @@ actor PhotoCleanupWorker {
             }
         }
         try Task.checkCancellation()
-        let snapshot = CleanupSnapshot(date: .now, libraryCount: assets.result.count, items: items, similarGroups: similarity.groups)
+        let snapshot = CleanupSnapshot(
+            date: .now,
+            libraryCount: assets.result.count,
+            changeToken: tokenData,
+            items: items,
+            similarGroups: similarity.groups
+        )
         if let data = try? JSONEncoder().encode(snapshot) {
             try Task.checkCancellation()
             try? data.write(to: cacheURL, options: .atomic)
@@ -210,12 +313,18 @@ final class PhotoCleanupModel: ObservableObject {
     @Published var running = false
     @Published var processed = 0
     @Published var total = 0
+    @Published var snapshotIsStale = false
     private var task: Task<Void, Never>?
     func load() async {
         if snapshot == nil, let result = await PhotoCleanupWorker.shared.load() {
             projection = await CleanupProjectionWorker.shared.project(result)
             snapshot = result
+            await validateFreshness()
         }
+    }
+    func validateFreshness() async {
+        guard let snapshot else { return }
+        snapshotIsStale = !(await PhotoCleanupWorker.shared.isCurrent(snapshot))
     }
     func start(_ assets: PHFetchResult<PHAsset>) {
         guard !running else { return }
@@ -231,6 +340,7 @@ final class PhotoCleanupModel: ObservableObject {
                 let projection = await CleanupProjectionWorker.shared.project(snapshot)
                 try Task.checkCancellation()
                 self.projection = projection; self.snapshot = snapshot
+                self.snapshotIsStale = !(await PhotoCleanupWorker.shared.isCurrent(snapshot))
             } catch is CancellationError {
                 // Preserve the last complete snapshot when paused or hidden.
             } catch {
@@ -254,7 +364,11 @@ struct PhotoCleanupScreen: View {
                             Text(ByteCountFormatter.string(fromByteCount: projection.bytes, countStyle: .file)).font(.system(size: 38, weight: .bold, design: .rounded)).monospacedDigit()
                             Text("已读取本机媒体 · \(projection.measuredCount.formatted()) / \(snapshot.libraryCount.formatted()) 项").font(.caption).foregroundStyle(.secondary)
                             Text("云端原片及未读取的 Live Photo 配对视频不计入大小。统计时间：\(snapshot.date.formatted(date: .abbreviated, time: .shortened))").font(.caption2).foregroundStyle(.secondary)
-                            if snapshot.libraryCount != store.allPhotos?.count { Text("图库已变化，请更新扫描。").font(.caption).foregroundStyle(.orange) }
+                            if model.snapshotIsStale || snapshot.libraryCount != store.allPhotos?.count {
+                                Text("图库已变化（或扫描后内容被修改），请更新扫描。")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            }
                         }
                     } else { Text("扫描本机媒体，查看占用与清理建议。").foregroundStyle(.secondary) }
                     if model.running {
@@ -269,11 +383,11 @@ struct PhotoCleanupScreen: View {
                         NavigationLink { CleanupGroupList(title: "相似照片", groups: snapshot.similarGroups, store: store) } label: { Label("相似照片 · \(snapshot.similarGroups.count) 组", systemImage: "square.on.square") }
 
                         NavigationLink { CleanupGroupList(title: "重复文件", groups: projection.duplicates, store: store) } label: { Label("重复文件 · \(projection.duplicates.count) 组", systemImage: "doc.on.doc") }
-                        category("大截图", symbol: "viewfinder", items: projection.categories["screenshots"] ?? [])
-                        category("大照片", symbol: "photo", items: projection.categories["photos"] ?? [])
-                        category("大视频", symbol: "video", items: projection.categories["videos"] ?? [])
-                        category("大 Live Photo", symbol: "livephoto", items: projection.categories["live"] ?? [])
-                        NavigationLink { CleanupAssetList(title: "全部文件排序", items: snapshot.items, store: store) } label: { Label("全部文件排序", systemImage: "arrow.up.arrow.down") }
+                        category("大截图", symbol: "viewfinder", items: projection.categories["screenshots"] ?? [], scanIdentity: snapshot.identity)
+                        category("大照片", symbol: "photo", items: projection.categories["photos"] ?? [], scanIdentity: snapshot.identity)
+                        category("大视频", symbol: "video", items: projection.categories["videos"] ?? [], scanIdentity: snapshot.identity)
+                        category("大 Live Photo", symbol: "livephoto", items: projection.categories["live"] ?? [], scanIdentity: snapshot.identity)
+                        NavigationLink { CleanupAssetList(title: "全部文件排序", items: snapshot.items, scanIdentity: snapshot.identity, store: store) } label: { Label("全部文件排序", systemImage: "arrow.up.arrow.down") }
                     }
                     Section("更多工具") {
                         NavigationLink { CleanupStatisticsScreen(projection: projection) } label: { Label("每日空间统计 / 文件大小分布", systemImage: "chart.bar") }
@@ -287,12 +401,13 @@ struct PhotoCleanupScreen: View {
             .labelStyle(.titleAndIcon)
             .navigationTitle("清理相册")
             .task { await model.load() }
+            .task(id: store.libraryRevision) { await model.validateFreshness() }
             .onChange(of: scene.phase) { _, value in if value == .background { model.stop() } }
             .onDisappear { model.stop() }
         }
     }
-    private func category(_ title: String, symbol: String, items: [ScannedMedia]) -> some View {
-        NavigationLink { CleanupAssetList(title: title, items: items, store: store) } label: { Label("\(title) · \(items.count)", systemImage: symbol) }
+    private func category(_ title: String, symbol: String, items: [ScannedMedia], scanIdentity: String) -> some View {
+        NavigationLink { CleanupAssetList(title: title, items: items, scanIdentity: scanIdentity, store: store) } label: { Label("\(title) · \(items.count)", systemImage: symbol) }
     }
 }
 
@@ -318,6 +433,9 @@ private struct CleanupGroupList: View {
 private struct CleanupAssetList: View {
     let title: String
     let items: [ScannedMedia]
+    /// Identifies the scan that produced `items`. Counting entries is not
+    /// enough: a rescan can replace the same number of assets.
+    let scanIdentity: String
     @ObservedObject var store: PhotoLibraryStore
     @State private var ascending = false
     @State private var page = 0
@@ -337,10 +455,11 @@ private struct CleanupAssetList: View {
             }
             HStack { Button("上一页") { page -= 1 }.disabled(page == 0); Spacer(); Text("\(page + 1) / \(max(1, (items.count + pageSize - 1) / pageSize))"); Spacer(); Button("下一页") { page += 1 }.disabled((page + 1) * pageSize >= items.count) }
         }.navigationTitle(title)
-        .task(id: "\(ascending)-\(items.count)") {
+        .task(id: "\(ascending)-\(scanIdentity)") {
             let result = await CleanupProjectionWorker.shared.sort(items, ascending: ascending)
             guard !Task.isCancelled else { return }; sorted = result
         }
+        .onChange(of: scanIdentity) { _, _ in page = 0 }
         .task(id: WorkspaceIdentifierRequest(ids: current.map(\.id), revision: store.libraryRevision)) {
             let result = await WorkspaceAssetQuery.shared.batch(current.map(\.id))
             guard !Task.isCancelled else { return }; pageAssets = result.assets

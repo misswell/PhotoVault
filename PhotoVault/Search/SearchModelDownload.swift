@@ -48,6 +48,35 @@ enum SearchModelDownloadError: LocalizedError {
     }
 }
 
+/// Serializes installations. A cancelled attempt can still be inside a
+/// URLSession transfer or a Core ML compile for a while, and its staging
+/// directory is deleted by the next attempt's `.download-*` sweep — which
+/// would silently unlink the files it is still writing. Holding this gate for
+/// the whole install keeps two attempts from touching each other's staging.
+actor SearchModelInstallGate {
+    static let shared = SearchModelInstallGate()
+
+    private var isBusy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !isBusy {
+            isBusy = true
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            isBusy = false
+        } else {
+            // Ownership transfers directly to the resumed waiter.
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
 /// All large reads, hashing and Core ML compilation stay off the main actor.
 /// The final directory is published only after the complete installation passes.
 enum SearchModelDownloader {
@@ -60,6 +89,29 @@ enum SearchModelDownloader {
         catalog: SearchModelCatalog,
         destination: URL,
         session: URLSession = .shared,
+        progress: @escaping @Sendable (Progress) -> Void
+    ) async throws {
+        await SearchModelInstallGate.shared.acquire()
+        do {
+            // Waiting for the gate ignores cancellation; a cancelled caller
+            // must not start an install (and sweep another attempt's staging)
+            // just because it was queued behind one.
+            try Task.checkCancellation()
+            try await installExclusively(
+                catalog: catalog, destination: destination,
+                session: session, progress: progress
+            )
+        } catch {
+            await SearchModelInstallGate.shared.release()
+            throw error
+        }
+        await SearchModelInstallGate.shared.release()
+    }
+
+    private static func installExclusively(
+        catalog: SearchModelCatalog,
+        destination: URL,
+        session: URLSession,
         progress: @escaping @Sendable (Progress) -> Void
     ) async throws {
         let manager = FileManager.default

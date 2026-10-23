@@ -151,6 +151,16 @@ struct AssetImageView: View {
             resumesAfterBackground = false
             loadAttempt += 1
         }
+        .onReceive(NotificationCenter.default.publisher(for: PhotoImageManager.assetContentChangedNotification)) { notification in
+            guard let identifiers = notification.userInfo?[
+                PhotoImageManager.changedAssetIdentifiersKey
+            ] as? Set<String>, identifiers.contains(asset.localIdentifier) else { return }
+            // An edit (or revert) replaced the pixels behind this identifier.
+            // Re-request; the cache key rotates with the content revision. The
+            // frame on screen is kept until the new render arrives, so the page
+            // never blanks mid-edit.
+            loadAttempt += 1
+        }
         .onDisappear {
             cancelImageRequest()
         }
