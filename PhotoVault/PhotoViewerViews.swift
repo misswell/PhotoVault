@@ -4,6 +4,8 @@ import UIKit
 import AVKit
 import PhotosUI
 import OSLog
+import MapKit
+import UniformTypeIdentifiers
 
 #if DEBUG
 enum PagerDiagnostics {
@@ -868,6 +870,33 @@ enum ViewerAssets {
     }
 }
 
+private struct ViewerPhotoHeading: View {
+    let asset: PHAsset?
+    let index: Int
+    let count: Int
+
+    var body: some View {
+        VStack(spacing: 3) {
+            Text(asset?.creationDate?.formatted(date: .abbreviated, time: .omitted) ?? "照片")
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .accessibilityIdentifier("viewer-date")
+            HStack(spacing: 5) {
+                if let date = asset?.creationDate {
+                    Text(date.formatted(date: .omitted, time: .shortened))
+                    Text("·")
+                }
+                Text("\(count > 0 ? min(index + 1, count) : 0) / \(count)")
+                    .monospacedDigit()
+                    .accessibilityIdentifier("viewer-counter")
+            }
+            .font(.caption2)
+            .foregroundStyle(.white.opacity(0.75))
+            .lineLimit(1)
+        }
+    }
+}
+
 struct PhotoViewerView: View {
     let assets: ViewerAssets
     let initialIndex: Int
@@ -889,7 +918,7 @@ struct PhotoViewerView: View {
     @Environment(\.accessibilityReduceMotion) private var accessibilityReduceMotion
     @State private var currentIndex: Int
     @State private var controlsVisible = true
-    @State private var isShowingInfo = false
+    @State private var infoAsset: WorkspaceAsset?
     @State private var editorAsset: WorkspaceAsset?
     @State private var noteAsset: WorkspaceAsset?
     @State private var textAsset: WorkspaceAsset?
@@ -944,13 +973,7 @@ struct PhotoViewerView: View {
     var body: some View {
         GeometryReader { presentationProxy in
             ZStack {
-                // Keep UIKit's page controller on its original stable layer.
-                // Transforming a container around UIPageViewController during
-                // an interactive scroll can invalidate UIKit's transition
-                // bookkeeping. The page background is transparent: the zoom
-                // transition's dimming layer provides the black backdrop, so
-                // opening zooms the photo up out of its grid cell and closing
-                // zooms it back instead of moving a full-screen page.
+                // The media canvas and pager stay stable while chrome is toggled.
                 GeometryReader { proxy in
                         AssetPager(
                             assets: assets,
@@ -1000,13 +1023,9 @@ struct PhotoViewerView: View {
                                         isScrubbingFilmstrip = scrubbing
                                     }
                                 )
-                                .frame(height: 64)
-                                .background(
-                                    .ultraThinMaterial,
-                                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                )
-                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .frame(height: 56)
                                 .padding(.horizontal, 10)
+                                .padding(.bottom, 8)
                             }
                             bottomBar
                             if isAlbumDockVisible {
@@ -1035,10 +1054,8 @@ struct PhotoViewerView: View {
         .statusBarHidden(!controlsVisible || isDismissing)
         .persistentSystemOverlays(.automatic)
         .modifier(ViewerWorkspaceSheets(asset: currentAsset, store: store, editor: $editorAsset, note: $noteAsset, text: $textAsset))
-        .sheet(isPresented: $isShowingInfo) {
-            if assets.count > 0 {
-                PhotoInfoView(asset: assets.object(at: currentIndex))
-            }
+        .sheet(item: $infoAsset) { item in
+            PhotoInfoView(asset: item.asset)
         }
         .sheet(isPresented: $isShowingAlbumPicker) {
             if let currentAsset {
@@ -1295,77 +1312,98 @@ struct PhotoViewerView: View {
 
     private var topBar: some View {
         HStack(spacing: 8) {
-            Button {
-                requestDismiss(reason: "close-button")
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.headline.weight(.semibold))
-                    .frame(width: 36, height: 36)
-                    .glassEffect(.regular.interactive(), in: Circle())
-                    .frame(width: 46, height: 46)
-                    .contentShape(Rectangle())
+            viewerBarAction { requestDismiss(reason: "close-button") } label: {
+                Image(systemName: "chevron.backward")
             }
+            .accessibilityLabel("返回")
             .accessibilityIdentifier("viewer-close")
 
-            Spacer()
-
-            Text("\(currentIndex + 1) / \(assets.count)")
-                .font(.subheadline.weight(.medium))
-                .monospacedDigit()
-                // Lets a UI test assert *which* photo the viewer is showing,
-                // not merely that some viewer opened.
-                .accessibilityIdentifier("viewer-counter")
+            ViewerPhotoHeading(asset: currentAsset, index: currentIndex, count: assets.count)
+                .frame(maxWidth: .infinity)
 
             if currentAsset?.hasPlayableAudio == true {
                 MediaAudioButton()
             }
-
-            Button {
-                isShowingInfo = true
-            } label: {
-                Image(systemName: "info.circle")
-                    .font(.title3)
-                    .frame(width: 36, height: 36)
-                    .glassEffect(.regular.interactive(), in: Circle())
-                    .frame(width: 46, height: 46)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("信息")
-            .accessibilityIdentifier("viewer-info")
-
-            Button(action: toggleFullScreen) {
-                Image(systemName: isFullScreen
-                    ? "arrow.down.right.and.arrow.up.left"
-                    : "arrow.up.left.and.arrow.down.right")
-                    .font(.title3)
-                    .contentTransition(.symbolEffect(.replace))
-                    .frame(width: 36, height: 36)
-                    .glassEffect(.regular.interactive(), in: Circle())
-                    .frame(width: 46, height: 46)
-                    .contentShape(Rectangle())
-            }
-            .animation(.snappy(duration: 0.22), value: isFullScreen)
-            .accessibilityLabel(isFullScreen ? "退出全屏" : "全屏显示")
+            moreMenu
         }
+        .font(.title3.weight(.medium))
         .foregroundStyle(.white)
         .padding(.horizontal, 12)
         .padding(.top, 8)
     }
 
-    /// Photos-style floating actions: each icon owns an independent liquid
-    /// glass circle and a full 46pt hit target; the row itself stays clear.
+    private var moreMenu: some View {
+        Menu {
+            Button("添加到相册", systemImage: "folder.badge.plus") {
+                isShowingAlbumPicker = true
+            }
+            .accessibilityIdentifier("viewer-add-to-album")
+            Button(isAlbumDockVisible ? "收起相册快捷栏" : "显示相册快捷栏", systemImage: "rectangle.bottomthird.inset.filled") {
+                isAlbumDockVisible.toggle()
+            }
+            .accessibilityIdentifier("viewer-album-dock-toggle")
+            if let album, album.kind == .user {
+                Button("从「\(album.title)」移除", systemImage: "folder.badge.minus", role: .destructive) {
+                    removeCurrentFromAlbum()
+                }
+            }
+            Divider()
+            Button("播放幻灯片", systemImage: "play.rectangle") { isShowingSlideshowOptions = true }
+                .accessibilityIdentifier("viewer-slideshow")
+            Button(isFullScreen ? "退出全屏" : "填充屏幕", systemImage: "arrow.up.left.and.arrow.down.right", action: toggleFullScreen)
+            Divider()
+            Button("备注 / 日记", systemImage: "text.bubble") {
+                if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) }
+            }
+            if currentAsset?.mediaType == .image {
+                Button("识别文字", systemImage: "text.viewfinder") {
+                    if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) }
+                }
+            }
+            if let currentAsset {
+                Button(store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站", systemImage: "archivebox") {
+                    if store.isInRecycleBin(currentAsset) { store.removeFromRecycleBin(currentAsset) }
+                    else { store.addToRecycleBin(currentAsset) }
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .frame(width: 46, height: 46)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: Circle())
+        .disabled(currentAsset == nil)
+        .accessibilityLabel("更多照片操作")
+        .accessibilityIdentifier("viewer-more")
+    }
+
+    /// Keep the same five primary actions as Photos, with organizing tools in More.
     private var bottomBar: some View {
         HStack(spacing: 0) {
             viewerBarAction {
-                if let currentAsset { editorAsset = WorkspaceAsset(asset: currentAsset) }
-            } label: { Image(systemName: "slider.horizontal.3") }
-            .disabled(currentAsset == nil)
-            .accessibilityLabel("编辑与压缩")
-            .accessibilityIdentifier("viewer-edit")
-            Spacer()
-            viewerBarAction {
-                toggleCurrentFavorite()
+                guard !isPreparingShare, let currentAsset else { return }
+                isPreparingShare = true
+                store.requestShareItems(for: [currentAsset]) { items, temporaryURLs in
+                    isPreparingShare = false
+                    guard !items.isEmpty else {
+                        removeTemporaryURLs(temporaryURLs)
+                        return
+                    }
+                    ActivityPresenter.present(items: items) {
+                        removeTemporaryURLs(temporaryURLs)
+                    }
+                }
             } label: {
+                if isPreparingShare { ProgressView().tint(.white) }
+                else { Image(systemName: "square.and.arrow.up") }
+            }
+            .disabled(isPreparingShare || currentAsset == nil)
+            .accessibilityLabel(isPreparingShare ? "正在准备分享" : "分享")
+            .accessibilityIdentifier("viewer-share")
+
+            Spacer(minLength: 0)
+            viewerBarAction(action: toggleCurrentFavorite) {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
                     .symbolRenderingMode(.hierarchical)
                     .contentTransition(.symbolEffect(.replace))
@@ -1373,62 +1411,27 @@ struct PhotoViewerView: View {
             .animation(.snappy(duration: 0.22), value: isFavorite)
             .disabled(currentAsset == nil || favoriteSavingAssetIDs.contains(currentAsset?.localIdentifier ?? ""))
             .foregroundStyle(isFavorite ? .red : .white)
-            .accessibilityIdentifier("viewer-favorite")
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
+            .accessibilityIdentifier("viewer-favorite")
 
-            Spacer()
-
-            Menu {
-                Button {
-                    isShowingAlbumPicker = true
-                } label: {
-                    Label("完整相册选择器", systemImage: "folder.badge.plus")
-                }
-                if let album, album.kind == .user {
-                    Button(role: .destructive) {
-                        removeCurrentFromAlbum()
-                    } label: {
-                        Label("移出当前相册", systemImage: "folder.badge.minus")
-                    }
-                }
-            } label: {
-                Image(systemName: isAlbumDockVisible ? "rectangle.bottomthird.inset.filled" : "folder.badge.plus")
-                    .frame(width: 36, height: 36)
-                    .glassEffect(.regular.interactive(), in: Circle())
-                    .frame(width: 46, height: 46)
-                    .contentShape(Rectangle())
-            } primaryAction: {
-                isAlbumDockVisible.toggle()
-            }
-            .accessibilityLabel(isAlbumDockVisible ? "收起相册快捷栏" : "显示相册快捷栏")
-            .accessibilityIdentifier("viewer-album-dock-toggle")
-
-            Spacer()
-
+            Spacer(minLength: 0)
             viewerBarAction {
-                guard !isPreparingShare, assets.count > 0 else { return }
-                isPreparingShare = true
-                store.requestShareItems(for: [assets.object(at: currentIndex)]) { items, temporaryURLs in
-                    isPreparingShare = false
-                    guard !items.isEmpty else { return }
-                    ActivityPresenter.present(items: items) {
-                        removeTemporaryURLs(temporaryURLs)
-                    }
-                }
-            } label: {
-                // Swap the glyph for a spinner inside the same 46pt frame so
-                // preparing iCloud data never shifts the bar's layout.
-                if isPreparingShare {
-                    ProgressView()
-                        .tint(.white)
-                } else {
-                    Image(systemName: "square.and.arrow.up")
-                }
-            }
-            .disabled(isPreparingShare || assets.count == 0)
-            .accessibilityIdentifier("viewer-share")
-            Spacer()
-            Menu {
+                if let currentAsset { infoAsset = WorkspaceAsset(asset: currentAsset) }
+            } label: { Image(systemName: "info.circle") }
+            .disabled(currentAsset == nil)
+            .accessibilityLabel("信息")
+            .accessibilityIdentifier("viewer-info")
+
+            Spacer(minLength: 0)
+            viewerBarAction {
+                if let currentAsset { editorAsset = WorkspaceAsset(asset: currentAsset) }
+            } label: { Image(systemName: "slider.horizontal.3") }
+            .disabled(currentAsset == nil)
+            .accessibilityLabel(currentAsset?.mediaType == .video ? "视频编辑与压缩" : "编辑")
+            .accessibilityIdentifier("viewer-edit")
+
+            Spacer(minLength: 0)
+            viewerBarAction {
                 if let currentAsset {
                     Button(
                         store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站",
@@ -1438,27 +1441,13 @@ struct PhotoViewerView: View {
                         else { store.addToRecycleBin(currentAsset) }
                     }
                 }
-                Button("播放幻灯片", systemImage: "play.rectangle") { isShowingSlideshowOptions = true }
-                    .disabled(currentAsset == nil)
-                    .accessibilityIdentifier("viewer-slideshow")
-                Divider()
-                Button("备注 / 日记", systemImage: "text.bubble") { if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) } }
-                if currentAsset?.mediaType == .image {
-                    Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
-                }
-                Button("从照片库删除", systemImage: "trash", role: .destructive) {
-                    if let currentAsset {
-                        store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
-                    }
-                }
-            } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
-            .glassEffect(.regular.interactive(), in: Circle())
-            .accessibilityLabel("更多照片操作")
-            .accessibilityIdentifier("viewer-more")
+            } label: { Image(systemName: "trash") }
+            .disabled(currentAsset == nil)
+            .accessibilityLabel("从照片库删除")
+            .accessibilityIdentifier("viewer-delete")
         }
         .font(.title3.weight(.medium))
         .foregroundStyle(.white)
-        .buttonStyle(.plain)
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
     }
@@ -2106,15 +2095,14 @@ private struct IndexedAssetPager: View {
             loadWindow(around: clampedIndex)
         }
         .onChange(of: isIndexingUnsorted) { _, indexing in
-            // A page load can be dropped by the store's generation guard
-            // while an index sync runs. Once the sync finishes, re-request
-            // whatever window is still missing instead of leaving the
-            // viewer on a placeholder forever.
+            // Retry the window after a sync in case an in-flight request was
+            // dropped. Keep the session's resolved photos: adding the current
+            // photo to an album removes it from Unsorted, but must not replace
+            // what the user is still viewing with the next database row.
             guard !indexing else { return }
             loadGeneration &+= 1
             loadingOffsets.removeAll()
             loadedOffsets.removeAll()
-            assetsByIndex.removeAll()
             loadWindow(around: currentIndex)
         }
         .overlay {
@@ -2378,7 +2366,8 @@ private struct IndexedAssetPager: View {
             loadedOffsets.insert(offset)
             var merged = assetsByIndex
             for (localIndex, asset) in pageAssets.enumerated() {
-                merged[offset + localIndex] = asset
+                let index = offset + localIndex
+                if merged[index] == nil { merged[index] = asset }
             }
             assetsByIndex = merged
             trimAssetCache(around: currentIndex)
@@ -2773,7 +2762,7 @@ struct IndexedPhotoViewerView: View {
     @State private var currentIndex: Int
     @State private var assetsByIndex: [Int: PHAsset] = [:]
     @State private var controlsVisible = true
-    @State private var isShowingInfo = false
+    @State private var infoAsset: WorkspaceAsset?
     @State private var editorAsset: WorkspaceAsset?
     @State private var noteAsset: WorkspaceAsset?
     @State private var textAsset: WorkspaceAsset?
@@ -2884,13 +2873,9 @@ struct IndexedPhotoViewerView: View {
                                         isScrubbingFilmstrip = scrubbing
                                     }
                                 )
-                                .frame(height: 64)
-                                .background(
-                                    .ultraThinMaterial,
-                                    in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                )
-                                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                .frame(height: 56)
                                 .padding(.horizontal, 10)
+                                .padding(.bottom, 8)
                             }
                             bottomBar
                             if isAlbumDockVisible {
@@ -2919,10 +2904,8 @@ struct IndexedPhotoViewerView: View {
         .statusBarHidden(!controlsVisible || isDismissing)
         .persistentSystemOverlays(.automatic)
         .modifier(ViewerWorkspaceSheets(asset: currentAsset, store: store, editor: $editorAsset, note: $noteAsset, text: $textAsset))
-        .sheet(isPresented: $isShowingInfo) {
-            if let currentAsset {
-                PhotoInfoView(asset: currentAsset)
-            }
+        .sheet(item: $infoAsset) { item in
+            PhotoInfoView(asset: item.asset)
         }
         .sheet(isPresented: $isShowingAlbumPicker) {
             if let currentAsset {
@@ -3172,74 +3155,93 @@ struct IndexedPhotoViewerView: View {
 
     private var topBar: some View {
         HStack(spacing: 8) {
-            Button { requestDismiss(reason: "close-button") } label: {
-                Image(systemName: "xmark")
-                    .font(.headline.weight(.semibold))
-                    .frame(width: 36, height: 36)
-                    .glassEffect(.regular.interactive(), in: Circle())
-                    .frame(width: 46, height: 46)
-                    .contentShape(Rectangle())
+            viewerBarAction { requestDismiss(reason: "close-button") } label: {
+                Image(systemName: "chevron.backward")
             }
+            .accessibilityLabel("返回")
             .accessibilityIdentifier("viewer-close")
 
-            Spacer()
-
-            Text("\(min(currentIndex + 1, max(1, totalCount))) / \(totalCount)")
-                .font(.subheadline.weight(.medium))
-                .monospacedDigit()
-                // Lets a UI test assert *which* photo the viewer is showing,
-                // not merely that some viewer opened.
-                .accessibilityIdentifier("viewer-counter")
+            ViewerPhotoHeading(asset: currentAsset, index: currentIndex, count: totalCount)
+                .frame(maxWidth: .infinity)
 
             if currentAsset?.hasPlayableAudio == true {
                 MediaAudioButton()
             }
-
-            Button { isShowingInfo = true } label: {
-                Image(systemName: "info.circle")
-                    .font(.title3)
-                    .frame(width: 36, height: 36)
-                    .glassEffect(.regular.interactive(), in: Circle())
-                    .frame(width: 46, height: 46)
-                    .contentShape(Rectangle())
-            }
-            .disabled(currentAsset == nil)
-            .accessibilityLabel("信息")
-            .accessibilityIdentifier("viewer-info")
-
-            Button(action: toggleFullScreen) {
-                Image(systemName: isFullScreen
-                    ? "arrow.down.right.and.arrow.up.left"
-                    : "arrow.up.left.and.arrow.down.right")
-                    .font(.title3)
-                    .contentTransition(.symbolEffect(.replace))
-                    .frame(width: 36, height: 36)
-                    .glassEffect(.regular.interactive(), in: Circle())
-                    .frame(width: 46, height: 46)
-                    .contentShape(Rectangle())
-            }
-            .animation(.snappy(duration: 0.22), value: isFullScreen)
-            .accessibilityLabel(isFullScreen ? "退出全屏" : "全屏显示")
+            moreMenu
         }
+        .font(.title3.weight(.medium))
         .foregroundStyle(.white)
         .padding(.horizontal, 12)
         .padding(.top, 8)
     }
 
-    /// Photos-style floating actions: each icon owns an independent liquid
-    /// glass circle and a full 46pt hit target; the row itself stays clear.
+    private var moreMenu: some View {
+        Menu {
+            Button("添加到相册", systemImage: "folder.badge.plus") {
+                isShowingAlbumPicker = true
+            }
+            .accessibilityIdentifier("viewer-add-to-album")
+            Button(isAlbumDockVisible ? "收起相册快捷栏" : "显示相册快捷栏", systemImage: "rectangle.bottomthird.inset.filled") {
+                isAlbumDockVisible.toggle()
+            }
+            .accessibilityIdentifier("viewer-album-dock-toggle")
+            Divider()
+            Button("播放幻灯片", systemImage: "play.rectangle") { isShowingSlideshowOptions = true }
+                .accessibilityIdentifier("viewer-slideshow")
+            Button(isFullScreen ? "退出全屏" : "填充屏幕", systemImage: "arrow.up.left.and.arrow.down.right", action: toggleFullScreen)
+            Divider()
+            Button("备注 / 日记", systemImage: "text.bubble") {
+                if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) }
+            }
+            if currentAsset?.mediaType == .image {
+                Button("识别文字", systemImage: "text.viewfinder") {
+                    if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) }
+                }
+            }
+            if let currentAsset {
+                Button(store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站", systemImage: "archivebox") {
+                    if store.isInRecycleBin(currentAsset) { store.removeFromRecycleBin(currentAsset) }
+                    else { store.addToRecycleBin(currentAsset) }
+                }
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .frame(width: 46, height: 46)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: Circle())
+        .disabled(currentAsset == nil)
+        .accessibilityLabel("更多照片操作")
+        .accessibilityIdentifier("viewer-more")
+    }
+
+    /// Keep the same five primary actions as Photos, with organizing tools in More.
     private var bottomBar: some View {
         HStack(spacing: 0) {
             viewerBarAction {
-                if let currentAsset { editorAsset = WorkspaceAsset(asset: currentAsset) }
-            } label: { Image(systemName: "slider.horizontal.3") }
-            .disabled(currentAsset == nil)
-            .accessibilityLabel("编辑与压缩")
-            .accessibilityIdentifier("viewer-edit")
-            Spacer()
-            viewerBarAction {
-                toggleCurrentFavorite()
+                guard !isPreparingShare, let currentAsset else { return }
+                isPreparingShare = true
+                store.requestShareItems(for: [currentAsset]) { items, temporaryURLs in
+                    isPreparingShare = false
+                    guard !items.isEmpty else {
+                        removeTemporaryURLs(temporaryURLs)
+                        return
+                    }
+                    ActivityPresenter.present(items: items) {
+                        removeTemporaryURLs(temporaryURLs)
+                    }
+                }
             } label: {
+                if isPreparingShare { ProgressView().tint(.white) }
+                else { Image(systemName: "square.and.arrow.up") }
+            }
+            .disabled(isPreparingShare || currentAsset == nil)
+            .accessibilityLabel(isPreparingShare ? "正在准备分享" : "分享")
+            .accessibilityIdentifier("viewer-share")
+
+            Spacer(minLength: 0)
+            viewerBarAction(action: toggleCurrentFavorite) {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
                     .symbolRenderingMode(.hierarchical)
                     .contentTransition(.symbolEffect(.replace))
@@ -3247,53 +3249,27 @@ struct IndexedPhotoViewerView: View {
             .animation(.snappy(duration: 0.22), value: isFavorite)
             .disabled(currentAsset == nil || favoriteSavingAssetIDs.contains(currentAsset?.localIdentifier ?? ""))
             .foregroundStyle(isFavorite ? .red : .white)
-            .accessibilityIdentifier("viewer-favorite")
             .accessibilityLabel(isFavorite ? "取消收藏" : "收藏")
+            .accessibilityIdentifier("viewer-favorite")
 
-            Spacer()
-
-            Menu {
-                Button {
-                    isShowingAlbumPicker = true
-                } label: {
-                    Label("完整相册选择器", systemImage: "folder.badge.plus")
-                }
-            } label: {
-                Image(systemName: isAlbumDockVisible ? "rectangle.bottomthird.inset.filled" : "folder.badge.plus")
-                    .frame(width: 36, height: 36)
-                    .glassEffect(.regular.interactive(), in: Circle())
-                    .frame(width: 46, height: 46)
-                    .contentShape(Rectangle())
-            } primaryAction: {
-                isAlbumDockVisible.toggle()
-            }
-            .accessibilityLabel(isAlbumDockVisible ? "收起相册快捷栏" : "显示相册快捷栏")
-            .accessibilityIdentifier("viewer-album-dock-toggle")
-
-            Spacer()
-
+            Spacer(minLength: 0)
             viewerBarAction {
-                guard !isPreparingShare, let currentAsset else { return }
-                isPreparingShare = true
-                store.requestShareItems(for: [currentAsset]) { items, temporaryURLs in
-                    isPreparingShare = false
-                    guard !items.isEmpty else { return }
-                    ActivityPresenter.present(items: items) {
-                        removeTemporaryURLs(temporaryURLs)
-                    }
-                }
-            } label: {
-                if isPreparingShare {
-                    ProgressView()
-                        .tint(.white)
-                } else {
-                    Image(systemName: "square.and.arrow.up")
-                }
-            }
-            .disabled(isPreparingShare || currentAsset == nil)
-            .accessibilityIdentifier("viewer-share")
-            Spacer()
-            Menu {
+                if let currentAsset { infoAsset = WorkspaceAsset(asset: currentAsset) }
+            } label: { Image(systemName: "info.circle") }
+            .disabled(currentAsset == nil)
+            .accessibilityLabel("信息")
+            .accessibilityIdentifier("viewer-info")
+
+            Spacer(minLength: 0)
+            viewerBarAction {
+                if let currentAsset { editorAsset = WorkspaceAsset(asset: currentAsset) }
+            } label: { Image(systemName: "slider.horizontal.3") }
+            .disabled(currentAsset == nil)
+            .accessibilityLabel(currentAsset?.mediaType == .video ? "视频编辑与压缩" : "编辑")
+            .accessibilityIdentifier("viewer-edit")
+
+            Spacer(minLength: 0)
+            viewerBarAction {
                 if let currentAsset {
                     Button(
                         store.isInRecycleBin(currentAsset) ? "移出回收站" : "加入回收站",
@@ -3303,27 +3279,13 @@ struct IndexedPhotoViewerView: View {
                         else { store.addToRecycleBin(currentAsset) }
                     }
                 }
-                Button("播放幻灯片", systemImage: "play.rectangle") { isShowingSlideshowOptions = true }
-                    .disabled(currentAsset == nil)
-                    .accessibilityIdentifier("viewer-slideshow")
-                Divider()
-                Button("备注 / 日记", systemImage: "text.bubble") { if let currentAsset { noteAsset = WorkspaceAsset(asset: currentAsset) } }
-                if currentAsset?.mediaType == .image {
-                    Button("识别文字", systemImage: "text.viewfinder") { if let currentAsset { textAsset = WorkspaceAsset(asset: currentAsset) } }
-                }
-                Button("从照片库删除", systemImage: "trash", role: .destructive) {
-                    if let currentAsset {
-                        store.deleteAssets([currentAsset], onDeleted: { requestDismiss(reason: "delete-from-library") }) { result in handle(result) }
-                    }
-                }
-            } label: { Image(systemName: "ellipsis").frame(width: 46, height: 46).contentShape(Rectangle()) }
-            .glassEffect(.regular.interactive(), in: Circle())
-            .accessibilityLabel("更多照片操作")
-            .accessibilityIdentifier("viewer-more")
+            } label: { Image(systemName: "trash") }
+            .disabled(currentAsset == nil)
+            .accessibilityLabel("从照片库删除")
+            .accessibilityIdentifier("viewer-delete")
         }
         .font(.title3.weight(.medium))
         .foregroundStyle(.white)
-        .buttonStyle(.plain)
         .padding(.horizontal, 12)
         .padding(.bottom, 8)
     }
@@ -4432,49 +4394,114 @@ struct PhotoInfoView: View {
     let asset: PHAsset
 
     @Environment(\.dismiss) private var dismiss
+    @ObservedObject private var workspace = PhotoWorkspaceStore.shared
+    @State private var filename: String?
+    @State private var fileFormat: String?
+    @State private var noteAsset: WorkspaceAsset?
+
+    private var mediaDescription: String {
+        if asset.mediaType == .video { return "视频" }
+        if asset.mediaSubtypes.contains(.photoLive) { return "实况照片" }
+        if asset.mediaSubtypes.contains(.photoScreenshot) { return "截屏" }
+        if asset.mediaSubtypes.contains(.photoPanorama) { return "全景照片" }
+        return "照片"
+    }
 
     var body: some View {
         NavigationStack {
             List {
-                LabeledContent("尺寸") {
-                    Text("\(asset.pixelWidth) × \(asset.pixelHeight)")
+                Section {
+                    Button {
+                        noteAsset = WorkspaceAsset(asset: asset)
+                    } label: {
+                        let note = workspace.notes[asset.localIdentifier] ?? ""
+                        Label(note.isEmpty ? "添加说明" : note, systemImage: "text.bubble")
+                            .foregroundStyle(note.isEmpty ? .secondary : .primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .accessibilityIdentifier("photo-info-caption")
                 }
 
-                if let creationDate = asset.creationDate {
-                    LabeledContent("拍摄时间") {
-                        Text(creationDate.formatted(date: .long, time: .shortened))
+                Section {
+                    if let creationDate = asset.creationDate {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(creationDate.formatted(date: .complete, time: .omitted))
+                                .font(.headline)
+                            Text(creationDate.formatted(date: .omitted, time: .standard))
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    if let filename {
+                        LabeledContent("文件名", value: filename)
+                            .textSelection(.enabled)
+                            .accessibilityValue(filename)
+                            .accessibilityIdentifier("photo-info-filename")
+                    }
+                    LabeledContent("类型", value: mediaDescription)
+                    if let fileFormat { LabeledContent("格式", value: fileFormat) }
+                    LabeledContent("尺寸") {
+                        Text("\(asset.pixelWidth) × \(asset.pixelHeight)")
+                            .monospacedDigit()
+                    }
+                    if asset.mediaType == .image {
+                        LabeledContent("像素") {
+                            let megapixels = Double(asset.pixelWidth) * Double(asset.pixelHeight) / 1_000_000
+                            Text("\(megapixels.formatted(.number.precision(.fractionLength(1)))) MP")
+                        }
+                    }
+                    if asset.mediaType == .video {
+                        LabeledContent("时长") {
+                            Text(Duration.seconds(asset.duration).formatted(.time(pattern: .minuteSecond)))
+                                .monospacedDigit()
+                        }
                     }
                 }
 
                 if let location = asset.location {
-                    LabeledContent("位置") {
-                        Text(
-                            String(
-                                format: "%.4f, %.4f",
-                                location.coordinate.latitude,
-                                location.coordinate.longitude
-                            )
-                        )
+                    Section("拍摄位置") {
+                        Map(initialPosition: .region(MKCoordinateRegion(
+                            center: location.coordinate,
+                            span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+                        )), interactionModes: []) {
+                            Marker("拍摄位置", coordinate: location.coordinate)
+                        }
+                        .frame(height: 180)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .accessibilityLabel("照片拍摄位置地图")
+                        Button("在地图中打开", systemImage: "map") {
+                            let item = MKMapItem(location: location, address: nil)
+                            item.name = "拍摄位置"
+                            item.openInMaps()
+                        }
                     }
-                }
-
-                LabeledContent("标识符") {
-                    Text(asset.localIdentifier)
-                        .font(.caption)
-                        .textSelection(.enabled)
-                        .multilineTextAlignment(.trailing)
                 }
             }
             .navigationTitle("照片信息")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") {
-                        dismiss()
-                    }
+                    Button("完成") { dismiss() }
                 }
             }
         }
         .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .sheet(item: $noteAsset) { item in PhotoNoteSheet(asset: item.asset) }
+        .task(id: asset.localIdentifier) {
+            // Only inspect resource metadata, off the main thread. Opening Info
+            // must never download or decode a large iCloud original.
+            let result = await Task.detached(priority: .utility) { [asset] in
+                let resources = PHAssetResource.assetResources(for: asset)
+                let resource = resources.first { $0.type == .photo || $0.type == .video }
+                    ?? resources.first
+                let format = resource.flatMap { UTType($0.uniformTypeIdentifier)?.preferredFilenameExtension?.uppercased() }
+                return (resource?.originalFilename, format)
+            }.value
+            guard !Task.isCancelled else { return }
+            filename = result.0
+            fileFormat = result.1
+        }
     }
 }

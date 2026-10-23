@@ -285,12 +285,13 @@ final class PhotoViewerDismissUITests: XCTestCase {
         app.launch()
         grantPhotoAccessIfNeeded()
 
-        let grid = app.collectionViews["photo-grid"]
-        if grid.waitForExistence(timeout: 15) { return app }
+        let firstPhoto = app.collectionViews["photo-grid"].cells["photo-cell-0"]
+        if firstPhoto.waitForExistence(timeout: 15), firstPhoto.isHittable { return app }
 
         let libraryRow = app.staticTexts["图库"].firstMatch
-        if libraryRow.waitForExistence(timeout: 5) { libraryRow.tap() }
-        XCTAssertTrue(grid.waitForExistence(timeout: 20), "图库网格应加载出照片")
+        if libraryRow.waitForExistence(timeout: 5), libraryRow.isHittable { libraryRow.tap() }
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 20), "图库网格应加载出照片")
+        XCTAssertTrue(firstPhoto.isHittable, "图库不能仍被侧栏遮挡")
         return app
     }
 
@@ -388,6 +389,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
     private func showAlbumDock(in app: XCUIApplication) {
         let create = app.buttons["album-dock-create"]
         if !create.waitForExistence(timeout: 3) {
+            app.buttons["viewer-more"].tap()
             app.buttons["viewer-album-dock-toggle"].tap()
         }
         XCTAssertTrue(create.waitForExistence(timeout: 5))
@@ -472,6 +474,7 @@ final class PhotoViewerDismissUITests: XCTestCase {
         expectMembership("已加入", album: dockAlbum(named: title, in: app))
         app.buttons["album-dock-close"].tap()
         XCTAssertTrue(app.collectionViews["viewer-filmstrip"].waitForExistence(timeout: 5))
+        app.buttons["viewer-more"].tap()
         app.buttons["viewer-album-dock-toggle"].tap()
         XCTAssertTrue(app.buttons["album-dock-create"].waitForExistence(timeout: 5))
     }
@@ -527,10 +530,22 @@ final class PhotoViewerDismissUITests: XCTestCase {
         let destination = dockAlbum(named: title, in: app)
         expectMembership("未加入", album: destination)
         let initialCounter = app.staticTexts["viewer-counter"].label
+        func currentFilename() -> String {
+            app.buttons["viewer-info"].tap()
+            let filename = app.descendants(matching: .any)["photo-info-filename"].firstMatch
+            XCTAssertTrue(filename.waitForExistence(timeout: 10))
+            let value = filename.value as? String
+            XCTAssertNotNil(value, "文件名应通过原生信息行的辅助功能值公开")
+            app.buttons["完成"].firstMatch.tap()
+            return value ?? ""
+        }
+        let initialFilename = currentFilename()
         destination.tap()
         expectMembership("已加入", album: destination)
         XCTAssertEqual(app.staticTexts["viewer-counter"].label, initialCounter,
                        "未整理加入相册后应保留当前照片，方便继续整理")
+        XCTAssertEqual(currentFilename(), initialFilename,
+                       "索引更新后不能用相同位置的下一张照片替换当前照片")
         let screenshot = XCTAttachment(screenshot: app.screenshot())
         screenshot.name = "未整理详情-一点加入"
         screenshot.lifetime = .keepAlways
@@ -1179,12 +1194,13 @@ final class SlideshowOptionsUITests: XCTestCase {
             app.launch()
         }
 
-        let grid = app.collectionViews["photo-grid"]
-        if grid.waitForExistence(timeout: 15) { return app }
+        let firstPhoto = app.collectionViews["photo-grid"].cells["photo-cell-0"]
+        if firstPhoto.waitForExistence(timeout: 15), firstPhoto.isHittable { return app }
 
         let libraryRow = app.staticTexts["图库"].firstMatch
-        if libraryRow.waitForExistence(timeout: 5) { libraryRow.tap() }
-        XCTAssertTrue(grid.waitForExistence(timeout: 20), "图库网格应加载出照片")
+        if libraryRow.waitForExistence(timeout: 5), libraryRow.isHittable { libraryRow.tap() }
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 20), "图库网格应加载出照片")
+        XCTAssertTrue(firstPhoto.isHittable, "图库不能仍被侧栏遮挡")
         return app
     }
 

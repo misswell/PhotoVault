@@ -23,11 +23,15 @@ final class ReferenceWorkflowUITests: XCTestCase {
 
     private func openViewer(_ app: XCUIApplication, photosOnly: Bool = true) {
         let grid = app.collectionViews["photo-grid"]
-        if !grid.waitForExistence(timeout: 15) {
+        let firstPhoto = grid.cells.matching(identifier: "photo-cell-0").firstMatch
+        // A split-view detail can exist behind the compact sidebar. Require a
+        // visible photo before treating the library as the active page.
+        if !firstPhoto.waitForExistence(timeout: 10) || !firstPhoto.isHittable {
             let library = app.staticTexts["图库"].firstMatch
-            if library.exists { library.tap() }
+            if library.waitForExistence(timeout: 5) && library.isHittable { library.tap() }
         }
-        XCTAssertTrue(grid.waitForExistence(timeout: 15))
+        XCTAssertTrue(firstPhoto.waitForExistence(timeout: 15))
+        XCTAssertTrue(firstPhoto.isHittable)
         if photosOnly {
             let filter = app.buttons["筛选与排序"]
             if filter.exists { filter.tap(); app.buttons["照片"].firstMatch.tap() }
@@ -72,6 +76,9 @@ final class ReferenceWorkflowUITests: XCTestCase {
         openViewer(app)
         app.buttons["viewer-info"].tap()
         XCTAssertTrue(app.navigationBars["照片信息"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.descendants(matching: .any)["photo-info-filename"].firstMatch.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["标识符"].exists)
+        capture("native-photo-info", app: app)
         let done = app.buttons["完成"].firstMatch
         XCTAssertTrue(done.isHittable); done.tap()
         app.buttons["viewer-close"].tap()
@@ -192,8 +199,7 @@ final class ReferenceWorkflowUITests: XCTestCase {
         let app = launch(["-PhotoVault.library.browseMode", "expanded"])
         openViewer(app)
         func prompt() -> XCUIElement {
-            app.buttons["更多照片操作"].tap()
-            app.buttons["从照片库删除"].firstMatch.tap()
+            app.buttons["viewer-delete"].tap()
             let local = app.sheets.firstMatch
             if local.waitForExistence(timeout: 5) { return local }
             let system = XCUIApplication(bundleIdentifier: "com.apple.springboard").alerts.firstMatch
@@ -257,7 +263,7 @@ final class ReferenceWorkflowUITests: XCTestCase {
     func testViewerHasCompactActionsAndRestoresAfterBackground() {
         let app = launch(["-PhotoVault.library.browseMode", "expanded", "-PhotoVault.viewer.albumDock.visible.v2", "NO", "-viewer-cancel-reentry-probe"])
         openViewer(app)
-        let identifiers = ["viewer-edit", "viewer-favorite", "viewer-album-dock-toggle", "viewer-share", "viewer-more"]
+        let identifiers = ["viewer-share", "viewer-favorite", "viewer-info", "viewer-edit", "viewer-delete"]
         var previousRight: CGFloat = 0
         for id in identifiers {
             let button = app.buttons[id]
@@ -266,6 +272,9 @@ final class ReferenceWorkflowUITests: XCTestCase {
             XCTAssertGreaterThanOrEqual(button.frame.minX, previousRight - 1)
             previousRight = button.frame.maxX
         }
+        XCTAssertTrue(app.staticTexts["viewer-date"].exists)
+        XCTAssertLessThan(app.buttons["viewer-more"].frame.maxY, app.buttons["viewer-share"].frame.minY)
+        XCTAssertEqual(app.buttons["viewer-share"].frame.midY, app.buttons["viewer-delete"].frame.midY, accuracy: 1)
         XCTAssertFalse(app.buttons["album-dock-create"].exists, "首次进入应收起相册快捷栏")
         capture("compact-viewer", app: app)
         let window = app.windows.firstMatch
@@ -290,7 +299,8 @@ final class ReferenceWorkflowUITests: XCTestCase {
         waitForExpectations(timeout: 10)
         app.buttons["viewer-more"].tap()
         XCTAssertTrue(app.buttons["viewer-slideshow"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["从照片库删除"].exists)
+        XCTAssertTrue(app.buttons["viewer-add-to-album"].exists)
+        XCTAssertTrue(app.buttons["viewer-album-dock-toggle"].exists)
     }
 
     func testGridResumesDegradedFramesWithoutBlanking() {
