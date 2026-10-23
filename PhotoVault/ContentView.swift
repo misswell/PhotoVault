@@ -739,16 +739,16 @@ private struct PhotoVaultHomeScreen: View {
 
                     PhotoVaultHomeActionCard(
                         title: "文件夹相册",
-                        detail: "SMB、本机或 U 盘",
+                        detail: "SMB、本机、U盘",
                         systemImage: "folder"
                     ) {
                         onSelectSection(.lan)
                     }
 
                     PhotoVaultHomeActionCard(
-                        title: "整理",
-                        detail: "随机整理照片",
-                        systemImage: "rectangle.stack.badge.play"
+                        title: "清理",
+                        detail: "空间扫描与建议",
+                        systemImage: "chart.pie.fill"
                     ) {
                         onSelectOrganizer()
                     }
@@ -799,7 +799,7 @@ private struct PhotoVaultHomeActionCard: View {
                     Text(detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(2)
                 }
 
                 Spacer(minLength: 0)
@@ -1647,7 +1647,7 @@ struct PhotoVaultSettingsView: View {
         case PhotoVaultStartupDestination.lanRawValue:
             return "下次启动时打开文件夹相册。"
         case PhotoVaultStartupDestination.organizerRawValue:
-            return "下次启动时打开整理。"
+            return "下次启动时打开清理。"
         default:
             guard let albumID = savedStartupAlbumID else {
                 return "下次启动时打开首页。"
@@ -1677,10 +1677,12 @@ struct PhotoVaultSettingsView: View {
                     Button("清理图片缓存") {
                         PhotoImageManager.shared.dropTransientCaches()
                         LANFolderImageCache.shared.removeAll()
+                        SMBImageMemoryCache.removeAll()
                         Task.detached(priority: .utility) { LANFolderThumbnailDiskCache.purgeAll() }
+                        Task.detached(priority: .utility) { SMBOriginalCache.purgeAll() }
                         cacheCleared = true
                     }
-                    if cacheCleared { Text("图片内存缓存已释放，文件夹缩略图缓存将在后台清理。").font(.caption).foregroundStyle(.secondary) }
+                    if cacheCleared { Text("图片内存缓存已释放，文件夹缩略图和 SMB 原图缓存将在后台清理。").font(.caption).foregroundStyle(.secondary) }
                 }
 
                 Section("智能搜索") {
@@ -1698,7 +1700,7 @@ struct PhotoVaultSettingsView: View {
                             .tag(PhotoVaultStartupDestination.unsortedRawValue)
                         Text("文件夹相册")
                             .tag(PhotoVaultStartupDestination.lanRawValue)
-                        Text("整理")
+                        Text("清理")
                             .tag(PhotoVaultStartupDestination.organizerRawValue)
 
                         Section("相册") {
@@ -1798,7 +1800,7 @@ struct PhotoVaultSettingsView: View {
                         guard store.recycleBinCount > 0 else {
                             alert = PhotoVaultAlert(
                                 title: "回收站为空",
-                                message: "请先在照片详情中点击垃圾桶按钮，将照片加入回收站。"
+                                message: "请先在照片详情的更多菜单中把照片加入回收站。"
                             )
                             return
                         }

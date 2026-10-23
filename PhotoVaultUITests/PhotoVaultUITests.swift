@@ -7,6 +7,12 @@ final class SearchModelDownloadUITests: XCTestCase {
             let button = app.buttons[label].firstMatch
             if button.exists && button.isHittable { button.tap(); return }
         }
+        // 紧凑宽度下侧栏不是 split view 的并列列，而是详情页的返回目标；
+        // 返回按钮沿用侧栏标题“照片”，没有 Show Sidebar 控件。
+        for label in ["照片", "Back"] {
+            let button = app.buttons[label].firstMatch
+            if button.exists && button.isHittable { button.tap(); return }
+        }
     }
 
     func testOptionalModelAndSettingsEntry() throws {
@@ -57,6 +63,176 @@ final class SearchModelDownloadUITests: XCTestCase {
         cancel.tap()
         XCTAssertTrue(download.waitForExistence(timeout: 10), "取消后应允许重新下载")
         XCTAssertFalse(cancel.exists)
+    }
+}
+
+/// End-to-end SMB regression: credentials → share list → directory picker →
+/// album grid → viewer paging.
+///
+/// Needs a reachable SMB2 server, so it only runs when explicitly enabled.
+/// Pass the settings through the test-runner environment (xcodebuild strips
+/// the `TEST_RUNNER_` prefix):
+///
+///     TEST_RUNNER_PV_SMB_UI_TEST=1 \
+///     TEST_RUNNER_PV_SMB_PASSWORD=secret \
+///     xcodebuild test ... -only-testing:PhotoVaultUITests/SMBFolderAlbumUITests
+///
+/// `PV_SMB_HOST` (default 127.0.0.1), `PV_SMB_PORT` (4450), `PV_SMB_USER`
+/// (tester) and `PV_SMB_SHARE` (Photos) are optional.
+@MainActor
+final class SMBFolderAlbumUITests: XCTestCase {
+    private var app: XCUIApplication!
+
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+        let environment = ProcessInfo.processInfo.environment
+        try XCTSkipUnless(
+            environment["PV_SMB_UI_TEST"] == "1",
+            "需要本地 SMB 测试服务器；设置 TEST_RUNNER_PV_SMB_UI_TEST=1 后运行。"
+        )
+        try XCTSkipUnless(
+            (environment["PV_SMB_PASSWORD"] ?? "").isEmpty == false,
+            "缺少 TEST_RUNNER_PV_SMB_PASSWORD。"
+        )
+    }
+
+    func testAddServerBrowseAndOpenViewer() throws {
+        let environment = ProcessInfo.processInfo.environment
+        let host = environment["PV_SMB_HOST"] ?? "127.0.0.1"
+        let port = environment["PV_SMB_PORT"] ?? "4450"
+        let user = environment["PV_SMB_USER"] ?? "tester"
+        let password = environment["PV_SMB_PASSWORD"] ?? ""
+
+        app = XCUIApplication()
+        app.launchArguments += [
+            "--pv-reset-smb",
+            "-PhotoVault.startup.destination", "lan",
+            "-PhotoVault.slideshow.interval", "3",
+            "-PhotoVault.slideshow.shuffles", "NO",
+            "-PhotoVault.slideshow.fillsScreen", "NO",
+        ]
+        app.launch()
+        pvGrantPhotosPermissionIfNeeded()
+
+        let addEntry = app.buttons["smb-add-album-home"]
+        XCTAssertTrue(addEntry.waitForExistence(timeout: 25), "文件夹相册页应提供 SMB 添加入口")
+        addEntry.tap()
+
+        replaceText(in: app.textFields["smb-host"], with: host)
+        replaceText(in: app.textFields["smb-port"], with: port)
+        replaceText(in: app.textFields["smb-username"], with: user)
+        replaceText(in: app.secureTextFields["smb-password"], with: password)
+
+        let connect = app.buttons["smb-connect"]
+        reveal(connect)
+        connect.tap()
+
+        // Connecting to a LAN address may raise the local-network prompt.
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        if springboard.alerts.firstMatch.waitForExistence(timeout: 3) {
+            print("SMB TEST springboard alert:", springboard.alerts.firstMatch.label)
+            for label in ["允许", "Allow", "好", "OK"] {
+                let button = springboard.buttons[label].firstMatch
+                if button.exists && button.isHittable { button.tap(); break }
+            }
+        }
+
+        // The login sheet closes before browsing starts; the share list is
+        // pushed on the folder-album home's own navigation stack.
+        let share = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "smb-share-")
+        ).firstMatch
+        XCTAssertTrue(share.waitForExistence(timeout: 60), "登录后应列出可用的共享")
+
+        // Submitting a password form makes iOS offer to save it. That sheet
+        // (rendered by the AutoFill UI process) sits above the app window
+        // and makes every app element unhittable until it is answered.
+        let dismissSave = app.buttons.matching(
+            NSPredicate(format: "label IN %@", ["Not Now", "以后再说", "暂不", "不保存"])
+        ).firstMatch
+        if dismissSave.waitForExistence(timeout: 5) { dismissSave.tap() }
+
+        XCTAssertTrue(app.navigationBars["选择共享"].waitForExistence(timeout: 10), "应进入共享列表")
+        let hittable = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "isHittable == true"),
+            object: share
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [hittable], timeout: 15),
+            .completed,
+            "共享行应可点击"
+        )
+        share.tap()
+
+        let addFolder = app.buttons["smb-add-folder"]
+        XCTAssertTrue(addFolder.waitForExistence(timeout: 30), "目录浏览器应提供添加按钮")
+        addFolder.tap()
+
+        // Adding returns to the home list, where the new album must exist.
+        let albumRow = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "smb-album-")
+        ).firstMatch
+        XCTAssertTrue(albumRow.waitForExistence(timeout: 20), "添加后首页应出现 SMB 相册")
+        albumRow.tap()
+
+        let grid = app.scrollViews["smb-grid"]
+        XCTAssertTrue(grid.waitForExistence(timeout: 90), "打开 SMB 相册应进入网格")
+
+        let firstCell = app.buttons["smb-cell-0"]
+        XCTAssertTrue(firstCell.waitForExistence(timeout: 60), "网格应加载出照片")
+        firstCell.tap()
+
+        XCTAssertTrue(app.buttons["关闭"].waitForExistence(timeout: 15), "点按缩略图应打开详情页")
+        XCTAssertTrue(app.staticTexts["1 / 3"].waitForExistence(timeout: 30), "详情页应显示照片计数")
+
+        app.swipeLeft()
+        XCTAssertTrue(app.staticTexts["2 / 3"].waitForExistence(timeout: 20), "左滑应翻到下一张")
+
+        // The share sheet cannot read the virtual SMB scheme: the original
+        // must be downloaded to a real file before it is presented.
+        let shareButton = app.buttons["分享"]
+        XCTAssertTrue(shareButton.waitForExistence(timeout: 10), "详情页应提供分享")
+        shareButton.tap()
+        let activity = app.otherElements["ActivityListView"]
+        XCTAssertTrue(activity.waitForExistence(timeout: 45), "分享面板应出现（SMB 文件已完成下载）")
+        // The share sheet is a popover; tapping its backdrop dismisses it
+        // without the downward swipe that would also close the viewer.
+        let dismissRegion = app.otherElements["PopoverDismissRegion"]
+        XCTAssertTrue(dismissRegion.waitForExistence(timeout: 5), "分享面板应可关闭")
+        dismissRegion.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.12)).tap()
+        XCTAssertTrue(app.staticTexts["2 / 3"].waitForExistence(timeout: 10), "关闭分享后应回到详情页")
+
+        app.buttons["关闭"].tap()
+        XCTAssertTrue(grid.waitForExistence(timeout: 15), "关闭详情页应回到网格")
+        XCTAssertTrue(firstCell.waitForExistence(timeout: 10))
+
+        // Folder slideshow reuses the album options sheet and auto-advances.
+        let play = app.buttons["播放"]
+        XCTAssertTrue(play.waitForExistence(timeout: 10), "SMB 网格应提供播放按钮")
+        play.tap()
+        let start = app.buttons["slideshow-start"]
+        XCTAssertTrue(start.waitForExistence(timeout: 10), "播放前应弹出幻灯片设置面板")
+        start.tap()
+        XCTAssertTrue(app.staticTexts["1 / 3"].waitForExistence(timeout: 20), "幻灯片应从第一张开始")
+        XCTAssertTrue(app.staticTexts["2 / 3"].waitForExistence(timeout: 20), "幻灯片应自动推进")
+        app.buttons["结束幻灯片"].tap()
+        XCTAssertTrue(grid.waitForExistence(timeout: 15), "结束幻灯片应回到网格")
+    }
+
+    /// SwiftUI Form fields below the keyboard are not hittable yet; scrolling
+    /// the form also dismisses the keyboard interactively.
+    private func replaceText(in field: XCUIElement, with text: String) {
+        XCTAssertTrue(field.waitForExistence(timeout: 10), "找不到输入框 \(field)")
+        reveal(field)
+        field.tap()
+        field.tap(withNumberOfTaps: 3, numberOfTouches: 1)
+        field.typeText(text)
+    }
+
+    private func reveal(_ element: XCUIElement) {
+        for _ in 0..<3 where !element.isHittable {
+            app.swipeUp()
+        }
     }
 }
 
@@ -1342,6 +1518,47 @@ final class SlideshowOptionsUITests: XCTestCase {
         XCTAssertTrue(
             app.buttons["viewer-close"].waitForExistence(timeout: 10),
             "关闭幻灯片后应回到未整理详情页"
+        )
+    }
+}
+
+/// The folder-album home must keep all three add routes visible: SMB, iCloud
+/// Drive and the remaining Files providers. iCloud itself cannot be signed in
+/// on a simulator, so this covers the entry points rather than a pick.
+@MainActor
+final class FolderAlbumHomeUITests: XCTestCase {
+    /// The list is lazy: entries below the fold do not exist in the
+    /// accessibility tree until they are scrolled into view.
+    private func reveal(_ element: XCUIElement, in app: XCUIApplication) -> Bool {
+        for _ in 0..<3 {
+            if element.exists { return true }
+            app.swipeUp()
+        }
+        return element.exists
+    }
+
+    func testAddEntriesAreAvailable() throws {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments += ["-PhotoVault.startup.destination", "lan"]
+        app.launch()
+        pvGrantPhotosPermissionIfNeeded()
+
+        XCTAssertTrue(
+            app.buttons["smb-add-album-home"].waitForExistence(timeout: 25),
+            "文件夹相册应提供 SMB 添加入口"
+        )
+        XCTAssertTrue(
+            reveal(app.staticTexts["iCloud Drive"].firstMatch, in: app),
+            "iCloud Drive 应有独立分区"
+        )
+        XCTAssertTrue(
+            reveal(app.buttons["icloud-add-folder-home"], in: app),
+            "文件夹相册应提供 iCloud Drive 添加入口"
+        )
+        XCTAssertTrue(
+            reveal(app.buttons["folder-add-home"], in: app),
+            "文件夹相册应保留其他文件提供方入口"
         )
     }
 }

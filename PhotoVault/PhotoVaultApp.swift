@@ -5,6 +5,12 @@ import UIKit
 struct PhotoVaultApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
+    init() {
+        #if DEBUG
+        SMBTestState.resetIfRequested()
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
@@ -39,6 +45,7 @@ struct PhotoVaultApp: App {
             // their decoded thumbnails and viewer frames are ours to release,
             // and the grid ones are re-read from the on-disk cache on return.
             LANFolderImageCache.shared.removeAll()
+            SMBImageMemoryCache.removeAll()
         }
     }
 }

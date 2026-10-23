@@ -13,7 +13,7 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1.5</string>
+	<string>1.1.6</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
@@ -24,6 +24,8 @@
 	<string>PhotoVault 需要访问照片，用于展示图库、相册和未整理照片。</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>PhotoVault 需要写入照片库，用于创建相册、整理照片和保存编辑结果。</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>PhotoVault 需要访问本地网络，用于连接你添加的 SMB/NAS 共享并直接浏览其中的照片。</string>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>

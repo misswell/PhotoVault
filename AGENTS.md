@@ -213,6 +213,32 @@
 - 文件夹的看图与幻灯片必须和相册同款体验（`LANFolderPager` + 重写后的 `LANFolderSlideshowScreen`）：查看器由 `LANFolderGridScreen` 经 `PhotoViewerNavigator` **push**（会话私有 transitionState、`preferredTransition = .zoom`、系统竖滑关闭；自绘 drag-offset 下拉与 `require(toFail:)` 手势仲裁已删除，不要加回来），`LANFolderPager` 与相册 pager 共用 `ViewerPagerEngine`（横向 paging UICollectionView，只横向手势、程序化跳转带 pending 保护），不要回退成点区域翻页；图片内容模式用 fit（整张显示，和相册一致），只有网格缩略图用 fill。幻灯片镜像相册 `SlideshowView`：单可见页 + `.task(id:)` 推进器（后台暂停、provider 交付不阻塞推进）、间隔/随机/循环控制、设置里的过渡样式（fade/slide/zoom/dissolve）、邻页预读走共享的 `LANFolderImageLoaderQueue`、播放时禁休眠。`LANFolderImageView` 必须保持"上报尺寸 = 提案尺寸"（`Color.clear.overlay { … }.clipped()`），`scaledToFill` 的溢出尺寸会把兄弟控件挤出屏幕。
 - 文件夹访问（`startAccessingSecurityScopedResource`）必须与 `stopAccessing` 成对出现；图片加载按文件各自包裹即可。
 
+## SMB 直连相册
+
+- 文件 App 里的“其他 App 的目录”书签跨启动必然失效（沙盒不允许），这类来源要用 SMB 直连而不是安全作用域书签。SMB 走 `kishikawakatsumi/SMBClient`，**只支持 SMB 2.0/2.1**（SMB1-only 设备连不上，错误提示里要说明）；依赖固定 revision（`66eafaa6d17e034e8036dee4b3ebc1b52cb53919`），不要随手升级。
+- 添加流程：`SMBAddAlbumSheet` 只负责登录与保存服务器（先 `listShares` 验证，成功后写 Keychain + `SMBServerLibrary`，再 `onLoggedIn` 回传并 dismiss）；共享列表/目录选择在首页自己的 `NavigationStack` 里 push（`SMBBrowseSharesView` → `SMBDirectoryBrowserView`），不要塞回 sheet 内部导航。登录后系统会弹“储存密码？”（AutoFill 进程绘制，App 无法拦截），这是正常行为。服务器密码存 Keychain（service `com.misswell.PhotoVault.smb`，`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`）；`SecItemUpdate` 不接受 `kSecAttrAccessible`，更新与新增必须用不同 payload。**同一 host/port/username/domain 重复添加必须复用既有 server 并覆盖 Keychain 密码**（同时丢弃该 server 的 pooled 连接），不能追加第二个 server——两个 server 各自保存一份密码，旧条目的失效密码会让同名专辑随机打不开；相册本身已按 (serverID, share, path) 去重。
+- 删除服务器要级联：`SMBFolderLibrary` 里该服务器的相册、每册磁盘缩略图缓存、`SMBConnectionPool` 连接、Keychain 密码一起清理。
+- SMB 文件以虚拟 URL（scheme `photovault-smb`，host 是相册 ID，query 带 mtime/size）喂给现有网格/详情/胶片/幻灯片，复用 LAN 文件夹那套 UI。任何系统 API（分享、导出）拿到虚拟 URL 前必须先经 `SMBFileMaterializer` 落成本地文件；分享用原文件名（硬链接进临时目录，`ActivityPresenter` 关闭时清理），不要直接把缓存里的哈希文件名交给 `UIActivityViewController`。
+- 图片读取链路：`SMBShareConnection` **一连接一操作串行**（SMBClient 非线程安全）。超时只把调用方放走，底层调用仍在 Network.framework 里跑，所以串行 gate 必须由 worker 真正退出时的 `onWorkerExit` 释放、超时/取消路径不得 `disconnect`（会和被放弃的调用抢 session），否则下一次请求会与旧调用并发使用同一 client。`SMBTransferCoordinator` 合并同文件 in-flight 请求、限并发、失败重试一次；原图落盘缓存（`SMBOriginalCache`，2GB 上限 + 过期 `.download-*` 清理），内存另有一层 NSCache。枚举走 `SMBFolderEnumerator`（递归、按修改时间倒序、可取消），结果进 `LANFolderSessionCache`，空结果不缓存。所有 SMB 调用包 `SMBTimeout.run`，超时明确报错而不是无限转圈。
+- 文件夹详情页（`LANFolderViewerScreen`）被 push 在网格的 SwiftUI 树之外，**索引必须由详情页自己的 `@State` 持有**（`initialIndex` 初始化）；从网格传 `@Binding` 会导致翻页后计数器/胶片条不刷新（分页器换了页、界面还停在旧页）。两套网格（本机文件夹、SMB）都只传 `initialIndex`。
+- 回归测试：`PhotoVaultUITests/SMBFolderAlbumUITests`，需要本地 SMB 服务器与测试凭据，未设置时跳过。测试服务器可用 impacket（`pip install impacket`）：`smbserver.py -port 4450 -username <user> -password <password> -smb2support Photos <图片目录>`；然后：
+  ```bash
+  TEST_RUNNER_PV_SMB_UI_TEST=1 TEST_RUNNER_PV_SMB_PASSWORD=<password> \
+    xcodebuild test -project PhotoVault.xcodeproj -scheme PhotoVault \
+    -destination 'platform=iOS Simulator,id=<id>' \
+    -only-testing:PhotoVaultUITests/SMBFolderAlbumUITests -derivedDataPath build/DerivedDataSMB
+  ```
+  用例覆盖：添加服务器 → 共享列表 → 目录 → 添加相册 → 从首页重开 → 网格 → 详情翻页 → 分享面板（文件已落地）→ 关闭分享回到同一页 → 幻灯片自动推进。测试凭据只通过环境变量传入，不得写进仓库。用例启动带 `--pv-reset-smb`（DEBUG，`SMBTestState`）清掉上一轮残留的服务器、相册和 Keychain 密码；模拟器不会因重装自动清空这些状态，否则 `firstMatch` 会点到旧密码的同名专辑，表现为无关的 `logonFailure`。
+
+## iCloud Drive 文件夹
+
+- iOS **没有公开 API 枚举整个 iCloud Drive**：任意 iCloud Drive 文件夹只能由用户在系统文件选择器（`UIDocumentPickerViewController(forOpeningContentTypes: [.folder])`）里选中并授权。`FileManager.url(forUbiquityContainerIdentifier:)` 只能拿到 App 自己的 iCloud 容器（还要 iCloud Documents capability），不要用它冒充“浏览 iCloud Drive”，也不要为这个功能引入 iCloud entitlement——它会牵动 App ID 与发布描述文件。
+- 首页“文件夹相册”给 iCloud Drive 独立分区（`LANFolderAlbum.isICloudDrive`，添加时按 `Mobile Documents/com~apple~CloudDocs` 路径并辅以 `isUbiquitousItem` 识别，旧条目解码默认 false，首次解析成功后按路径补标）。iCloud 文件夹与普通文件夹共用 `LANFolderGridScreen`，但错误/超时文案必须按来源区分，不能再提示“其他 App 的目录 / 移到我的 iPhone 顶层”（那层没有可写根目录）。
+- **书签必须在安全作用域内创建**：`LANFolderLibrary.add(from:)` 先 `startAccessingSecurityScopedResource()`，再 `bookmarkData`，随后停止。拿着未激活作用域的 URL 生成书签会出现“重启后按路径解析成功、`startAccessing` 却为 false”的假授权。
+- iCloud 原图会被系统驱逐：`LANFolderImageLoader.startDownloadIfNeeded` 在协调读取前对 `/Mobile Documents/` 下的 ubiquitous item 调 `startDownloadingUbiquitousItem`；读取仍受 20 秒协调超时约束，超时显示占位，不要无限等待。
+- 枚举为空时无论 scope 是否启动都要再走一次 `NSFileCoordinator` 协调读取兜底（iCloud 会出现 scope 已启动、直接遍历却为空的情况）；空结果仍不写 `LANFolderSessionCache`。
+- 模拟器无法登录 iCloud，iCloud Drive 只能做编译与真机人工验证。`FolderAlbumHomeUITests` 只断言 SMB / iCloud Drive / 其他文件夹三个入口和 iCloud 分区存在。
+
 ## 幻灯片和预读
 
 - 幻灯片不要通过动态重建的三页 `TabView` 自动播放，否则容易在前两张之间来回切换。

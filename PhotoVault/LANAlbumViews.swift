@@ -4,66 +4,217 @@ import UniformTypeIdentifiers
 
 // MARK: - Home entry
 
-/// Sidebar entry for folders picked through the Files app (SMB/NAS shares
-/// included) treated as albums.
+/// Sidebar entry for external folders treated as albums: direct SMB shares
+/// (no Files-app mount, no re-authorization after launch) and folders picked
+/// through the Files app (local, USB, iCloud Drive).
 struct LANAlbumHomeScreen: View {
     @State private var folders: [LANFolderAlbum] = LANFolderLibrary.load()
+    @State private var smbFolders: [SMBFolderAlbum] = SMBFolderLibrary.load()
+    @State private var servers: [SMBServer] = SMBServerLibrary.load()
     @State private var isShowingPicker = false
-    @State private var activeFolder: LANFolderAlbum?
-    @State private var alert: PhotoVaultAlert?
+    @State private var isShowingSMBAdd = false
+    @State private var route: FolderRoute?
+    @State private var pendingSMBLogin: SMBLoginResult?
+    @State private var alert: HomeAlert?
+
+    private struct SMBLoginResult: Hashable {
+        let server: SMBServer
+        let shares: [SMBShareInfo]
+    }
+
+    private enum FolderRoute: Hashable {
+        case local(LANFolderAlbum)
+        case smb(SMBFolderAlbum)
+        case smbShares(SMBLoginResult)
+    }
+
+    private enum HomeAlert: Identifiable {
+        case message(title: String, message: String)
+        case deleteServers([SMBServer])
+
+        var id: String {
+            switch self {
+            case .message(let title, let message):
+                return "message-\(title)-\(message)"
+            case .deleteServers(let servers):
+                return "servers-\(servers.map(\.id.uuidString).joined(separator: ","))"
+            }
+        }
+    }
+
+    private var iCloudFolders: [LANFolderAlbum] {
+        folders.filter(\.isICloudDrive)
+    }
+
+    private var filesAppFolders: [LANFolderAlbum] {
+        folders.filter { !$0.isICloudDrive }
+    }
+
+    @ViewBuilder
+    private func folderRows(_ subset: [LANFolderAlbum], identifierPrefix: String) -> some View {
+        ForEach(subset) { folder in
+            Button {
+                route = .local(folder)
+            } label: {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(folder.name)
+                    Text("添加于 \(folder.addedAt.formatted(date: .abbreviated, time: .omitted))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("\(identifierPrefix)\(folder.name)")
+        }
+        .onDelete { offsets in
+            deleteFolders(at: offsets, from: subset)
+        }
+    }
+
+    private func deleteFolders(at offsets: IndexSet, from subset: [LANFolderAlbum]) {
+        let ids = Set(offsets.compactMap { subset.indices.contains($0) ? subset[$0].id : nil })
+        guard !ids.isEmpty else { return }
+        for id in ids {
+            LANFolderThumbnailDiskCache.purge(folderID: id)
+        }
+        folders.removeAll { ids.contains($0.id) }
+        LANFolderLibrary.save(folders)
+    }
 
     var body: some View {
         List {
             Section {
-                if folders.isEmpty {
-                    Text("还没有添加局域网文件夹。")
+                if smbFolders.isEmpty {
+                    Text("还没有添加 SMB 相册。")
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(folders) { folder in
+                    ForEach(smbFolders) { folder in
                         Button {
-                            activeFolder = folder
+                            route = .smb(folder)
                         } label: {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(folder.name)
-                                Text("添加于 \(folder.addedAt.formatted(date: .abbreviated, time: .omitted))")
+                                Text("\(serverLabel(for: folder)) · \(folder.displayPath)")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
+                                    .lineLimit(1)
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("smb-album-\(folder.name)")
                     }
                     .onDelete { offsets in
-                        for index in offsets where folders.indices.contains(index) {
-                            LANFolderThumbnailDiskCache.purge(folderID: folders[index].id)
+                        // Resolve every row before mutating: each removal
+                        // rewrites the stored list, so reading offsets against
+                        // the updated array would hit shifted indices.
+                        let ids = offsets.compactMap {
+                            smbFolders.indices.contains($0) ? smbFolders[$0].id : nil
                         }
-                        folders.remove(atOffsets: offsets)
-                        LANFolderLibrary.save(folders)
+                        for id in ids {
+                            smbFolders = SMBFolderLibrary.remove(albumID: id)
+                        }
                     }
                 }
+                Button {
+                    isShowingSMBAdd = true
+                } label: {
+                    Label("添加 SMB 相册", systemImage: "externaldrive.badge.plus")
+                }
+                .accessibilityIdentifier("smb-add-album-home")
             } header: {
-                Text("已添加")
+                Text("SMB 相册")
             } footer: {
-                Text("来源不限：局域网 SMB/NAS 共享、本机文件夹、外接 U 盘都可以。先在文件 App 里连接服务器或挂载设备，再选择文件夹即可当作相册。")
+                Text("直接连接 NAS 或 SMB 共享，不需要在文件 App 里挂载，也不会因为重启而丢失访问权限。")
             }
 
             Section {
+                folderRows(iCloudFolders, identifierPrefix: "icloud-folder-")
+                if iCloudFolders.isEmpty {
+                    Text("还没有添加 iCloud Drive 文件夹。")
+                        .foregroundStyle(.secondary)
+                }
                 Button {
                     isShowingPicker = true
                 } label: {
-                    Label("添加文件夹", systemImage: "folder.badge.plus")
+                    Label("从 iCloud Drive 添加文件夹", systemImage: "icloud.and.arrow.down")
+                }
+                .accessibilityIdentifier("icloud-add-folder-home")
+            } header: {
+                Text("iCloud Drive")
+            } footer: {
+                Text("在文件选择器侧栏进入 iCloud Drive 选择文件夹。添加后直接读取原文件、不复制；权限由系统书签跨启动恢复，原图未下载时会按需下载。")
+            }
+
+            Section {
+                folderRows(filesAppFolders, identifierPrefix: "folder-")
+                if filesAppFolders.isEmpty {
+                    Text("还没有添加其他文件夹。")
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    isShowingPicker = true
+                } label: {
+                    Label("添加其他文件夹", systemImage: "folder.badge.plus")
+                }
+                .accessibilityIdentifier("folder-add-home")
+            } header: {
+                Text("其他文件夹")
+            } footer: {
+                Text("本机、外接 U 盘或文件 App 里连接的共享。其他 App「我的 iPhone」目录内的文件夹无法跨启动保留授权，请改用 SMB 或 iCloud Drive。")
+            }
+
+            if !servers.isEmpty {
+                Section {
+                    ForEach(servers) { server in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(server.name)
+                            Text("\(server.username.isEmpty ? "访客" : server.username)@\(server.displayAddress)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .onDelete { offsets in
+                        let targets = offsets.compactMap {
+                            servers.indices.contains($0) ? servers[$0] : nil
+                        }
+                        guard !targets.isEmpty else { return }
+                        alert = .deleteServers(targets)
+                    }
+                } header: {
+                    Text("SMB 服务器")
+                } footer: {
+                    Text("删除服务器会移除它的相册条目和保存的密码，不会删除服务器上的照片。")
                 }
             }
         }
         .navigationTitle("文件夹相册")
-        .navigationDestination(item: $activeFolder) { folder in
-            LANFolderGridScreen(folder: folder)
+        .navigationDestination(item: $route) { route in
+            switch route {
+            case .local(let folder):
+                LANFolderGridScreen(folder: folder)
+            case .smb(let folder):
+                SMBFolderGridScreen(folder: folder)
+            case .smbShares(let login):
+                SMBBrowseSharesView(server: login.server, shares: login.shares) { _ in
+                    smbFolders = SMBFolderLibrary.load()
+                    servers = SMBServerLibrary.load()
+                    // The album is now in the home list; popping back makes
+                    // the result visible instead of pushing a second detail
+                    // on top of the picker stack.
+                    self.route = nil
+                }
+            }
         }
         .onAppear {
             // Re-auth writes fresh bookmarks into storage behind this
             // screen; pick them up when the list reappears.
             folders = LANFolderLibrary.load()
+            smbFolders = SMBFolderLibrary.load()
+            servers = SMBServerLibrary.load()
         }
         .task {
             // Wake the provider daemons so the first folder tap does not
@@ -74,7 +225,7 @@ struct LANAlbumHomeScreen: View {
             LANFolderPicker { pickedURL in
                 Task { @MainActor in
                     guard let result = await LANFolderLibrary.add(from: pickedURL) else {
-                        alert = PhotoVaultAlert(
+                        alert = .message(
                             title: "无法添加文件夹",
                             message: "创建访问书签失败，请重试或换一个文件夹。"
                         )
@@ -84,18 +235,57 @@ struct LANAlbumHomeScreen: View {
                     // Re-picking a registered folder refreshes its access
                     // grant — open it right away, silently.
                     if case .duplicate(let healed) = result.outcome {
-                        activeFolder = healed
+                        route = .local(healed)
                     }
                 }
             }
         }
-        .alert(item: $alert) { alert in
-            Alert(
-                title: Text(alert.title),
-                message: Text(alert.message),
-                dismissButton: .default(Text("好"))
-            )
+        .sheet(isPresented: $isShowingSMBAdd, onDismiss: {
+            smbFolders = SMBFolderLibrary.load()
+            servers = SMBServerLibrary.load()
+            // Browsing continues in this screen's navigation stack. Pushing
+            // from inside the credential sheet leaves the keyboard's
+            // text-effects window above the share list, where it silently
+            // swallows every tap on a row.
+            if let pendingSMBLogin {
+                self.pendingSMBLogin = nil
+                route = .smbShares(pendingSMBLogin)
+            }
+        }) {
+            SMBAddAlbumSheet { server, shares in
+                pendingSMBLogin = SMBLoginResult(server: server, shares: shares)
+            }
         }
+        .alert(item: $alert) { alert in
+            switch alert {
+            case .message(let title, let message):
+                return Alert(
+                    title: Text(title),
+                    message: Text(message),
+                    dismissButton: .default(Text("好"))
+                )
+            case .deleteServers(let targets):
+                let albumCount = smbFolders.filter { folder in
+                    targets.contains { $0.id == folder.serverID }
+                }.count
+                let names = targets.map(\.name).joined(separator: "、")
+                return Alert(
+                    title: Text(targets.count == 1 ? "删除 SMB 服务器？" : "删除 \(targets.count) 台 SMB 服务器？"),
+                    message: Text("将移除「\(names)」的 \(albumCount) 个相册条目和保存的密码。服务器上的照片不会被删除。"),
+                    primaryButton: .destructive(Text("删除")) {
+                        for server in targets {
+                            smbFolders = SMBFolderLibrary.remove(serverID: server.id)
+                        }
+                        servers = SMBServerLibrary.load()
+                    },
+                    secondaryButton: .cancel(Text("取消"))
+                )
+            }
+        }
+    }
+
+    private func serverLabel(for folder: SMBFolderAlbum) -> String {
+        servers.first(where: { $0.id == folder.serverID })?.name ?? "SMB"
     }
 }
 
@@ -162,7 +352,6 @@ struct LANFolderGridScreen: View {
     @State private var isShowingReauthPicker = false
     @State private var hasAutoPresentedPicker = false
     @State private var reauthDirectory: URL?
-    @State private var viewerIndex: Int?
     /// Pushes/pops the viewer on the folder detail's navigation stack, so the
     /// folder viewer gets the same system zoom transition and interactive
     /// pull-down dismissal as the album, unsorted and search viewers.
@@ -172,6 +361,8 @@ struct LANFolderGridScreen: View {
     /// and resolution are not known without decoding every file.
     @State private var isShowingSlideshowOptions = false
     @State private var isStartingSlideshow = false
+    @State private var pendingSlideshowStart = false
+    @State private var enumerateGeneration = 0
 
     private let columns = [
         GridItem(.adaptive(minimum: 88, maximum: 150), spacing: 2)
@@ -210,9 +401,9 @@ struct LANFolderGridScreen: View {
             } else {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 2) {
-                        // Index-keyed so a swipe that rewrites `viewerIndex`
-                        // does not rebuild an n-element `(offset, element)`
-                        // array for a folder that can hold thousands of files.
+                        // Index-keyed so the grid never rebuilds an n-element
+                        // `(offset, element)` array for a folder that can
+                        // hold thousands of files.
                         ForEach(files.indices, id: \.self) { index in
                             Button {
                                 openViewer(at: index)
@@ -251,7 +442,8 @@ struct LANFolderGridScreen: View {
             }
         }
         .task(id: "\(folder.id)#\(enumerateAttempt)") {
-            await enumerate()
+            enumerateGeneration += 1
+            await enumerate(generation: enumerateGeneration)
         }
         .sheet(isPresented: $isShowingReauthPicker) {
             LANFolderPicker(
@@ -280,10 +472,17 @@ struct LANFolderGridScreen: View {
                 title: "\(folder.name)幻灯片",
                 source: nil,
                 onStart: { _ in
-                    isStartingSlideshow = true
+                    // The cover must wait for the options sheet to finish
+                    // dismissing; presenting both in one turn drops the cover.
+                    pendingSlideshowStart = true
                     isShowingSlideshowOptions = false
                 }
             )
+        }
+        .onChange(of: isShowingSlideshowOptions) { _, isShowing in
+            guard !isShowing, pendingSlideshowStart else { return }
+            pendingSlideshowStart = false
+            isStartingSlideshow = true
         }
         .fullScreenCover(
             isPresented: $isStartingSlideshow,
@@ -307,11 +506,6 @@ struct LANFolderGridScreen: View {
     /// the interactive pull-down dismissal behaves like every other entry.
     private func openViewer(at index: Int) {
         guard files.indices.contains(index) else { return }
-        viewerIndex = index
-        let indexBinding = Binding(
-            get: { viewerIndex ?? index },
-            set: { viewerIndex = $0 }
-        )
         navigator.open(
             request: PhotoViewerRequest(index: index, assetIdentifier: files[index].absoluteString, previewImage: nil),
             gridTransitionCoordinator: nil
@@ -319,7 +513,7 @@ struct LANFolderGridScreen: View {
             AnyView(LANFolderViewerScreen(
                 files: files, folderID: folder.id,
                 rootURL: folderURL ?? URL(fileURLWithPath: "/"),
-                index: indexBinding, transitionState: state, onClose: close
+                initialIndex: index, transitionState: state, onClose: close
             ))
         }
     }
@@ -335,7 +529,7 @@ struct LANFolderGridScreen: View {
     /// racing the main-thread reads in `body`. All blocking work already runs
     /// on GCD inside `LANFolderTimeout.run`.
     @MainActor
-    private func enumerate() async {
+    private func enumerate(generation: Int) async {
         // Re-entry replays the session cache: hitting the share again was
         // stacking a second full traversal on top of the first one. Restore
         // the resolved root as well, or every thumbnail cache key in the
@@ -354,7 +548,7 @@ struct LANFolderGridScreen: View {
         // navigation time, or the healed bookmark would never be used.
         let album = LANFolderLibrary.load().first(where: { $0.id == folder.id }) ?? folder
         LANFolderDiagnostics.log(
-            "enumerating \(album.name): bookmarkFP=\("len\(album.bookmark.count):\(album.bookmark.base64EncodedString().suffix(6))")"
+            "enumerating \(album.name): iCloudDrive=\(album.isICloudDrive) bookmarkFP=\("len\(album.bookmark.count):\(album.bookmark.base64EncodedString().suffix(6))")"
         )
         let startedAt = Date()
         // Resolve + activate + enumerate can each block against a dead or
@@ -367,6 +561,7 @@ struct LANFolderGridScreen: View {
             LANFolderDiagnostics.log(
                 "resolved \(album.name): path=\(url.path), exists=\(FileManager.default.fileExists(atPath: url.path))"
             )
+            LANFolderLibrary.markICloudDriveIfNeeded(id: album.id, resolvedURL: url)
             // Hold the security scope for the whole session; re-acquiring it
             // on every visit stalled the album behind provider round trips.
             // No blocking retries: the folder list already warmed the
@@ -383,10 +578,12 @@ struct LANFolderGridScreen: View {
             var enumerated = LANFolderImageLoader.enumerateImageFiles(under: url)
             // A failed grant is not necessarily the end: a coordinated read
             // through NSFileCoordinator can negotiate access with the file
-            // provider even when startAccessing was refused. Probe it and
-            // keep whatever it yields.
+            // provider even when startAccessing was refused. iCloud Drive also
+            // reports a started scope while a direct FileManager traversal
+            // comes back empty, so probe the coordinated channel whenever the
+            // enumeration is empty rather than only after a denied grant.
             var coordinatedWorked = false
-            if enumerated.isEmpty && !scopeStarted {
+            if enumerated.isEmpty {
                 if let coordinatedFiles = LANFolderLibrary.coordinatedEnumerate(id: album.id, url: url),
                    !coordinatedFiles.isEmpty {
                     enumerated = coordinatedFiles
@@ -403,6 +600,9 @@ struct LANFolderGridScreen: View {
             )
         }
         if let outcome, let url = outcome.url, let enumerated = outcome.files {
+            // A retry or a re-authorization may have started a newer pass
+            // while this one was blocked on the share; its result is stale.
+            guard generation == enumerateGeneration else { return }
             if enumerated.isEmpty && !outcome.scopeStarted {
                 // The stored bookmark no longer grants access (app reinstall,
                 // provider re-auth): resolving succeeds by path, but the
@@ -413,7 +613,9 @@ struct LANFolderGridScreen: View {
                 LANFolderDiagnostics.log(
                     "access lost for \(album.name): scope denied, 0 files, bookmarkFP=\("len\(album.bookmark.count):\(album.bookmark.base64EncodedString().suffix(6))"), resolvedPath=\(url.path), exists=\(FileManager.default.fileExists(atPath: url.path))"
                 )
-                enumerateError = "无法获得文件夹的访问权限：该文件夹位于其他 App 的目录内，iOS 出于沙盒安全不允许跨启动记住此类授权。建议在文件 App 中将它移动到“我的 iPhone”顶层后，在这里删除并重新添加；或每次进入时重新选择一次。"
+                enumerateError = (album.isICloudDrive || LANFolderProvider.isICloudDrive(url))
+                    ? "无法访问 iCloud Drive 文件夹：请确认已在系统设置登录 iCloud、开启 iCloud 云盘并有可用网络。点“重新授权”重新选择该文件夹即可恢复；如果它已被移动，请先在文件 App 中确认位置。"
+                    : "无法获得文件夹的访问权限：该文件夹可能位于其他 App 的目录内，iOS 出于沙盒安全不允许跨启动记住此类授权。建议把它移到 iCloud Drive 顶层或改用 SMB 直连，然后在这里重新选择一次。"
                 // Open the picker at the folder's parent so the folder is
                 // visible and selectable in one tap.
                 reauthDirectory = url.deletingLastPathComponent()
@@ -439,8 +641,11 @@ struct LANFolderGridScreen: View {
                 }
             }
         } else {
+            guard generation == enumerateGeneration else { return }
             LANFolderDiagnostics.log("enumerate timed out for \(album.name)")
-            enumerateError = "文件夹访问超时或已不可访问，请检查共享连接后重试，或删除后重新添加。"
+            enumerateError = album.isICloudDrive
+                ? "读取 iCloud Drive 超时，请检查网络和 iCloud 云盘状态后重试。"
+                : "文件夹访问超时或已不可访问，请检查共享连接后重试，或删除后重新添加。"
         }
         isEnumerating = false
     }
@@ -448,7 +653,7 @@ struct LANFolderGridScreen: View {
 
 // MARK: - Image views
 
-private struct LANFolderImageView: View {
+struct LANFolderImageView: View {
     let url: URL
     let folderID: UUID
     let rootURL: URL
@@ -516,11 +721,33 @@ struct LANFolderViewerScreen: View {
     let files: [URL]
     let folderID: UUID
     let rootURL: URL
-    @Binding var index: Int
     /// Popping is owned by the navigation stack the viewer was pushed onto;
     /// the close button routes through it like every other exit.
     let transitionState: PhotoViewerTransitionState
     let onClose: () -> Void
+
+    /// The viewer is hosted outside the grid's SwiftUI tree, so the displayed
+    /// page must be owned here — a binding back to the grid updates the pager
+    /// but never re-renders the counter or filmstrip.
+    @State private var index: Int
+    @State private var isPreparingShare = false
+    @State private var isShowingShareError = false
+
+    init(
+        files: [URL],
+        folderID: UUID,
+        rootURL: URL,
+        initialIndex: Int,
+        transitionState: PhotoViewerTransitionState,
+        onClose: @escaping () -> Void
+    ) {
+        self.files = files
+        self.folderID = folderID
+        self.rootURL = rootURL
+        self.transitionState = transitionState
+        self.onClose = onClose
+        _index = State(initialValue: min(max(0, initialIndex), max(0, files.count - 1)))
+    }
 
     var body: some View {
         ZStack {
@@ -567,14 +794,38 @@ struct LANFolderViewerScreen: View {
                         .lineLimit(1)
                     Spacer()
                     Button {
-                        guard files.indices.contains(index) else { return }
-                        ActivityPresenter.present(items: [files[index]])
+                        guard files.indices.contains(index), !isPreparingShare else { return }
+                        let source = files[index]
+                        isPreparingShare = true
+                        Task { @MainActor in
+                            // SMB URLs must become real files before the
+                            // share sheet can read them; local folders pass
+                            // through immediately.
+                            let materialized = await SMBFileMaterializer.materialized(for: source)
+                            isPreparingShare = false
+                            guard let materialized else {
+                                isShowingShareError = true
+                                return
+                            }
+                            ActivityPresenter.present(
+                                items: [materialized.url],
+                                onDismiss: materialized.cleanup
+                            )
+                        }
                     } label: {
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.headline.weight(.semibold))
-                            .frame(width: 46, height: 46)
-                            .glassEffect(.regular.interactive(), in: Circle())
+                        if isPreparingShare {
+                            ProgressView()
+                                .tint(.white)
+                                .frame(width: 46, height: 46)
+                                .glassEffect(.regular, in: Circle())
+                        } else {
+                            Image(systemName: "square.and.arrow.up")
+                                .font(.headline.weight(.semibold))
+                                .frame(width: 46, height: 46)
+                                .glassEffect(.regular.interactive(), in: Circle())
+                        }
                     }
+                    .disabled(isPreparingShare)
                     .accessibilityLabel("分享")
                 }
                 .padding(.horizontal, 18)
@@ -594,6 +845,11 @@ struct LANFolderViewerScreen: View {
         .onChange(of: index) { _, newValue in
             transitionState.update(index: newValue, assetIdentifier: files.indices.contains(newValue) ? files[newValue].absoluteString : nil)
             prefetchNeighbors(around: newValue)
+        }
+        .alert("无法分享", isPresented: $isShowingShareError) {
+            Button("好", role: .cancel) { }
+        } message: {
+            Text("无法从 SMB 服务器读取这张照片，请检查共享连接后重试。")
         }
     }
 

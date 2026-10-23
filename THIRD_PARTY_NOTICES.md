@@ -38,13 +38,33 @@ contain no model weights or tokenizer.
 - **NOTICE file:** the upstream distribution contains no `NOTICE` file, so
   Apache-2.0 section 4(d) imposes no additional attribution to propagate.
 
-### No other third-party code is redistributed
+## SMB client
 
-The app links only Apple-provided frameworks at runtime (PhotoKit, Vision,
-CoreML, Metal, Accelerate, SwiftUI, UIKit, SQLite). There are **no** Swift Package
-Manager, CocoaPods or Carthage dependencies in `PhotoVault.xcodeproj`
-(`XCRemoteSwiftPackageReference` appears zero times), so there is no other
-bundled third-party source or binary.
+PhotoVault can browse photos on a NAS or other SMB share directly, without
+going through the Files app. This is the only third-party source linked into
+the app.
+
+### SMBClient — `kishikawakatsumi/SMBClient`
+
+- **License:** MIT
+- **Upstream:** <https://github.com/kishikawakatsumi/SMBClient>
+- **Consumed as:** Swift Package Manager remote dependency, pinned to revision
+  `66eafaa6d17e034e8036dee4b3ebc1b52cb53919` (the upstream repository publishes
+  no version tags)
+- **Purpose:** pure-Swift SMB 2.0.2 / 2.1 client (NTLMv2, SMB signing) used to
+  log in, list shares and directories, and download image files
+- **Modifications:** none. The package is linked unmodified as the
+  `SMBClient` product.
+
+The library never receives photos or credentials other than the SMB account
+the user enters for their own server. Passwords are stored in the iOS Keychain,
+never in preferences or logs.
+
+### Apple frameworks only otherwise
+
+Apart from SMBClient, the app links only Apple-provided frameworks at runtime
+(PhotoKit, Vision, CoreML, Metal, Accelerate, Network, Security, SwiftUI, UIKit,
+SQLite). There are no CocoaPods or Carthage dependencies.
 
 ## Build-time only — not redistributed
 
@@ -257,4 +277,30 @@ The following applies to SigLIP2 and to the `tokenizer-v1.bin` derived from it.
       of your accepting any such warranty or additional liability.
 
    END OF TERMS AND CONDITIONS
+```
+
+## MIT License — SMBClient
+
+```text
+MIT License
+
+Copyright (c) 2024 Kishikawa Katsumi
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 ```

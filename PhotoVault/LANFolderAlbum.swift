@@ -104,6 +104,36 @@ struct LANFolderAlbum: Codable, Identifiable, Equatable, Hashable {
     var name: String
     var bookmark: Data
     var addedAt: Date
+    /// iCloud Drive folders are still picked through the Files picker (iOS has
+    /// no API to enumerate the drive directly), but they get their own section
+    /// and their own diagnostics instead of the "other app container" advice.
+    /// Optional on disk: entries written before this flag decode as false.
+    var isICloudDrive: Bool = false
+}
+
+extension LANFolderAlbum {
+    private enum CodingKeys: String, CodingKey {
+        case id, name, bookmark, addedAt, isICloudDrive
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        bookmark = try container.decode(Data.self, forKey: .bookmark)
+        addedAt = try container.decode(Date.self, forKey: .addedAt)
+        isICloudDrive = try container.decodeIfPresent(Bool.self, forKey: .isICloudDrive) ?? false
+    }
+}
+
+enum LANFolderProvider {
+    /// `Mobile Documents/com~apple~CloudDocs` is the iCloud Drive root; every
+    /// other app's iCloud container sits beside it under a different name.
+    static func isICloudDrive(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        return path.contains("/Mobile Documents/com~apple~CloudDocs/")
+            || path.hasSuffix("/Mobile Documents/com~apple~CloudDocs")
+    }
 }
 
 enum LANFolderLibrary {
@@ -140,18 +170,43 @@ enum LANFolderLibrary {
     /// matching runs off the main thread and a dead share cannot hang the
     /// picker callback.
     static func add(from pickedURL: URL) async -> AddResult? {
-        guard let bookmark = try? pickedURL.bookmarkData(
+        // Provider-backed folders (iCloud Drive in particular) only guarantee
+        // the grant while this security scope is held. A bookmark minted from
+        // an idle URL resolved by path after relaunch but never restored
+        // access, which surfaced as "folder moved / other app's directory".
+        let scopeStarted = pickedURL.startAccessingSecurityScopedResource()
+        // Shared iCloud folders and app iCloud containers do not always live
+        // under the CloudDocs root; ask the provider while the scope is held.
+        // Gate on the Mobile Documents path so picking an SMB share does not
+        // pay for an extra provider round trip.
+        let isICloudDrive = LANFolderProvider.isICloudDrive(pickedURL)
+            || (pickedURL.path.contains("/Mobile Documents/")
+                && (try? pickedURL.resourceValues(forKeys: [.isUbiquitousItemKey]).isUbiquitousItem) == true)
+        let bookmark = try? pickedURL.bookmarkData(
             options: [],
             includingResourceValuesForKeys: nil,
             relativeTo: nil
-        ) else { return nil }
+        )
+        if scopeStarted {
+            pickedURL.stopAccessingSecurityScopedResource()
+        }
+        guard let bookmark else { return nil }
+        let pickedPath = pickedURL.standardizedFileURL.path
+        // Picking the drive root hands back ".../com~apple~CloudDocs"; show
+        // the name users know instead of the provider directory.
+        let displayName = pickedPath.hasSuffix("/Mobile Documents/com~apple~CloudDocs")
+            ? "iCloud Drive"
+            : pickedURL.lastPathComponent
         let candidate = LANFolderAlbum(
             id: UUID(),
-            name: pickedURL.lastPathComponent,
+            name: displayName,
             bookmark: bookmark,
-            addedAt: .now
+            addedAt: .now,
+            isICloudDrive: isICloudDrive
         )
-        let pickedPath = pickedURL.standardizedFileURL.path
+        LANFolderDiagnostics.log(
+            "adding \(displayName): iCloudDrive=\(isICloudDrive) scopeStarted=\(scopeStarted)"
+        )
 
         return await Task.detached(priority: .userInitiated) {
             var kept: [LANFolderAlbum] = []
@@ -183,6 +238,7 @@ enum LANFolderLibrary {
                 healed.bookmark = bookmark
                 healed.name = candidate.name
                 healed.addedAt = candidate.addedAt
+                healed.isICloudDrive = isICloudDrive
                 kept = kept.map { $0.id == healed.id ? healed : $0 }
                 save(kept)
                 return AddResult(outcome: .duplicate(healed), folders: kept)
@@ -266,6 +322,20 @@ enum LANFolderLibrary {
             LANFolderDiagnostics.log("resolved \(album.name): bookmark STALE")
         }
         return url
+    }
+
+    /// Entries added before iCloud Drive had its own section were stored
+    /// without the flag. Reclassify on the first successful resolve so the
+    /// list, diagnostics and error copy stop treating them as local
+    /// containers; the path check costs no provider round trip.
+    static func markICloudDriveIfNeeded(id: UUID, resolvedURL: URL) {
+        guard LANFolderProvider.isICloudDrive(resolvedURL) else { return }
+        var folders = load()
+        guard let index = folders.firstIndex(where: { $0.id == id }),
+              !folders[index].isICloudDrive
+        else { return }
+        folders[index].isICloudDrive = true
+        save(folders)
     }
 
     /// A stale bookmark still resolves, but providers sometimes stop
@@ -452,6 +522,22 @@ enum LANFolderImageLoader {
             .map(\.url)
     }
 
+    /// iCloud Drive originals get evicted to reclaim space. A coordinated read
+    /// then waits for a transfer nobody requested and times out on a photo
+    /// that would otherwise display. Ask the system to materialize it first;
+    /// the coordinated read below waits (bounded by its timeout). Only URLs
+    /// under Mobile Documents pay for the resource query — SMB and local
+    /// folders skip it on a string check.
+    static func startDownloadIfNeeded(_ url: URL) {
+        guard url.path.contains("/Mobile Documents/") else { return }
+        guard let values = try? url.resourceValues(forKeys: [
+            .isUbiquitousItemKey,
+            .ubiquitousItemDownloadingStatusKey,
+        ]), values.isUbiquitousItem == true else { return }
+        guard values.ubiquitousItemDownloadingStatus != .current else { return }
+        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+    }
+
     /// Downscaled decode through ImageIO. A full-resolution decode of a 50MP
     /// file inside a grid cell is exactly the main-thread hitch we never
     /// allow; callers run this off the main actor. The read is wrapped in an
@@ -460,6 +546,7 @@ enum LANFolderImageLoader {
     /// bounded: a wedged provider must not pin a decode slot for the rest of
     /// the process, which used to starve every later image load.
     static func image(at url: URL, maxPixelSize: CGFloat) -> UIImage? {
+        startDownloadIfNeeded(url)
         let coordinator = NSFileCoordinator(filePresenter: nil)
         let intent = NSFileAccessIntent.readingIntent(with: url, options: [])
         let decoded = CoordinatedResult<UIImage>()
@@ -658,10 +745,16 @@ enum LANFolderThumbnailDiskCache {
         try? FileManager.default.removeItem(at: root)
     }
 
-    /// Drops a removed album's thumbnails from Caches.
+    /// Drops a removed album's thumbnails from Caches. Deleting thousands of
+    /// files can block for a while, so it never runs on the main thread.
     static func purge(folderID: UUID) {
-        let directory = directory(for: folderID)
-        try? FileManager.default.removeItem(at: directory)
+        let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("PhotoVault", isDirectory: true)
+            .appendingPathComponent("lan-thumbnails", isDirectory: true)
+            .appendingPathComponent(folderID.uuidString, isDirectory: true)
+        Task.detached(priority: .utility) {
+            try? FileManager.default.removeItem(at: directory)
+        }
     }
 }
 
@@ -763,11 +856,24 @@ enum LANFolderImageLoaderQueue {
         rootURL: URL,
         maxPixelSize: CGFloat
     ) async -> UIImage? {
+        // SMB files are virtual URLs served by their own download/decode
+        // pipeline; they never touch NSFileCoordinator or the local disk
+        // thumbnail cache, whose keys assume a real file URL.
+        if SMBFileMaterializer.isSMB(url) {
+            return await SMBImagePipeline.shared.image(for: url, maxPixelSize: maxPixelSize)
+        }
         let isFullSize = maxPixelSize > fullSizeThreshold
         let box = WaiterBox()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<UIImage?, Never>) in
                 let key: NSString = "\(url.path)#\(Int(maxPixelSize))" as NSString
+                // Cancelled before this body ran (onCancel fired first and
+                // saw no waiter): never enqueue a decode for an off-screen
+                // cell just to tear it down afterwards.
+                guard !Task.isCancelled else {
+                    continuation.resume(returning: nil)
+                    return
+                }
                 if let cached = LANFolderImageCache.shared.image(
                     forKey: key,
                     isFullSize: isFullSize
@@ -935,6 +1041,12 @@ enum LANFolderSessionCache {
         lock.lock()
         defer { lock.unlock() }
         entriesByFolder[id] = Entry(rootURL: rootURL, files: files)
+    }
+
+    static func remove(id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        entriesByFolder.removeValue(forKey: id)
     }
 
     static func removeAll() {
